@@ -30,9 +30,10 @@ import urllib.error
 import urllib.request
 from datetime import datetime
 
+from .config import settings
+
 from sqlalchemy.orm import Session
 
-from .config import settings
 from .models import ProviderSetting
 
 # ── Registry ──────────────────────────────────────────────────────────────
@@ -348,7 +349,12 @@ def _basic_auth(user: str, password: str) -> str:
 def _http(method: str, url: str, headers: dict | None = None,
           data: bytes | None = None, timeout: int = 6):
     """Returns (status_code, None) or (None, error_label) — never raises."""
-    req = urllib.request.Request(url, method=method, data=data, headers=headers or {})
+    # A product User-Agent is load-bearing: provider edges (Vapi proven
+    # live 2026-10-23) reject urllib's default "Python-urllib/x.y" UA with
+    # HTTP 403 before auth is even evaluated — same key, curl UA = 200,
+    # urllib UA = 403.
+    headers = {"User-Agent": "VoiceAgentPlatform/1.0", **(headers or {})}
+    req = urllib.request.Request(url, method=method, data=data, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             r.read(512)
@@ -372,7 +378,10 @@ def _verdict(provider_label: str, code, err) -> tuple[str, str]:
 
 def _check(provider: str, v: dict) -> tuple[str, str]:
     if provider == "vapi":
-        code, err = _http("GET", "https://api.vapi.ai/call?limit=1",
+        # Via the configurable base URL (the documented seam the smoke
+        # suite points at its fake) — previously hardcoded, which made
+        # this probe the one call the fakes could not exercise.
+        code, err = _http("GET", f"{settings.VAPI_BASE_URL.rstrip('/')}/call?limit=1",
                           {"Authorization": f"Bearer {v['api_key']}"})
         return _verdict("Vapi", code, err)
     if provider == "twilio":

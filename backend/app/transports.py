@@ -63,6 +63,9 @@ def _request(method: str, url: str, headers: dict, data: bytes | None,
              timeout: int = 15):
     """Returns (status, parsed_json_or_None, error_label). Never raises;
     error_label is an exception class name only."""
+    # Product User-Agent — provider edges reject urllib's default UA with
+    # 403 before auth (proven live against Vapi, 2026-10-23).
+    headers = {"User-Agent": "VoiceAgentPlatform/1.0", **headers}
     req = urllib.request.Request(url, method=method, data=data, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:

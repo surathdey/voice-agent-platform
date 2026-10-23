@@ -595,6 +595,11 @@ class _FakeProvider(BaseHTTPRequestHandler):
         if self.path == "/call/phone":
             FAKE["vapi_calls"] += 1
             payload, code = {"id": f"call_fake_{FAKE['vapi_calls']}", "status": "queued"}, 200
+        elif self.command == "GET" and self.path.startswith("/call") \
+                and "Python-urllib" in (self.headers.get("User-Agent") or ""):
+            # UA-strict, mirroring live Vapi's edge (owner-proven
+            # 2026-10-23): urllib's default UA is 403'd before auth.
+            payload, code = {"message": "Forbidden"}, 403
         elif "/v1/Account/" in self.path and self.path.endswith("/Call/"):
             payload, code = {"request_uuid": "req-uuid-fake-1",
                              "message": "call queued", "api_id": "api-fake-1"}, 202
@@ -769,6 +774,14 @@ try:
     check6("tenant env key (not the defaults) is what configures Vapi here",
            vf["api_key"]["source"] == "env" and vapi_view["configured"] is True,
            vf.get("api_key"))
+    print("── A6 fix: Vapi probe vs a UA-strict edge (live Vapi 403s urllib's default UA) ──")
+    _, tres = call6(baseM, "POST", "/api/settings/providers/vapi/test", {}, **{"token": tokenM})
+    check6("test-connection passes a UA-strict Vapi (product UA, not Python-urllib)",
+           tres["status"] == "connected", tres)
+    greqs = [r for r in FAKE["requests"] if r["method"] == "GET" and r["path"].startswith("/call")]
+    check6("the probe's recorded User-Agent is the product UA",
+           bool(greqs) and greqs[-1]["headers"].get("User-Agent") == "VoiceAgentPlatform/1.0",
+           greqs[-1]["headers"] if greqs else "no GET /call recorded")
     _, saved_v = call6(baseM, "PUT", "/api/settings/providers/vapi",
                        {"fields": {"bn_voice_id_male": "tenant-bn-male-override"}}, token=tokenM)
     svf = {f["name"]: f for f in saved_v["fields"]}

@@ -167,7 +167,10 @@ def _sarvam_request(path: str, api_key: str, payload: dict,
         f"{settings.SARVAM_BASE_URL.rstrip('/')}{path}",
         method="POST", data=json.dumps(payload).encode(),
         headers={"api-subscription-key": api_key,
-                 "Content-Type": "application/json"})
+                 "Content-Type": "application/json",
+                 # Product User-Agent — some provider edges 403 the
+                 # urllib default UA before auth (Vapi, proven live).
+                 "User-Agent": "VoiceAgentPlatform/1.0"})
     return urllib.request.urlopen(req, timeout=timeout)
 
 
