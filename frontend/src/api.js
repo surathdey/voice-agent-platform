@@ -38,3 +38,23 @@ export async function api(path, options = {}) {
   if (res.status === 204) return null
   return res.json()
 }
+
+/* Multipart upload (CSV files) — same auth/error handling, no JSON body. */
+export async function apiUpload(path, formData) {
+  const res = await fetch(path, {
+    method: 'POST',
+    body: formData,
+    headers: { ...(getToken() ? { Authorization: `Bearer ${getToken()}` } : {}) },
+  })
+  if (res.status === 401) {
+    clearSession()
+    window.location.reload()
+    throw new Error('Session expired')
+  }
+  if (!res.ok) {
+    let msg = `Upload failed (${res.status})`
+    try { const j = await res.json(); if (j.detail) msg = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail) } catch {}
+    throw new Error(msg)
+  }
+  return res.json()
+}

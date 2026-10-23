@@ -119,20 +119,37 @@ class PromptVersion(Base):
 
 
 class Campaign(Base):
+    """One campaign is bound to exactly ONE agent (design §11.2, decision 14.1).
+
+    Campaign screens set BUSINESS fields only (design §15 rules): name,
+    product, purpose, audience, a named CHANNEL (never a phone number — the
+    platform manages the number pool underneath), provider mode, schedule and
+    retry rules. Nothing agent-level lives here: no model, voice, language
+    rule or prompt — those belong to the AgentConfig the campaign references.
+    """
+
     __tablename__ = "campaigns"
 
     campaign_id: Mapped[str] = mapped_column(String(40), primary_key=True, default=lambda: new_id("cmp"))
     tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.tenant_id"), nullable=False, index=True)
     agent_id: Mapped[str] = mapped_column(ForeignKey("agent_configs.agent_id"), nullable=False)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
-    product: Mapped[str] = mapped_column(String(120), default="")   # credit card | vehicle loan | home loan …
+    # Canonical product kind (see schemas.PRODUCTS): vehicle_loan | credit_card
+    # | home_loan | personal_loan | other. The kind decides which identifier
+    # the agent uses on the call (registration number / card last 4 / account no.).
+    product: Mapped[str] = mapped_column(String(40), default="vehicle_loan")
+    product_detail: Mapped[str] = mapped_column(String(300), default="")  # e.g. "two-wheeler (stale records)"
     purpose: Mapped[str] = mapped_column(Text, default="")
+    audience: Mapped[str] = mapped_column(Text, default="")  # who the campaign is for
+    # Named channel — "Service Channel 1", "Service Channel 2", … NEVER a number.
+    channel: Mapped[str] = mapped_column(String(120), default="Service Channel 1")
     provider_mode: Mapped[str] = mapped_column(String(20), default="managed")  # managed | self_hosted
-    status: Mapped[str] = mapped_column(String(30), default="draft")
-    schedule: Mapped[dict] = mapped_column(JSON, default=dict)       # calling windows etc.
-    retry_rules: Mapped[dict] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(30), default="draft")  # draft → active → paused → completed
+    schedule: Mapped[dict] = mapped_column(JSON, default=dict)       # start date, calling days/window, daily cap
+    retry_rules: Mapped[dict] = mapped_column(JSON, default=dict)    # max attempts, retry gap
     routing_rules: Mapped[list] = mapped_column(JSON, default=list)  # [{disposition, action, ...}]
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class Lead(Base):
@@ -145,6 +162,9 @@ class Lead(Base):
     name: Mapped[str] = mapped_column(String(200), default="")
     bank_name: Mapped[str] = mapped_column(String(200), default="")
     state: Mapped[str] = mapped_column(String(120), default="")
+    # agent_fields holds every mapped non-core column, PLUS the product
+    # identifier under canonical keys (A3): "product_identifier" (value) and
+    # "product_identifier_type" (registration_number | card_last4 | account_number).
     agent_fields: Mapped[dict] = mapped_column(JSON, default=dict)   # keys defined by the agent
     attempt_count: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(30), default="pending")

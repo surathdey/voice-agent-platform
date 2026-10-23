@@ -1,5 +1,87 @@
 # BUILD LOG
 
+## Chunk 2 — Phase A: A3 Campaigns & Leads (2026-10-23)
+
+### Built
+- **Campaign CRUD bound to one agent** (`/api/campaigns`). Business fields
+  only, per the §15 campaign-screen rules: name, product (canonical kind:
+  `vehicle_loan | credit_card | home_loan | personal_loan | other`) +
+  free-text product detail, purpose, audience, named **channel** (“Service
+  Channel 1”…), `provider_mode` (managed | self_hosted), schedule, retry
+  rules, routing rules. The campaign API schema carries **no from-number**
+  and no agent-level field (no model / voice / language rule / prompt) —
+  enforced by a smoke check against `/openapi.json`, not just by convention.
+  The agent must belong to the caller's tenant (cross-tenant bind → 422).
+  Model change: `campaigns` gains `audience`, `channel`, `product_detail`,
+  `updated_at` (migration `002_a3_campaign_fields.sql`).
+- **Status lifecycle:** draft → active ⇄ paused → completed (terminal),
+  via `POST /api/campaigns/{id}/status`; illegal transitions → 400.
+- **Leads — CSV upload with column mapping.** Two steps:
+  `POST /{id}/leads/preview` (parses only: headers, row count, sample rows,
+  **suggested mapping** from header aliases) and `POST /{id}/leads/upload`
+  (file + confirmed mapping JSON). Targets: name / phone_number / bank_name /
+  state / product_identifier / agent_field / ignore. Rows without a phone
+  are invalid; a phone already in the campaign (or repeated in the file) is
+  a **duplicate and skipped** — the wireframe behaviour (“858 valid · 2
+  duplicates skipped”). The product identifier is stored in
+  `lead.agent_fields` as `product_identifier` + `product_identifier_type`,
+  typed by the campaign's product (vehicle → `registration_number`, card →
+  `card_last4`, home/personal → `account_number`); all other mapped columns
+  land in `agent_fields` under their normalised header names. RPI's own
+  format (callee_name · phone_number · bank_name · state) and the bank
+  allocation format (ACCOUNT_NO · CUSTOMER_NAME · PRINCIPAL · OUTSTANDING ·
+  MOBILE_NO · RegistrationNumber) are both covered by the alias suggester.
+- **Schedule + retry as configuration** (no dispatch yet — A5/A10):
+  start date, calling days, calling window, daily cap; max attempts per
+  lead, retry gap days, retry-at-a-different-time. Stored on the campaign
+  and editable via the wizard's Schedule step / campaign PUT.
+- **Frontend** (same theme tokens): **Campaigns list/history** matching
+  wireframe `w11-campaigns-list.png` (status summary badges, table with
+  agent / channel / status / leads, row → campaign page); the **5-step
+  campaign wizard** (Agent select with the agent's needs/config panel →
+  Details with gold numbered markers + “What this means” notes panel →
+  Leads with expected-column chips, dropzone, mapping rows → Schedule →
+  Review blocks with Edit jumps, Launch / Save-as-draft); a **campaign
+  detail page** with status actions (launch / pause / resume / complete /
+  delete), details + schedule panels, routing rules when present, and the
+  lead table for **that campaign only** (+ add-more-leads upload). The
+  Campaigns nav item is enabled. Shared upload component:
+  `frontend/src/pages/LeadsUpload.jsx`.
+
+### Verification (native, no Docker on this VM — same caveat as chunk 1)
+- Backend under uvicorn on a fresh SQLite DB; `scripts/smoke_test.py`:
+  **46/46 checks passed** (17 chunk-1 checks + 29 A3 checks/asserts):
+  campaign schemas free of from_number/agent-level fields; create bound to
+  the seeded RPI agent with product/purpose/audience/channel stored and
+  `identifier_type: registration_number`; bad agent → 422, bad product →
+  422; RPI CSV preview suggests the right mapping; upload of a 6-row file
+  → **5 created, 1 duplicate, 0 invalid**; re-upload → 0 created, 6
+  duplicates; upload without a phone mapping → 422; bank-format upload →
+  identifier stored as registration_number with principal/account in
+  agent_fields; credit-card campaign → `card_last4`; schedule/retry/
+  routing PUT round-trips; lifecycle draft→completed with illegal moves
+  → 400; **tenant isolation**: other tenant's campaign list empty,
+  campaign + leads 404, upload 404, cross-tenant agent bind 422.
+- Frontend: `vite build` clean; dev server served the console and proxied
+  `/api/health` to the backend.
+
+### Known limitations (deliberate, for this chunk)
+- No dispatch: launching a campaign only flips its status to active; calls,
+  connected counts, outcomes and the results spreadsheet arrive with
+  A5/A10. Schedule/retry/routing are stored configuration until then.
+- CSV upload is whole-file in memory with a per-column mapping; very large
+  lists (100k+ rows) will want chunked/streamed ingest — revisit at A10.
+- `product` is a fixed canonical list; a lender product outside the list
+  maps to `other` (account-number identifier) until the list grows.
+- The wizard infers the expected lead columns from the agent (RPI-format
+  for the verification agent, bank format otherwise) — a per-agent file
+  format declaration belongs with the Phase B agent builds.
+
+### Next step
+**A4 — Provider settings:** tenant provider settings + secret store +
+“Test connection” for Sarvam, Plivo and the managed platform (secrets masked
+on re-read, absent from all API responses).
+
 ## Chunk 1 — Phase A: A1 + A2 (2026-10-23)
 
 ### Built

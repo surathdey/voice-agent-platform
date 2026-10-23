@@ -5,9 +5,9 @@ Voice Agent Platform V2 (Greenfield + QGBS MVP)*. Agents are **data, not
 code**: each agent is one prompt plus structured voice/model/language
 configuration, run in campaigns against lead lists.
 
-**This build = Phase A, chunk 1: A1 (tenancy + core data model) and A2
-(Agent Config Studio).** See `BUILD-LOG.md` for what is verified and what
-comes next (A3: campaigns & leads).
+**This build = Phase A, chunks 1–2: A1 (tenancy + core data model), A2
+(Agent Config Studio) and A3 (Campaigns & Leads).** See `BUILD-LOG.md` for
+what is verified and what comes next (A4: provider settings).
 
 ## Run it (Docker — the owner's route)
 
@@ -44,7 +44,7 @@ cd frontend && npm install && npm run dev   # http://localhost:5173, proxies /ap
 - [ ] `GET /api/health` returns `telephony_mode: "stub"`.
 - [ ] Create a second tenant (`POST /api/tenants`), log in as its admin:
       it sees **zero** agents, and QGBS agent URLs return 404
-      (run `python3 scripts/smoke_test.py` — 17 checks automate all of this).
+      (run `python3 scripts/smoke_test.py` — 46 checks automate all of this).
 
 **A2 — Agent Config Studio**
 - [ ] Agents library matches the wireframe layout: cards with LLM, STT/TTS,
@@ -55,6 +55,20 @@ cd frontend && npm install && npm run dev   # http://localhost:5173, proxies /ap
 - [ ] Edit the prompt and save: the version history gains a new version.
 - [ ] Open an older version, roll back: the old text goes live again as a
       **new** version (history is append-only, nothing is rewritten).
+
+**A3 — Campaigns & Leads**
+- [ ] Campaigns list: status summary badges + table (agent, channel, leads).
+- [ ] “+ New Campaign” walks the 5-step wizard — Agent → Details → Leads →
+      Schedule → Review — in the wireframe layout. Details asks for product /
+      purpose / audience and a named **Channel**; there is deliberately **no**
+      phone-number field and nothing agent-level (no model/voice/prompt).
+- [ ] Step 3: drop an RPI-format CSV (`callee_name, phone_number, bank_name,
+      state`) — the mapping is suggested automatically; upload reports
+      created / duplicates skipped / invalid. For a vehicle-loan campaign, a
+      bank file's `RegistrationNumber` maps to the **product identifier**.
+- [ ] Campaign page: launch / pause / resume / complete follow the lifecycle
+      (draft → active ⇄ paused → completed); the leads table shows **only
+      that campaign's** leads.
 
 ## Design decisions that override the design doc
 
@@ -74,8 +88,10 @@ cd frontend && npm install && npm run dev   # http://localhost:5173, proxies /ap
 
 ```
 backend/    FastAPI app (app/models.py = all six design entities + prompt_versions,
-            app/routers/ = auth, tenants, agents; migrations/001_initial.sql = DDL of record)
-frontend/   React (Vite) console — theme tokens in src/theme.css (wireframe design language)
-scripts/    smoke_test.py — automated acceptance checks for this chunk
+            app/routers/ = auth, tenants, agents, campaigns;
+            migrations/001_initial.sql + 002_a3_campaign_fields.sql = DDL of record)
+frontend/   React (Vite) console — theme tokens in src/theme.css (wireframe design language);
+            pages: Agents, AgentEditor, Campaigns, CampaignWizard, CampaignDetail, LeadsUpload
+scripts/    smoke_test.py — automated acceptance checks (A1 + A2 + A3)
 docker-compose.yml   db (PostgreSQL 16) + backend + frontend (nginx)
 ```

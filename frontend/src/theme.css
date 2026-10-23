@@ -169,3 +169,83 @@ pre.preview {
   border-radius: 8px; padding: 9px 12px; font-size: 13.5px; margin-bottom: 14px; }
 .ok-note { background: rgba(14,124,102,0.08); border: 1px solid var(--teal); color: var(--teal-dark);
   border-radius: 8px; padding: 9px 12px; font-size: 13.5px; margin-bottom: 14px; }
+
+/* ── Campaigns (A3) ─────────────────────────────────────────────────────── */
+/* Status summary badges + campaign table (wireframe w11-campaigns-list) */
+.summary-badges { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+.pill {
+  display: inline-block; color: #fff; font-size: 10.5px; font-weight: 700;
+  letter-spacing: 0.07em; padding: 3px 10px; border-radius: 20px; text-transform: uppercase;
+  background: var(--slate); white-space: nowrap;
+}
+.pill.teal { background: var(--teal); } .pill.navy { background: var(--navy); }
+.pill.gold { background: var(--gold); } .pill.slate { background: var(--slate); }
+table.data { width: 100%; border-collapse: collapse; font-size: 14px; }
+table.data th {
+  text-align: left; color: var(--slate); font-size: 12px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.05em; padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+}
+table.data td { padding: 11px 12px; border-bottom: 1px solid #e7edf2; vertical-align: middle; }
+table.data tr:last-child td { border-bottom: 0; }
+table.data tr.clickable { cursor: pointer; }
+table.data tr.clickable:hover td { background: rgba(14, 124, 102, 0.04); }
+table.data .chev { color: var(--slate); font-size: 18px; font-weight: 700; text-align: right; }
+.num { text-align: right; font-variant-numeric: tabular-nums; }
+
+/* Wizard (wireframes: 5-step campaign creation) */
+.steps { display: flex; align-items: flex-start; margin: 6px 0 26px; }
+.step { display: flex; align-items: center; gap: 9px; }
+.step .dot {
+  width: 30px; height: 30px; flex: 0 0 30px; border-radius: 50%;
+  background: var(--line); color: #fff; font-size: 13px; font-weight: 700;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.step.done .dot, .step.current .dot { background: var(--teal); }
+.step .lbl { font-size: 13px; color: var(--slate); font-weight: 500; }
+.step.current .lbl { color: var(--navy); font-weight: 700; }
+.step .bar { width: 64px; height: 2px; background: var(--line); margin: 0 14px; }
+.wizard-foot { display: flex; gap: 12px; margin-top: 26px; }
+.notes-panel { background: #f4f6f8; border: 1px solid var(--line); border-radius: var(--radius); padding: 16px 18px; }
+.notes-panel h4 { margin: 0 0 10px; color: var(--navy); font-size: 14px; }
+.notes-panel p { margin: 0 0 12px; font-size: 13.5px; color: var(--ink); }
+.notes-panel p:last-child { margin-bottom: 0; }
+.notes-panel .n { color: var(--gold); font-weight: 800; margin-right: 6px; }
+.two-col { display: grid; grid-template-columns: 1.55fr 1fr; gap: 22px; align-items: start; }
+
+/* Agent pick list (wizard step 1, wireframe sel-*) */
+.pick-list { border: 2px solid var(--navy); border-radius: var(--radius); background: #fff; overflow: hidden; }
+.pick-item { padding: 12px 16px; cursor: pointer; border-bottom: 1px solid #e7edf2; }
+.pick-item:last-child { border-bottom: 0; }
+.pick-item:hover { background: rgba(14, 124, 102, 0.04); }
+.pick-item.sel { background: rgba(14, 124, 102, 0.09); }
+.pick-item .nm { font-weight: 700; color: var(--navy); font-size: 14.5px; }
+.pick-item .tg { color: var(--slate); font-size: 13px; margin-top: 1px; }
+
+/* Leads upload (wizard step 3, wireframe leads-*) */
+.dropzone {
+  border: 2px dashed var(--line); border-radius: var(--radius); background: #fff;
+  padding: 26px 20px; text-align: center; cursor: pointer;
+}
+.dropzone:hover { border-color: var(--teal); }
+.dropzone .big { color: var(--navy); font-weight: 700; font-size: 15px; }
+.dropzone .sub { color: var(--teal); font-size: 13px; margin-top: 4px; }
+.chip {
+  display: inline-block; background: rgba(14,124,102,0.09); border: 1px solid var(--teal);
+  color: var(--navy); border-radius: 20px; padding: 5px 13px; font-size: 12.5px;
+  font-weight: 700; font-family: var(--mono); margin: 0 8px 8px 0;
+}
+.map-row { display: grid; grid-template-columns: 1fr 26px 1fr; gap: 8px; align-items: center; margin-bottom: 8px; }
+.map-row .col { font-family: var(--mono); font-size: 13px; font-weight: 600; color: var(--navy); }
+.map-row .arrow { color: var(--slate); text-align: center; }
+select.map-target { font-size: 13.5px; }
+
+/* Review blocks (wizard step 5, wireframe review-*) */
+.review-block {
+  display: grid; grid-template-columns: 110px 1fr auto; gap: 14px; align-items: start;
+  background: #fff; border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 14px 18px; margin-bottom: 12px;
+}
+.review-block .t { font-weight: 700; color: var(--navy); font-size: 13.5px; }
+.review-block .b { font-size: 13.5px; color: var(--ink); }
+.review-block .edit { color: var(--teal); font-weight: 600; font-size: 13px; background: none; border: 0; padding: 0; }

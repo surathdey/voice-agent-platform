@@ -1,16 +1,23 @@
 import React, { useState } from 'react'
 import Agents from './pages/Agents'
 import AgentEditor from './pages/AgentEditor'
+import Campaigns from './pages/Campaigns'
+import CampaignWizard from './pages/CampaignWizard'
+import CampaignDetail from './pages/CampaignDetail'
 import { api, clearSession, getUser, setSession } from './api'
 
 const NAV = ['Dashboard', 'Campaigns', 'Agents', 'Calls', 'Journey', 'Human Queue', 'Settings']
-const ENABLED = ['Agents'] // later chunks enable the rest
+const ENABLED = ['Campaigns', 'Agents'] // later chunks enable the rest
+const NAV_VIEW = { Campaigns: 'campaigns', Agents: 'agents' }
 
 export default function App() {
   const [user, setUser] = useState(getUser())
   const [view, setView] = useState({ name: 'agents' })
 
   if (!user) return <Login onDone={(u) => setUser(u)} />
+
+  const activeNav = view.name === 'editor' ? 'Agents'
+    : ['campaigns', 'wizard', 'campaign'].includes(view.name) ? 'Campaigns' : 'Agents'
 
   return (
     <div className="shell">
@@ -20,10 +27,10 @@ export default function App() {
           {NAV.map((item) => (
             <button
               key={item}
-              className={item === 'Agents' ? 'active' : ''}
+              className={item === activeNav ? 'active' : ''}
               disabled={!ENABLED.includes(item)}
               title={ENABLED.includes(item) ? '' : 'Arrives in a later build chunk'}
-              onClick={() => item === 'Agents' && setView({ name: 'agents' })}
+              onClick={() => ENABLED.includes(item) && setView({ name: NAV_VIEW[item] })}
             >{item}</button>
           ))}
         </nav>
@@ -42,6 +49,21 @@ export default function App() {
         )}
         {view.name === 'editor' && (
           <AgentEditor agentId={view.id} onBack={() => setView({ name: 'agents' })} />
+        )}
+        {view.name === 'campaigns' && (
+          <Campaigns
+            onOpen={(id) => setView({ name: 'campaign', id })}
+            onNew={() => setView({ name: 'wizard' })}
+          />
+        )}
+        {view.name === 'wizard' && (
+          <CampaignWizard
+            onLaunched={(id) => setView({ name: 'campaign', id })}
+            onExit={() => setView({ name: 'campaigns' })}
+          />
+        )}
+        {view.name === 'campaign' && (
+          <CampaignDetail campaignId={view.id} onBack={() => setView({ name: 'campaigns' })} />
         )}
       </main>
     </div>

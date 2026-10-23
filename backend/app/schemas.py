@@ -79,3 +79,100 @@ class PromptVersionOut(BaseModel):
     note: str = ""
     created_by: str = ""
     created_at: Optional[str] = None
+
+
+# ── Campaigns & leads (A3) ────────────────────────────────────────────────
+# Canonical product kinds. The kind decides which identifier the agent uses
+# on the call (design §15): vehicle → registration number, credit card →
+# card last 4, home/personal loan → loan account number.
+PRODUCTS = {
+    "vehicle_loan": {"label": "Vehicle loan", "identifier_type": "registration_number",
+                     "identifier_label": "Vehicle registration number"},
+    "credit_card": {"label": "Credit card", "identifier_type": "card_last4",
+                    "identifier_label": "Card last 4 digits"},
+    "home_loan": {"label": "Home loan", "identifier_type": "account_number",
+                  "identifier_label": "Loan account number"},
+    "personal_loan": {"label": "Personal loan", "identifier_type": "account_number",
+                      "identifier_label": "Loan account number"},
+    "other": {"label": "Other", "identifier_type": "account_number",
+              "identifier_label": "Account number"},
+}
+
+
+class ScheduleIn(BaseModel):
+    """Calling schedule — configuration only in A3 (dispatch engine is A5/A10)."""
+    start_date: str = ""                 # ISO date, e.g. "2026-10-24"
+    calling_days: str = "Mon – Sat"
+    window_start: str = "09:00"          # local time at the tenant's market
+    window_end: str = "19:00"
+    daily_cap: int = 2000                # max calls per day across the campaign
+
+
+class RetryIn(BaseModel):
+    max_attempts: int = 3                # per lead
+    retry_gap_days: int = 1
+    retry_different_time: bool = True    # retry at a different time of day
+
+
+class RoutingRule(BaseModel):
+    disposition: str
+    action: str                          # e.g. route_to_campaign | human_queue | none
+    target: str = ""                     # e.g. target campaign id / queue name
+
+
+class CampaignIn(BaseModel):
+    """Business fields ONLY (§15): no model/voice/language/prompt here, and
+    NEVER a from-number — the campaign names a channel, the platform owns
+    the number pool."""
+    agent_id: str                        # bound to exactly one agent
+    name: str
+    product: str = "vehicle_loan"        # a key of PRODUCTS
+    product_detail: str = ""
+    purpose: str = ""
+    audience: str = ""
+    channel: str = "Service Channel 1"
+    provider_mode: str = "managed"       # managed | self_hosted
+    schedule: ScheduleIn = Field(default_factory=ScheduleIn)
+    retry_rules: RetryIn = Field(default_factory=RetryIn)
+    routing_rules: List[RoutingRule] = []
+
+
+class CampaignOut(CampaignIn):
+    campaign_id: str
+    tenant_id: str
+    status: str = "draft"                # draft → active → paused → completed
+    agent_name: str = ""
+    product_label: str = ""
+    identifier_type: str = ""            # derived from product
+    identifier_label: str = ""
+    lead_count: int = 0
+    created_at: Optional[str] = None
+
+
+class CampaignStatusIn(BaseModel):
+    status: str                          # target status; transitions validated
+
+
+class LeadOut(BaseModel):
+    lead_id: str
+    campaign_id: str
+    phone_number: str
+    name: str = ""
+    bank_name: str = ""
+    state: str = ""
+    agent_fields: dict = Field(default_factory=dict)
+    attempt_count: int = 0
+    status: str = "pending"
+    created_at: Optional[str] = None
+
+
+class LeadListOut(BaseModel):
+    total: int
+    leads: List[LeadOut]
+
+
+class UploadResultOut(BaseModel):
+    total_rows: int
+    created: int
+    duplicates_skipped: int
+    invalid_skipped: int
