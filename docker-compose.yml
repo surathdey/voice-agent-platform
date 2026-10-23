@@ -1,0 +1,47 @@
+# Voice Agent Platform — full stack: PostgreSQL + FastAPI backend + React frontend.
+#   cp .env.example .env   (fill in real provider keys later; not needed to test)
+#   docker compose up --build
+# Frontend: http://localhost:5173   API: http://localhost:8000/api/health
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-vap}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-vap-demo-password}
+      POSTGRES_DB: ${POSTGRES_DB:-voice_platform}
+    volumes:
+      - vap_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-vap}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-vap}:${POSTGRES_PASSWORD:-vap-demo-password}@db:5432/${POSTGRES_DB:-voice_platform}
+      SECRET_KEY: ${SECRET_KEY:-dev-only-change-me}
+      TELEPHONY_MODE: ${TELEPHONY_MODE:-stub}
+      VAPI_API_KEY: ${VAPI_API_KEY:-}
+      PLIVO_AUTH_ID: ${PLIVO_AUTH_ID:-}
+      PLIVO_AUTH_TOKEN: ${PLIVO_AUTH_TOKEN:-}
+      SARVAM_API_KEY: ${SARVAM_API_KEY:-}
+      SEED_TENANT_NAME: ${SEED_TENANT_NAME:-QGBS}
+      SEED_USER_EMAIL: ${SEED_USER_EMAIL:-demo@qgbs.example}
+      SEED_USER_PASSWORD: ${SEED_USER_PASSWORD:-demo-password}
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+
+volumes:
+  vap_db:
