@@ -38,6 +38,17 @@ class Settings:
     VAPI_BN_TTS_MODEL: str = os.getenv("VAPI_BN_TTS_MODEL", "")
     VAPI_BN_VOICE_ID_FEMALE: str = os.getenv("VAPI_BN_VOICE_ID_FEMALE", "")
     VAPI_BN_VOICE_ID_MALE: str = os.getenv("VAPI_BN_VOICE_ID_MALE", "")
+    # Vapi transcriber profiles: per-language STT (Deepgram via Vapi)
+    # overrides of the registry defaults in app.providers. Bengali ships
+    # nova-3 — Vapi's nova-2 language enum has no Bengali (live-proven
+    # 2026-10-23: bn placements were rejected HTTP 400). Empty = shipped
+    # defaults.
+    VAPI_EN_TRANSCRIBER_PROVIDER: str = os.getenv("VAPI_EN_TRANSCRIBER_PROVIDER", "")
+    VAPI_EN_TRANSCRIBER_MODEL: str = os.getenv("VAPI_EN_TRANSCRIBER_MODEL", "")
+    VAPI_HI_TRANSCRIBER_PROVIDER: str = os.getenv("VAPI_HI_TRANSCRIBER_PROVIDER", "")
+    VAPI_HI_TRANSCRIBER_MODEL: str = os.getenv("VAPI_HI_TRANSCRIBER_MODEL", "")
+    VAPI_BN_TRANSCRIBER_PROVIDER: str = os.getenv("VAPI_BN_TRANSCRIBER_PROVIDER", "")
+    VAPI_BN_TRANSCRIBER_MODEL: str = os.getenv("VAPI_BN_TRANSCRIBER_MODEL", "")
     # Provider API base URLs — overridable for staging / tests (the A6
     # smoke suite points these at a local fake provider; production uses
     # the defaults).

@@ -48,7 +48,10 @@ PROVIDERS = {
                        "are the TTS side — one profile per language (provider, TTS model, "
                        "female + male voice IDs), pre-filled with the owner's verified RPI "
                        "voice setup and editable per tenant. The transport picks the profile "
-                       "by the call's language and the agent's voice gender.",
+                       "by the call's language and the agent's voice gender. The transcriber "
+                       "profiles are the STT side (Deepgram via Vapi) — one provider + model "
+                       "per language, likewise pre-filled and editable; Bengali ships nova-3 "
+                       "because Vapi's nova-2 language enum has no Bengali.",
         "primary": True, "optional": False,
         "fields": [
             {"name": "api_key", "label": "API key", "secret": True, "required": True,
@@ -69,6 +72,13 @@ PROVIDERS = {
              "env_attr": "VAPI_EN_VOICE_ID_FEMALE", "default": "90ipbRoKi4CpHXvKVtl0"},
             {"name": "en_voice_id_male", "label": "English · male voice ID", "secret": False, "required": False,
              "env_attr": "VAPI_EN_VOICE_ID_MALE", "default": "pzxut4zZz4GImZNlqQ3H"},
+            # ── Transcriber profiles (STT side) — provider + model per
+            # language, same pre-filled pattern as the voice profiles.
+            # Bengali ships nova-3: Vapi's nova-2 enum has no Bengali.
+            {"name": "en_transcriber_provider", "label": "English · transcriber provider", "secret": False, "required": False,
+             "env_attr": "VAPI_EN_TRANSCRIBER_PROVIDER", "default": "deepgram"},
+            {"name": "en_transcriber_model", "label": "English · transcriber model", "secret": False, "required": False,
+             "env_attr": "VAPI_EN_TRANSCRIBER_MODEL", "default": "nova-2"},
             {"name": "hi_voice_provider", "label": "Hindi · voice provider", "secret": False, "required": False,
              "env_attr": "VAPI_HI_VOICE_PROVIDER", "default": "11labs"},
             {"name": "hi_tts_model", "label": "Hindi · TTS model", "secret": False, "required": False,
@@ -77,6 +87,10 @@ PROVIDERS = {
              "env_attr": "VAPI_HI_VOICE_ID_FEMALE", "default": "1qEiC6qsybMkmnNdVMbK"},
             {"name": "hi_voice_id_male", "label": "Hindi · male voice ID", "secret": False, "required": False,
              "env_attr": "VAPI_HI_VOICE_ID_MALE", "default": "zT03pEAEi0VHKciJODfn"},
+            {"name": "hi_transcriber_provider", "label": "Hindi · transcriber provider", "secret": False, "required": False,
+             "env_attr": "VAPI_HI_TRANSCRIBER_PROVIDER", "default": "deepgram"},
+            {"name": "hi_transcriber_model", "label": "Hindi · transcriber model", "secret": False, "required": False,
+             "env_attr": "VAPI_HI_TRANSCRIBER_MODEL", "default": "nova-2"},
             {"name": "bn_voice_provider", "label": "Bengali · voice provider", "secret": False, "required": False,
              "env_attr": "VAPI_BN_VOICE_PROVIDER", "default": "11labs"},
             {"name": "bn_tts_model", "label": "Bengali · TTS model", "secret": False, "required": False,
@@ -85,6 +99,10 @@ PROVIDERS = {
              "env_attr": "VAPI_BN_VOICE_ID_FEMALE", "default": "611e0Wo6wEi3GcpkO5it"},
             {"name": "bn_voice_id_male", "label": "Bengali · male voice ID", "secret": False, "required": False,
              "env_attr": "VAPI_BN_VOICE_ID_MALE", "default": "GuSivqtqi1qfWxEuGhqa"},
+            {"name": "bn_transcriber_provider", "label": "Bengali · transcriber provider", "secret": False, "required": False,
+             "env_attr": "VAPI_BN_TRANSCRIBER_PROVIDER", "default": "deepgram"},
+            {"name": "bn_transcriber_model", "label": "Bengali · transcriber model", "secret": False, "required": False,
+             "env_attr": "VAPI_BN_TRANSCRIBER_MODEL", "default": "nova-3"},
             # ── Rate card (A12) — the tenant's contracted per-minute
             # telephony rate, used ONLY to estimate a call's cost when
             # Vapi's own end-of-call report carries no cost breakdown

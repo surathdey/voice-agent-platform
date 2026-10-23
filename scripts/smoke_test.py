@@ -593,8 +593,20 @@ class _FakeProvider(BaseHTTPRequestHandler):
             "headers": dict(self.headers), "body": raw.decode("utf-8", "replace"),
         })
         if self.path == "/call/phone":
-            FAKE["vapi_calls"] += 1
-            payload, code = {"id": f"call_fake_{FAKE['vapi_calls']}", "status": "queued"}, 200
+            # Mirror live Vapi's one proven validation (2026-10-23):
+            # Deepgram nova-2 has no Bengali — bn on nova-2 is a 400
+            # whose body names the field, exactly as live returned it.
+            try:
+                _body = json.loads(raw or b"{}")
+                _tr = (_body.get("assistant") or {}).get("transcriber") or {}
+            except Exception:
+                _tr = {}
+            if _tr.get("model") == "nova-2" and _tr.get("language") == "bn":
+                payload, code = {"message": ["assistant.transcriber.language must be one of the following values for nova-2 model: en, hi, multi"],
+                                 "error": "Bad Request", "statusCode": 400}, 400
+            else:
+                FAKE["vapi_calls"] += 1
+                payload, code = {"id": f"call_fake_{FAKE['vapi_calls']}", "status": "queued"}, 200
         elif self.command == "GET" and self.path.startswith("/call") \
                 and "Python-urllib" in (self.headers.get("User-Agent") or ""):
             # UA-strict, mirroring live Vapi's edge (owner-proven
@@ -789,6 +801,41 @@ try:
            svf["bn_voice_id_male"]["value"] == "tenant-bn-male-override"
            and svf["bn_voice_id_male"]["source"] == "tenant", svf.get("bn_voice_id_male"))
 
+    print("── A6 fix: Vapi transcriber profiles — configurable per language (owner-decided) ──")
+    check6("transcriber profiles pre-fill from defaults (bn → deepgram/nova-3; en/hi → deepgram/nova-2)",
+           vf["bn_transcriber_provider"]["value"] == "deepgram"
+           and vf["bn_transcriber_provider"]["source"] == "default"
+           and vf["bn_transcriber_model"]["value"] == "nova-3"
+           and vf["bn_transcriber_model"]["source"] == "default"
+           and vf["en_transcriber_provider"]["value"] == "deepgram"
+           and vf["en_transcriber_model"]["value"] == "nova-2"
+           and vf["en_transcriber_model"]["source"] == "default"
+           and vf["hi_transcriber_provider"]["value"] == "deepgram"
+           and vf["hi_transcriber_model"]["value"] == "nova-2"
+           and vf["hi_transcriber_model"]["source"] == "default", vf.get("bn_transcriber_model"))
+    _, saved_tr = call6(baseM, "PUT", "/api/settings/providers/vapi",
+                        {"fields": {"bn_transcriber_provider": "deepgram",
+                                    "bn_transcriber_model": "nova-2"}}, **{"token": tokenM})
+    tf = {f["name"]: f for f in saved_tr["fields"]}
+    check6("transcriber profile editable per tenant (override sticks, source = tenant)",
+           tf["bn_transcriber_provider"]["value"] == "deepgram"
+           and tf["bn_transcriber_provider"]["source"] == "tenant"
+           and tf["bn_transcriber_model"]["value"] == "nova-2"
+           and tf["bn_transcriber_model"]["source"] == "tenant", tf.get("bn_transcriber_model"))
+    # Clear it again right away: the managed dispatch below must run on
+    # the shipped defaults (the end-to-end nova-2 rejection proof lives
+    # further down, after the webhook section, where it can disturb
+    # nothing).
+    _, cleared_tr = call6(baseM, "PUT", "/api/settings/providers/vapi",
+                          {"fields": {"bn_transcriber_provider": "",
+                                      "bn_transcriber_model": ""}}, **{"token": tokenM})
+    cf0 = {f["name"]: f for f in cleared_tr["fields"]}
+    check6("clearing the transcriber override restores the shipped defaults",
+           cf0["bn_transcriber_model"]["value"] == "nova-3"
+           and cf0["bn_transcriber_model"]["source"] == "default"
+           and cf0["bn_transcriber_provider"]["value"] == "deepgram"
+           and cf0["bn_transcriber_provider"]["source"] == "default", cf0.get("bn_transcriber_model"))
+
     print("── A6: managed dispatch places real Vapi calls (fake provider) ──")
     cidM = campaign6(baseM, tokenM, rpiM["agent_id"], "A6 — Managed Batch", "managed")
     _, repM = call6(baseM, "POST", f"/api/campaigns/{cidM}/dispatch", token=tokenM)
@@ -819,6 +866,10 @@ try:
            wb["assistantOverrides"]["variableValues"]["bank_name"] == "Tata Capital"
            and wb["assistant"]["transcriber"]["language"] == "bn"
            and hi["assistant"]["transcriber"]["language"] == "hi")
+    check6("payload: transcriber model per language (bn → nova-3, hi → nova-2; live Vapi rejects bn on nova-2)",
+           wb["assistant"]["transcriber"] == {"provider": "deepgram", "model": "nova-3", "language": "bn"}
+           and hi["assistant"]["transcriber"] == {"provider": "deepgram", "model": "nova-2", "language": "hi"},
+           (wb["assistant"]["transcriber"], hi["assistant"]["transcriber"]))
     schema_props = wb["assistant"]["analysisPlan"]["structuredDataSchema"]["properties"]
     check6("payload: analysis schema = prompt buckets + captured fields (§8.2 source)",
            "RPC_CONFIRMED" in schema_props["disposition"]["enum"]
@@ -904,6 +955,39 @@ try:
     check6("webhook binds by provider call id when metadata is absent; no-answer maps to NO_ANSWER",
            ack3["created"] is True and hi_done["final_state"] == "NO_ANSWER"
            and hi_done["end_reason"] == "no_answer", hi_done)
+
+    print("── A6 fix: tenant-set bn transcriber nova-2 → placement 400, provider message preserved ──")
+    call6(baseM, "PUT", "/api/settings/providers/vapi",
+          {"fields": {"bn_transcriber_provider": "deepgram",
+                      "bn_transcriber_model": "nova-2"}}, **{"token": tokenM})
+    cidT = campaign6(baseM, tokenM, rpiM["agent_id"], "A6 — Transcriber Override Batch",
+                     "managed",
+                     "callee_name,phone_number,bank_name,state\n"
+                     "T. Ray,9300000007,Tata Capital,West Bengal\n")
+    _, repT = call6(baseM, "POST", f"/api/campaigns/{cidT}/dispatch", **{"token": tokenM})
+    check6("dispatch on the tenant's nova-2 Bengali transcriber: placement rejected, finalized FAILED in-line",
+           repT["transport"] == "managed" and repT["created"] == 1
+           and repT["placed"] == 0 and repT["finalized"] == 1, repT)
+    treqs = [r for r in FAKE["requests"] if r["path"] == "/call/phone"]
+    tpay = json.loads(treqs[-1]["body"])
+    check6("the rejected payload really carried the tenant's transcriber choice (deepgram/nova-2/bn)",
+           tpay["assistant"]["transcriber"] == {"provider": "deepgram", "model": "nova-2",
+                                                "language": "bn"},
+           tpay["assistant"]["transcriber"])
+    _, callsT = call6(baseM, "GET", f"/api/campaigns/{cidT}/calls", **{"token": tokenM})
+    tcall = callsT["calls"][0]
+    check6("the stored result carries Vapi's own message (the field it named: transcriber.language)",
+           tcall["final_state"] == "FAILED" and tcall["end_reason"] == "provider_error"
+           and "transcriber.language" in (tcall["summary"] or ""), tcall.get("summary"))
+    _, cleared2 = call6(baseM, "PUT", "/api/settings/providers/vapi",
+                        {"fields": {"bn_transcriber_provider": "",
+                                    "bn_transcriber_model": ""}}, **{"token": tokenM})
+    cf2 = {f["name"]: f for f in cleared2["fields"]}
+    check6("override cleared after the proof — shipped defaults back (bn → deepgram/nova-3)",
+           cf2["bn_transcriber_model"]["value"] == "nova-3"
+           and cf2["bn_transcriber_model"]["source"] == "default"
+           and cf2["bn_transcriber_provider"]["value"] == "deepgram"
+           and cf2["bn_transcriber_provider"]["source"] == "default", cf2.get("bn_transcriber_model"))
 
     print("── A6: agent voice gender picks the profile's male voice ──")
     _, male_agent = call6(baseM, "POST", "/api/agents", {

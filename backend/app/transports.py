@@ -75,11 +75,15 @@ def _request(method: str, url: str, headers: dict, data: bytes | None,
             except Exception:
                 return r.status, {}, None
     except urllib.error.HTTPError as e:
+        # Keep the provider's error body: its message is the diagnosis
+        # (live lesson 2026-10-23 — a bare "HTTP 400" cost an hour;
+        # Vapi's body named the exact invalid field).
         try:
-            e.read()
+            raw = e.read()
+            parsed = json.loads(raw) if raw else {}
         except Exception:
-            pass
-        return e.code, None, None
+            parsed = {}
+        return e.code, parsed, None
     except Exception as e:  # DNS, TLS, timeout, refused…
         return None, None, type(e).__name__
 
@@ -147,15 +151,26 @@ def _zero_cost(mode: str, currency: str) -> dict:
 
 
 def _placement_failed(mode: str, currency: str, provider_label: str,
-                      status, err) -> dict:
+                      status, err, provider_message=None) -> dict:
     detail = f"HTTP {status}" if status else f"network error ({err})"
+    summary = (f"{provider_label} rejected the call placement ({detail}) — "
+               "no call was placed.")
+    if provider_message:
+        # The provider's own words (Vapi returns a string or a list of
+        # validation strings) — sanitised to plain text, length-capped.
+        if isinstance(provider_message, (list, tuple)):
+            text = "; ".join(str(m) for m in provider_message)
+        else:
+            text = str(provider_message)
+        text = " ".join(text.split())[:400]
+        if text:
+            summary += f" {provider_label} said: {text}"
     return {
         "final_state": "FAILED",
         "end_reason": "provider_error",
         "disposition": "",
         "confidence": 0.0,
-        "summary": (f"{provider_label} rejected the call placement ({detail}) — "
-                    "no call was placed."),
+        "summary": summary,
         "captured_fields": {},
         "duration_s": 0,
         "recording_url": "",
@@ -199,6 +214,25 @@ def vapi_voice(fields: dict, agent: AgentConfig, language: str) -> dict:
         return voice
     provider, vid = _split_provider(fields.get("default_voice"), _FALLBACK_VOICE)
     return {"provider": provider, "voiceId": vid}
+
+
+def _vapi_transcriber(fields: dict, language: str) -> dict:
+    """Deepgram transcriber for one call, from the tenant's per-language
+    transcriber profiles (Settings → Providers → Vapi): provider + model
+    by the call's resolved language prefix (en / hi / bn); the language
+    code itself is derived from the resolved language. The fields arrive
+    resolved (tenant → .env → registry default), so the fallbacks here
+    only guard a hand-built fields dict — and they are the live-proven
+    shipped defaults (2026-10-23): Bengali needs nova-3, because Vapi's
+    nova-2 language enum contains NO Bengali — a bn placement on nova-2
+    is rejected HTTP 400 before anything else runs; Hindi and English
+    are in the nova-2 enum and stay there."""
+    code = (language or "hi").split("-")[0].strip().lower() or "hi"
+    provider = (fields.get(f"{code}_transcriber_provider") or "").strip() or "deepgram"
+    model = (fields.get(f"{code}_transcriber_model") or "").strip()
+    if not model:
+        model = "nova-3" if code == "bn" else "nova-2"
+    return {"provider": provider, "model": model, "language": code}
 
 
 def build_vapi_payload(session: CallSession, agent: AgentConfig,
@@ -245,8 +279,7 @@ def build_vapi_payload(session: CallSession, agent: AgentConfig,
             "messages": [{"role": "system", "content": agent.prompt or ""}],
         },
         "voice": vapi_voice(vapi_fields, agent, language),
-        "transcriber": {"provider": "deepgram", "model": "nova-2",
-                        "language": language.split("-")[0]},
+        "transcriber": _vapi_transcriber(vapi_fields, language),
         "firstMessageMode": "assistant-speaks-first",
         "serverUrl": f"{public_base()}/api/telephony/vapi/webhook",
         "serverUrlSecret": settings.WEBHOOK_SECRET,
@@ -432,7 +465,9 @@ class VapiTransport:
             db.commit()
             return None  # placed — the webhook finalizes this attempt
         db.commit()
-        return _placement_failed("managed", "USD", "Vapi", status, err)
+        return _placement_failed(
+            "managed", "USD", "Vapi", status, err,
+            body.get("message") if isinstance(body, dict) else None)
 
 
 # ── Self-hosted transport: Plivo (skeleton to the same boundary) ────────
@@ -647,4 +682,6 @@ class PlivoTransport:
             db.commit()
             return None  # placed — stream / status callbacks finalize it
         db.commit()
-        return _placement_failed("self_hosted", "INR", "Plivo", status, err)
+        return _placement_failed(
+            "self_hosted", "INR", "Plivo", status, err,
+            (body.get("message") or body.get("error")) if isinstance(body, dict) else None)

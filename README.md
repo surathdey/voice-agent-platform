@@ -159,6 +159,14 @@ cd frontend && npm install && npm run dev   # http://localhost:5173, proxies /ap
       voice IDs) pre-filled with the owner's verified RPI voice setup
       (11labs; English eleven_turbo_v2_5, Hindi + Bengali eleven_v3).
       Edit one — the dispatch payload for that language uses your value.
+- [x] The same card carries **Transcriber profiles** (the STT side:
+      provider + model per language, Deepgram via Vapi), likewise
+      pre-filled and editable per tenant. Shipped defaults: English +
+      Hindi `nova-2`; Bengali `nova-3` — Vapi's nova-2 language enum
+      has no Bengali, so a Bengali call on nova-2 is rejected at
+      placement (HTTP 400, live-proven 2026-10-23). When a placement is
+      rejected, the call record keeps the provider's own error message,
+      not just the HTTP status.
 - [x] In the Agent studio, **Voice gender** (female / male) selects
       which of the profile's voice IDs a managed call uses; the
       assistant (LLM) model is the separate Vapi **Default model**.
