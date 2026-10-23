@@ -12,7 +12,7 @@ services:
     volumes:
       - vap_db:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-vap}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-vap} -d ${POSTGRES_DB:-voice_platform}"]
       interval: 3s
       timeout: 3s
       retries: 20
