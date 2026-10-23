@@ -28,6 +28,7 @@ const FIELD_GROUPS = [
   ['en_', 'Voice profile — English'],
   ['hi_', 'Voice profile — Hindi'],
   ['bn_', 'Voice profile — Bengali'],
+  ['rate_', 'Rate card — per-minute rates for the cost breakdown'],
 ]
 function groupFields(fields) {
   const groups = []

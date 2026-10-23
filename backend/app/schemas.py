@@ -320,6 +320,8 @@ class DispatchOut(BaseModel):
     created: int = 0                     # new attempts admitted by this run
     already_dispatched: int = 0          # leads skipped: attempt already exists
     retry_waiting: int = 0               # A10: leads skipped — their retry gap has not elapsed
+    concurrency_capped: int = 0          # A12: leads withheld — the tenant's in-flight calls fill its concurrency limit
+    cancelled_inactive: int = 0          # A12: queued attempts withdrawn — the campaign stopped being active mid-dispatch
     finalized: int = 0                   # results written by this run
     placed: int = 0                      # real-transport calls placed (A6) — result lands via webhook / stream
     counts_by_state: dict = Field(default_factory=dict)
@@ -374,6 +376,11 @@ class CampaignResultsOut(BaseModel):
     leads_by_state: dict = Field(default_factory=dict)   # pending | attempted | exhausted
     awaiting_retry: int = 0              # pending leads whose retry gap has not elapsed
     total_duration_s: int = 0
+    # A12: real cost totals from the results' cost_breakdowns, grouped
+    # per currency (never mixed): [{currency, total, calls,
+    # connected_calls, cost_per_connected}]. Stub results are excluded —
+    # simulated money is not money.
+    costs: List[dict] = []
 
 
 class DashboardOut(BaseModel):
@@ -385,6 +392,9 @@ class DashboardOut(BaseModel):
     results_total: int = 0
     dispositions: dict = Field(default_factory=dict)     # tenant-wide totals across campaigns
     review_queue_count: int = 0          # results flagged review_required, all campaigns
+    # A12: real cost totals per currency (stub results excluded) —
+    # [{currency, total, calls, connected_calls, cost_per_connected}].
+    costs: List[dict] = []
 
 
 # ── Browser test harness (A11) ────────────────────────────────────────────

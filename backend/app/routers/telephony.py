@@ -414,6 +414,13 @@ async def plivo_stream(websocket: WebSocket, session_id: str):
                     stt_detail=detail_now,
                     transcript=(live or {}).get("finals", []),
                 )
+            if engine is not None:
+                # A12: the engine's cost inputs (synthesized-audio
+                # frames actually pumped) ride the outcome into
+                # finalize, where app.costing prices the legs from the
+                # tenant's rate card. Not a §8.2 field — consumed and
+                # discarded by the finalize path.
+                outcome["cost_metrics"] = engine.metrics()
             orchestrator.finalize_attempt(db, s, outcome)
     finally:
         stt.end_live_view(session_id)

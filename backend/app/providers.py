@@ -84,6 +84,12 @@ PROVIDERS = {
              "env_attr": "VAPI_BN_VOICE_ID_FEMALE", "default": "611e0Wo6wEi3GcpkO5it"},
             {"name": "bn_voice_id_male", "label": "Bengali · male voice ID", "secret": False, "required": False,
              "env_attr": "VAPI_BN_VOICE_ID_MALE", "default": "GuSivqtqi1qfWxEuGhqa"},
+            # ── Rate card (A12) — the tenant's contracted per-minute
+            # telephony rate, used ONLY to estimate a call's cost when
+            # Vapi's own end-of-call report carries no cost breakdown
+            # (Vapi's reported figures always win). Empty = no estimate.
+            {"name": "rate_telephony_per_min", "label": "Rate card · telephony (USD per minute)", "secret": False, "required": False,
+             "env_attr": "VAPI_RATE_TELEPHONY_PER_MIN"},
         ],
     },
     "twilio": {
@@ -106,6 +112,11 @@ PROVIDERS = {
              "env_attr": "PLIVO_AUTH_ID"},
             {"name": "auth_token", "label": "Auth token", "secret": True, "required": True,
              "env_attr": "PLIVO_AUTH_TOKEN"},
+            # ── Rate card (A12) — the tenant's contracted per-minute
+            # telephony rate; per-call cost breakdowns are computed
+            # from it at finalize (app.costing). Empty = costed at 0.
+            {"name": "rate_telephony_per_min", "label": "Rate card · telephony (INR per minute)", "secret": False, "required": False,
+             "env_attr": "PLIVO_RATE_TELEPHONY_PER_MIN"},
         ],
     },
     "exotel": {
@@ -130,6 +141,19 @@ PROVIDERS = {
         "fields": [
             {"name": "api_key", "label": "API key", "secret": True, "required": True,
              "env_attr": "SARVAM_API_KEY"},
+            # ── Rate cards (A12) — the tenant's contracted per-minute
+            # rates for the three Sarvam legs; per-call cost breakdowns
+            # are computed from them at finalize (app.costing). STT is
+            # metered on streamed-audio duration, the LLM on call
+            # duration (the API returns no token usage to this
+            # integration), TTS on synthesized audio actually pumped.
+            # Empty = costed at 0.
+            {"name": "rate_stt_per_min", "label": "Rate card · STT — Saaras (INR per minute of call audio)", "secret": False, "required": False,
+             "env_attr": "SARVAM_RATE_STT_PER_MIN"},
+            {"name": "rate_llm_per_min", "label": "Rate card · LLM (INR per minute of call duration)", "secret": False, "required": False,
+             "env_attr": "SARVAM_RATE_LLM_PER_MIN"},
+            {"name": "rate_tts_per_min", "label": "Rate card · TTS — Bulbul (INR per minute of synthesized audio played)", "secret": False, "required": False,
+             "env_attr": "SARVAM_RATE_TTS_PER_MIN"},
         ],
     },
 }

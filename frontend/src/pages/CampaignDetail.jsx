@@ -191,6 +191,23 @@ export default function CampaignDetail({ campaignId, onBack }) {
               </span>
             )}
           </div>
+          {(results.costs || []).length > 0 && (
+            <div style={{ marginTop: 14 }}>
+              {results.costs.map((e) => (
+                <div key={e.currency} style={{ fontSize: 13.5, margin: '2px 0' }}>
+                  <b>Cost · {e.currency}:</b> total {e.total} over {e.calls} costed call(s)
+                  {e.connected_calls > 0 && (
+                    <> — <b>{e.cost_per_connected}</b> per connected call</>
+                  )}
+                </div>
+              ))}
+              <div style={{ color: 'var(--slate)', fontSize: 12.5, marginTop: 4 }}>
+                From each result's own cost breakdown — the provider's reported
+                figures, or computed from this tenant's rate card (Settings →
+                Providers). Stub runs are excluded: simulated money is not money.
+              </div>
+            </div>
+          )}
           <p className="footnote" style={{ marginTop: 12 }}>
             Disposition buckets come from the agent's own prompt — its
             DISPOSITIONS section is the single source of truth, so editing

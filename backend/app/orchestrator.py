@@ -56,6 +56,7 @@ from datetime import date, datetime, timedelta
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from . import costing
 from . import market_time as mt
 from . import providers as prov
 from .config import settings
@@ -320,7 +321,13 @@ def finalize_attempt(db: Session, session: CallSession, outcome: dict):
         summary=outcome.get("summary") or "",
         captured_fields=outcome.get("captured_fields") or {},
         duration_s=int(outcome.get("duration_s") or 0),
-        cost_breakdown=outcome.get("cost_breakdown") or {},
+        # A12: real per-call cost, decided HERE in the single-writer
+        # path — provider-reported figures kept, the stub's labelled
+        # zeros kept, everything else computed from the tenant's rate
+        # card (app.costing). The outcome's transient "cost_metrics"
+        # (engine frames pumped) is consumed by the computation and
+        # never stored.
+        cost_breakdown=costing.finalize_breakdown(db, session, outcome),
     )
     db.add(result)
 
@@ -458,10 +465,14 @@ class Dispatcher:
     Enqueue: one CallSession (QUEUED) per admissible lead, idempotent by
     attempt_id. Admissible = campaign ACTIVE (the router enforces it),
     schedule open in market-local time, lead pending and under its
-    attempt cap, daily cap not reached, and — for re-queued leads — the
-    retry gap elapsed. Worker: drains the queue in batches of the
-    tenant's concurrency_limit through the resolved transport into
-    finalize.
+    attempt cap, daily cap not reached, retry gap elapsed for re-queued
+    leads, and — A12 — room under the tenant's concurrency limit, which
+    counts calls in flight across ALL the tenant's campaigns. Worker:
+    drains the queue in batches of the tenant's concurrency_limit
+    through the resolved transport into finalize, re-reading the
+    campaign's status before every attempt — a campaign paused or
+    completed mid-dispatch stops the run and its un-run queued attempts
+    are withdrawn (A12).
     """
 
     def dispatch(self, db: Session, campaign: Campaign) -> dict:
@@ -481,6 +492,8 @@ class Dispatcher:
             "created": 0,
             "already_dispatched": 0,
             "retry_waiting": 0,
+            "concurrency_capped": 0,
+            "cancelled_inactive": 0,
             "finalized": 0,
             "placed": 0,
             "message": "",
@@ -528,10 +541,30 @@ class Dispatcher:
                  if l.next_attempt_at is None or l.next_attempt_at <= now_utc]
         report["retry_waiting"] = len(pool) - len(leads)
 
+        # Tenant concurrency headroom (A12): the tenant's limit covers
+        # calls IN FLIGHT across ALL its campaigns, not just this one.
+        # Sessions already QUEUED / DIALING / IN_CALL — placed by an
+        # earlier dispatch of any campaign and not yet terminal —
+        # consume the limit first; this dispatch admits only what fits.
+        # (The stub finalizes inside its own dispatch, so its headroom
+        # is back by the next dispatch; placed real calls hold theirs
+        # until the provider ends them.)
+        limit = max(1, (tenant.concurrency_limit if tenant else 20) or 20)
+        in_flight = (
+            db.query(CallSession)
+            .filter(CallSession.tenant_id == campaign.tenant_id,
+                    CallSession.state.in_(("QUEUED", "DIALING", "IN_CALL")))
+            .count()
+        )
+        headroom = max(0, limit - in_flight)
+
         queued: list[CallSession] = []
         for lead in leads:
             if remaining_cap is not None and len(queued) >= remaining_cap:
                 break
+            if len(queued) >= headroom:
+                report["concurrency_capped"] += 1
+                continue
             attempt_id = _attempt_id(campaign, lead, (lead.attempt_count or 0) + 1)
             exists = (
                 db.query(CallSession)
@@ -565,11 +598,27 @@ class Dispatcher:
         # placed; its result lands later via webhook / stream through
         # the same finalize path).
         agent = db.get(AgentConfig, campaign.agent_id)
-        limit = max(1, (tenant.concurrency_limit if tenant else 20) or 20)
         run_start = datetime.utcnow()
         seq = 0
+        stopped_status = ""
         for i in range(0, len(queued), limit):
             for session in queued[i:i + limit]:
+                # Mid-dispatch stop (A12): the campaign's status is
+                # re-read before EVERY attempt. If it was paused or
+                # completed while this dispatch was running, no further
+                # attempt is placed — the sessions this dispatch created
+                # but never ran are withdrawn below (they never became
+                # attempts: no provider call, no result, no attempt
+                # count), so the leads stay pending for a future
+                # dispatch if the campaign is ever active again.
+                status_now = (
+                    db.query(Campaign.status)
+                    .filter(Campaign.campaign_id == campaign.campaign_id)
+                    .scalar()
+                )
+                if status_now != "active":
+                    stopped_status = status_now or "missing"
+                    break
                 outcome = transport.run(db, session, agent, campaign, seq, run_start)
                 if outcome is None:
                     report["placed"] += 1
@@ -578,8 +627,23 @@ class Dispatcher:
                     if created:
                         report["finalized"] += 1
                 seq += 1
+            if stopped_status:
+                break
+        if stopped_status:
+            withdrawn = [s for s in queued[seq:] if s.state == "QUEUED"]
+            for s in withdrawn:
+                db.delete(s)
+            db.commit()
+            report["cancelled_inactive"] = len(withdrawn)
+            report["created"] -= len(withdrawn)
 
-        if report["placed"]:
+        if stopped_status:
+            report["message"] = (
+                f"Dispatch stopped — the campaign became {stopped_status} "
+                f"while this dispatch was running; "
+                f"{report['cancelled_inactive']} queued attempt(s) were "
+                "withdrawn before any call was placed for them.")
+        elif report["placed"]:
             report["message"] = (
                 f"Placed {report['placed']} call(s) via the {transport_name} "
                 "transport — results land as the provider reports them "
@@ -598,10 +662,21 @@ class Dispatcher:
             report["message"] = (
                 f"{report['retry_waiting']} lead(s) are re-queued but their "
                 "retry gap has not elapsed yet — nothing new dispatched.")
+        elif report["concurrency_capped"]:
+            report["message"] = (
+                f"No attempts admitted — {report['concurrency_capped']} "
+                f"lead(s) are admissible but the tenant's concurrency limit "
+                f"({limit}) is fully in flight across its campaigns. They "
+                "will be admitted once in-flight calls end.")
         else:
             report["message"] = "No pending leads to dispatch."
         if report["retry_waiting"] and (report["created"] or report["placed"]):
             report["message"] += (
                 f" ({report['retry_waiting']} more lead(s) are waiting for "
                 "their retry gap to elapse.)")
+        if report["concurrency_capped"] and (report["created"] or report["placed"]):
+            report["message"] += (
+                f" ({report['concurrency_capped']} more lead(s) held by "
+                f"the tenant's concurrency limit ({limit}) — they will be "
+                "admitted once in-flight calls end.)")
         return report

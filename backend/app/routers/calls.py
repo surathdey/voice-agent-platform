@@ -140,6 +140,41 @@ def _counts(db: Session, query) -> dict:
     return counts
 
 
+def _cost_summary(pairs) -> list:
+    """Aggregate stored cost_breakdowns into per-currency totals (A12).
+
+    `pairs` yields (CallResult, final_state). Currencies are NEVER
+    mixed: each currency gets its own entry {currency, total, calls,
+    connected_calls, cost_per_connected}. Stub results are excluded —
+    their zeros are labelled simulated, and simulated money must not
+    dilute real cost-per-connected figures.
+    """
+    by_currency: dict[str, dict] = {}
+    for result, final_state in pairs:
+        cb = result.cost_breakdown or {}
+        if cb.get("mode") == "stub":
+            continue
+        currency = cb.get("currency") or ""
+        if not currency:
+            continue
+        entry = by_currency.setdefault(currency, {
+            "currency": currency, "total": 0.0, "calls": 0,
+            "connected_calls": 0, "cost_per_connected": 0.0})
+        entry["total"] += float(cb.get("total") or 0)
+        entry["calls"] += 1
+        if final_state == "COMPLETED":
+            entry["connected_calls"] += 1
+    out = []
+    for currency in sorted(by_currency):
+        entry = by_currency[currency]
+        entry["total"] = round(entry["total"], 4)
+        if entry["connected_calls"]:
+            entry["cost_per_connected"] = round(
+                entry["total"] / entry["connected_calls"], 4)
+        out.append(entry)
+    return out
+
+
 @router.post("/api/campaigns/{campaign_id}/dispatch", response_model=DispatchOut)
 def run_dispatch(campaign_id: str, user: User = Depends(get_current_user),
                  db: Session = Depends(get_db)):
@@ -229,6 +264,8 @@ def campaign_results(campaign_id: str, user: User = Depends(get_current_user),
         leads_by_state=leads_by_state,
         awaiting_retry=awaiting,
         total_duration_s=total_duration,
+        costs=_cost_summary(
+            (r, session_state.get(r.session_id)) for r in results),
     )
 
 
@@ -264,6 +301,11 @@ def dashboard(user: User = Depends(get_current_user),
         dispositions[key] = dispositions.get(key, 0) + 1
         if r.review_required:
             review += 1
+    result_states = {
+        s.session_id: s.state
+        for s in db.query(CallSession)
+        .filter(CallSession.tenant_id == user.tenant_id).all()
+    }
 
     return DashboardOut(
         timezone=mt.tenant_timezone_name(tenant),
@@ -274,6 +316,8 @@ def dashboard(user: User = Depends(get_current_user),
         results_total=len(results),
         dispositions=dispositions,
         review_queue_count=review,
+        costs=_cost_summary(
+            (r, result_states.get(r.session_id)) for r in results),
     )
 
 

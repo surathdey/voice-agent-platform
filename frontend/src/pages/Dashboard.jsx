@@ -120,6 +120,25 @@ export default function Dashboard({ onOpenCalls, onOpenCampaigns }) {
                   </button>
                 </div>
               </div>
+              <div className="card" style={{ marginTop: 20 }}>
+                <h3 className="section-title">Cost — all campaigns</h3>
+                {(data.costs || []).length === 0 && (
+                  <p style={{ margin: 0, color: 'var(--slate)' }}>
+                    No costed calls yet. Real calls are priced from each
+                    result's cost breakdown — the provider's reported
+                    figures, or the tenant's rate card in Settings →
+                    Providers. Stub runs never count as money.
+                  </p>
+                )}
+                {(data.costs || []).map((e) => (
+                  <div key={e.currency} style={{ margin: '4px 0', fontSize: 13.5 }}>
+                    <b>{e.currency}:</b> total {e.total} over {e.calls} costed call(s)
+                    {e.connected_calls > 0 && (
+                      <> — <b>{e.cost_per_connected}</b> per connected call</>
+                    )}
+                  </div>
+                ))}
+              </div>
             </div>
           </div>
         </>

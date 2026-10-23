@@ -490,6 +490,11 @@ async def browser_stream(websocket: WebSocket, session_id: str):
             elif not summary.startswith("[BROWSER TEST]"):
                 summary = "[BROWSER TEST] " + summary
             outcome["summary"] = summary.strip()
+            # A12: the engine's cost inputs ride the outcome into
+            # finalize (see routers/telephony.py) — the TTS leg is
+            # priced on the synthesized audio actually pumped; the
+            # browser channel's telephony leg is labelled, never costed.
+            outcome["cost_metrics"] = engine.metrics()
             orchestrator.finalize_attempt(db, s, outcome)
             result = (
                 db.query(CallResult)

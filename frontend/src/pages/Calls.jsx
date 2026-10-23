@@ -194,6 +194,32 @@ export default function Calls() {
                       </div>
                     )}
                     {c.summary && <div style={{ marginBottom: 6 }}>{c.summary}</div>}
+                    {c.cost_breakdown && c.cost_breakdown.total !== undefined && (
+                      <div style={{ marginBottom: 6, fontSize: 13 }}>
+                        <b>Cost:</b>{' '}
+                        telephony {c.cost_breakdown.telephony ?? 0} ·{' '}
+                        STT {c.cost_breakdown.stt ?? 0} ·{' '}
+                        LLM {c.cost_breakdown.llm ?? 0} ·{' '}
+                        TTS {c.cost_breakdown.tts ?? 0} —{' '}
+                        <b>total {c.cost_breakdown.total} {c.cost_breakdown.currency || ''}</b>
+                        {c.cost_breakdown.mode === 'stub' && (
+                          <span style={{ color: 'var(--slate)' }}> (simulated — not real money)</span>
+                        )}
+                        {c.cost_breakdown.cost_source === 'provider' && (
+                          <span style={{ color: 'var(--slate)' }}> (as reported by the provider)</span>
+                        )}
+                        {c.cost_breakdown.cost_source === 'rate_card' && (
+                          <span style={{ color: 'var(--slate)' }}> (computed from the tenant's rate card)</span>
+                        )}
+                        {c.cost_breakdown.basis && (
+                          <div style={{ color: 'var(--slate)', fontSize: 12.5, marginTop: 2 }}>
+                            {Object.entries(c.cost_breakdown.basis).map(([leg, note]) => (
+                              <div key={leg}>{leg}: {note}</div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
                     {(c.transcript || []).length === 0 && !c.summary && (
                       <span style={{ color: 'var(--slate)' }}>No transcript for this call.</span>
                     )}

@@ -369,6 +369,22 @@ def map_vapi_report(message: dict):
     if review_required and not summary:
         summary = ("Managed call completed, but the provider's analysis "
                    "returned no disposition — flagged for human review.")
+    breakdown = {
+        "telephony": cb.get("transport", 0) or 0,
+        "stt": cb.get("stt", 0) or 0,
+        "llm": cb.get("llm", 0) or 0,
+        "tts": cb.get("tts", 0) or 0,
+        "total": cb.get("total", 0) or 0,
+        "currency": "USD",
+        "mode": "managed",
+    }
+    if cb:
+        # A12: the provider metered this call itself — finalize keeps
+        # these figures verbatim (app.costing). A report WITHOUT a
+        # cost breakdown gets no stamp: finalize then estimates
+        # telephony from the tenant's rate card and marks the other
+        # legs "not reported by the provider".
+        breakdown["cost_source"] = "provider"
     outcome = {
         "final_state": final_state,
         "end_reason": end_reason,
@@ -380,15 +396,7 @@ def map_vapi_report(message: dict):
         "duration_s": duration_s,
         "recording_url": artifact.get("recordingUrl") or message.get("recordingUrl") or "",
         "transcript": _vapi_transcript(message),
-        "cost_breakdown": {
-            "telephony": cb.get("transport", 0) or 0,
-            "stt": cb.get("stt", 0) or 0,
-            "llm": cb.get("llm", 0) or 0,
-            "tts": cb.get("tts", 0) or 0,
-            "total": cb.get("total", 0) or 0,
-            "currency": "USD",
-            "mode": "managed",
-        },
+        "cost_breakdown": breakdown,
     }
     return binding, outcome
 

@@ -495,6 +495,12 @@ class ConversationEngine:
         self.llm_detail = ""
         self.tts_status = "active"
         self.tts_detail = ""
+        # A12 cost metering: μ-law frames of synthesized audio actually
+        # pumped into the stream, accumulated by _speak (a sentence cut
+        # by barge-in contributes only the frames that left). 160-byte
+        # frames at 8 kHz = 20 ms each — app.costing turns this into
+        # the TTS leg's cost at finalize.
+        self._tts_frames = 0
         self.end_reason = ""               # agent_end_call | max_turns | max_duration | no_input
         self._inbox: asyncio.Queue = asyncio.Queue()
         self._task: asyncio.Task | None = None
@@ -522,6 +528,11 @@ class ConversationEngine:
     def legs(self) -> dict:
         return {"llm_status": self.llm_status, "llm_detail": self.llm_detail,
                 "tts_status": self.tts_status, "tts_detail": self.tts_detail}
+
+    def metrics(self) -> dict:
+        """A12 cost inputs for finalize: the synthesized-audio frames
+        actually pumped across every sentence of this call."""
+        return {"tts_frames": self._tts_frames}
 
     def enqueue_final(self, turn: dict) -> None:
         """STT leg → engine: one final customer segment. Runs on the
@@ -856,10 +867,13 @@ class ConversationEngine:
         try:
             for i in range(0, len(audio), 160):
                 if self._interrupt.is_set():
+                    self._tts_frames += frames
                     return "interrupted", frames
                 await self._send_audio(audio[i:i + 160])
                 frames += 1
         except Exception:
             self._send_dead = True
+            self._tts_frames += frames
             return "failed", frames
+        self._tts_frames += frames
         return "spoken", frames

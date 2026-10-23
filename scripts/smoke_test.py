@@ -2958,6 +2958,685 @@ try:
     _ai11_server.shutdown()
     _stt11_server.shutdown()
 
+    print("── A12: rate cards → real cost · edge cases · 500-lead load ──")
+    # The final Phase A chunk. Rate cards live in Provider Settings and
+    # finalize computes the real breakdown from them; the edge cases run
+    # against a purpose-built fake provider (accepts-and-hangs / rejects /
+    # flips the campaign mid-dispatch) and A12's OWN Sarvam mocks (A8/A11's
+    # are shut down by their sections). The load test is stub-only.
+    # No live provider is called anywhere in this section.
+    from datetime import datetime as _dt12, timedelta as _td12, timezone as _tz12
+
+    def _raw12(base, method, path, body=None, token=None, timeout=120):
+        """Like call6 but with a caller-chosen timeout (the hang test's
+        dispatch legitimately takes ~15 s server-side)."""
+        data = json.dumps(body).encode() if body is not None else (
+            b"" if method == "POST" else None)
+        req = urllib.request.Request(base + path, data=data, method=method,
+                                     headers={"Content-Type": "application/json"})
+        if token:
+            req.add_header("Authorization", "Bearer " + token)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.status, json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            raw = e.read()
+            try:
+                return e.code, json.loads(raw or b"{}")
+            except Exception:
+                return e.code, {}
+
+    def _webhook12(base, sid, call_id, seconds=60, cost=None,
+                   disposition="RPC_CONFIRMED"):
+        t0 = _dt12(2026, 10, 23, 10, 0, 0, tzinfo=_tz12.utc)
+        fmt = lambda d: d.isoformat().replace("+00:00", "Z")
+        msg = {"type": "end-of-call-report",
+               "call": {"id": call_id, "metadata": {"session_id": sid}},
+               "startedAt": fmt(t0), "endedAt": fmt(t0 + _td12(seconds=seconds)),
+               "endedReason": "customer-ended-call",
+               "transcript": "agent: Hello.\ncustomer: Yes, speaking.",
+               "analysis": {"summary": "A12 webhook report.",
+                            "structuredData": {"disposition": disposition}},
+               "artifact": {"recordingUrl": "https://recordings.example/a12.mp3"}}
+        if cost is not None:
+            msg["costBreakdown"] = cost
+        req = urllib.request.Request(
+            base + "/api/telephony/vapi/webhook",
+            data=json.dumps({"message": msg}).encode(), method="POST",
+            headers={"Content-Type": "application/json",
+                     "x-vapi-secret": "a6-webhook-secret"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return r.status, json.loads(r.read() or b"{}")
+
+    def _row12(base, token, sid):
+        _s, cl = call6(base, "GET", "/api/calls?limit=200", token=token)
+        return next((c for c in cl["calls"] if c["session_id"] == sid), None)
+
+    # ── load: 500 stub leads to completion + a zero-lead no-op ──────
+    baseL = start_app6(18115, "load", {})
+    _s, tenantL = call6(baseL, "POST", "/api/tenants", {
+        "name": "A12 Load Co", "market": "IN", "concurrency_limit": 1000})
+    _s, loginL = call6(baseL, "POST", "/api/auth/login", {
+        "email": tenantL["admin_email"], "password": tenantL["admin_password"]})
+    tokenL = loginL["access_token"]
+    _s, agentL = call6(baseL, "POST", "/api/agents", {
+        "name": "A12 Load Agent",
+        "prompt": "ROLE\nYou verify identity for the lender.\n\nFLOW\n"
+                  "1. Greet and ask.\n\nDISPOSITIONS\n"
+                  "- CONFIRMED: the right party confirmed.\n"
+                  "- DENIED: the callee denied knowledge.\n"
+                  "- CALLBACK: a callback was requested.\n\n"
+                  "CLOSINGS\nClose politely.\n"}, token=tokenL, expect=201)
+    csvL = ("callee_name,phone_number,bank_name,state\n" + "\n".join(
+        f"Load Person {i},9600{i:06d},Tata Capital,West Bengal"
+        for i in range(1, 501)) + "\n")
+    cidL = campaign6(baseL, tokenL, agentL["agent_id"], "A12 — 500 Lead Load",
+                     "self_hosted", csvL)
+    t0L = time.monotonic()
+    stL, repL = _raw12(baseL, "POST", f"/api/campaigns/{cidL}/dispatch",
+                       token=tokenL, timeout=300)
+    wallL = time.monotonic() - t0L
+    check6("A12 load: a 500-lead stub dispatch runs to completion",
+           stL == 200 and repL["created"] == 500 and repL["finalized"] == 500,
+           (stL, {k: repL.get(k) for k in ("created", "finalized")}))
+    _s, callsL = call6(baseL, "GET", f"/api/campaigns/{cidL}/calls?limit=600",
+                       token=tokenL)
+    check6("A12 load: exactly 500 sessions, every one COMPLETED",
+           callsL["total"] == 500
+           and all(c["final_state"] == "COMPLETED" for c in callsL["calls"]),
+           callsL["total"])
+    _s, resL = call6(baseL, "GET", f"/api/campaigns/{cidL}/results", token=tokenL)
+    check6("A12 load: exactly 500 results (exactly-one-result under volume); "
+           "per-disposition counts sum to 500",
+           resL["results_count"] == 500 and resL["attempts_made"] == 500
+           and sum(resL["counts_by_disposition"].values()) == 500,
+           (resL["results_count"], resL["counts_by_disposition"]))
+    print(f"        (500-lead stub dispatch wall-clock: {wallL:.1f}s)")
+    check6("A12 load: stub results carry NO money (mode stub, total 0) and "
+           "are excluded from the cost aggregates",
+           all((c["cost_breakdown"] or {}).get("mode") == "stub"
+               and (c["cost_breakdown"] or {}).get("total") == 0
+               for c in callsL["calls"]) and resL["costs"] == [],
+           resL["costs"])
+    _s, campZ = call6(baseL, "POST", "/api/campaigns", {
+        "agent_id": agentL["agent_id"], "name": "A12 — Zero Leads", "schedule": {"window_start": "00:00", "window_end": "23:59", "calling_days": "Mon - Sun", "daily_cap": 2000},
+        "provider_mode": "self_hosted"}, token=tokenL, expect=201)
+    call6(baseL, "POST", f"/api/campaigns/{campZ['campaign_id']}/status",
+          {"status": "active"}, token=tokenL)
+    _s, repZ = call6(baseL, "POST",
+                     f"/api/campaigns/{campZ['campaign_id']}/dispatch",
+                     token=tokenL)
+    check6("A12: dispatching a campaign with zero leads is a clean no-op",
+           repZ["created"] == 0 and repZ["finalized"] == 0
+           and repZ["message"] == "No pending leads to dispatch.", repZ)
+
+    # ── A12's own Sarvam mocks: chat/TTS/classifier + Saaras STT ────
+    _LONG12 = " ".join(f"Long answer sentence {i}." for i in range(1, 121))
+    MOCK_AI12 = {"chat": [], "tts": [], "classify": []}
+
+    class _MockAI12(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def _send(self, data, ctype):
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b""
+            try:
+                body = json.loads(raw) if raw else {}
+            except Exception:
+                body = {}
+            if self.path.endswith("/chat/completions"):
+                msgs = body.get("messages") or []
+                system = msgs[0].get("content", "") if msgs else ""
+                if "POST-CALL CLASSIFIER" in system:
+                    MOCK_AI12["classify"].append(body)
+                    content = json.dumps({
+                        "disposition": "ANSWERED",
+                        "captured_fields": {"favourite_colour": "blue"},
+                        "confidence": 0.93, "summary": "A12 mock classification."})
+                    self._send(json.dumps({"choices": [{"message": {
+                        "role": "assistant", "content": content}}]}).encode(),
+                        "application/json")
+                    return
+                MOCK_AI12["chat"].append(body)
+                users = [m.get("content", "") for m in msgs
+                         if m.get("role") == "user"]
+                last = users[-1] if users else ""
+                if last == _L2_8:
+                    pieces = ["Thank you for your answers. ", "Have a good day."]
+                    end_call = True
+                elif last == _L1_8:
+                    pieces = ["Blue is a lovely ", "colour. And do you prefer it ",
+                              "for clothes or for cars?"]
+                    end_call = False
+                elif "A12 LONG SURVEY" in system:
+                    pieces = [_LONG12[i:i + 240]
+                              for i in range(0, len(_LONG12), 240)]
+                    end_call = False
+                else:  # the kickoff — greeting + the one survey question
+                    pieces = ["Hello, this is a short survey ",
+                              "call. What is your favourite colour?"]
+                    end_call = False
+                lines = []
+                for p in pieces:
+                    lines.append("data: " + json.dumps(
+                        {"choices": [{"delta": {"content": p}}]}) + "\n\n")
+                if end_call:
+                    lines.append("data: " + json.dumps({"choices": [{"delta": {
+                        "tool_calls": [{"index": 0, "id": "call_end_12",
+                                        "type": "function",
+                                        "function": {"name": "end_call",
+                                                     "arguments": ""}}]}}]})
+                        + "\n\n")
+                lines.append("data: [DONE]\n\n")
+                self._send("".join(lines).encode(), "text/event-stream")
+                return
+            if self.path.endswith("/text-to-speech"):
+                MOCK_AI12["tts"].append(body)
+                text = (body.get("inputs") or [""])[0]
+                self._send(json.dumps({"audios": [
+                    _b64_8.b64encode(_mock_audio8(text)).decode()]}).encode(),
+                    "application/json")
+                return
+            self._send(b"{}", "application/json")
+
+    def _mock_saaras12(ws):
+        info = {"frames": 0}
+        try:
+            for raw in ws:
+                try:
+                    msg = json.loads(raw)
+                except Exception:
+                    continue
+                if "audio" not in msg:
+                    continue
+                info["frames"] += 1
+                line = _L1_8 if info["frames"] == 1 else (
+                    _L2_8 if info["frames"] == 2 else "")
+                if line:
+                    ws.send(json.dumps({"type": "data", "data": {
+                        "transcript": line, "is_final": True}}))
+        except Exception:
+            pass  # client went away mid-stream — the mock just stops
+
+    _ai12_server = ThreadingHTTPServer(("127.0.0.1", 0), _MockAI12)
+    threading.Thread(target=_ai12_server.serve_forever, daemon=True).start()
+    MOCK_AI12_URL = f"http://127.0.0.1:{_ai12_server.server_address[1]}"
+    _stt12_server = _ws_serve7(_mock_saaras12, "127.0.0.1", 0)
+    threading.Thread(target=_stt12_server.serve_forever, daemon=True).start()
+    MOCK_STT12_URL = f"ws://127.0.0.1:{_stt12_server.socket.getsockname()[1]}"
+
+    # ── real cost: a self-hosted call priced from the rate card ─────
+    baseC = start_app6(18116, "cost", {
+        "TELEPHONY_MODE": "self_hosted", "PLIVO_AUTH_ID": "MAFAKEID",
+        "PLIVO_AUTH_TOKEN": "fake-plivo-token", "SARVAM_API_KEY": "sk-fake-sarvam",
+        "SARVAM_WS_URL": MOCK_STT12_URL, "SARVAM_BASE_URL": MOCK_AI12_URL})
+    tokenC = login6(baseC)
+    call6(baseC, "PUT", "/api/settings/providers/plivo",
+          {"fields": {"rate_telephony_per_min": "2"}}, token=tokenC)
+    call6(baseC, "PUT", "/api/settings/providers/sarvam",
+          {"fields": {"rate_stt_per_min": "3", "rate_llm_per_min": "5",
+                      "rate_tts_per_min": "7"}}, token=tokenC)
+    _s, viewP = call6(baseC, "GET", "/api/settings/providers/plivo", token=tokenC)
+    _s, viewS = call6(baseC, "GET", "/api/settings/providers/sarvam", token=tokenC)
+    fp12 = {f["name"]: f for f in viewP["fields"]}
+    fs12 = {f["name"]: f for f in viewS["fields"]}
+    check6("A12: rate cards are tenant settings — stored per provider, "
+           "labelled per-minute, shipped empty",
+           fp12["rate_telephony_per_min"]["value"] == "2"
+           and fp12["rate_telephony_per_min"]["source"] == "tenant"
+           and "per minute" in fp12["rate_telephony_per_min"]["label"]
+           and fs12["rate_stt_per_min"]["value"] == "3"
+           and fs12["rate_llm_per_min"]["value"] == "5"
+           and fs12["rate_tts_per_min"]["value"] == "7",
+           (fp12["rate_telephony_per_min"], fs12["rate_tts_per_min"]))
+    _s, agentC = call6(baseC, "POST", "/api/agents", {
+        "name": "A12 Cost Survey Agent", "prompt": _SCRIPTED_PROMPT_8,
+        "llm_model": "sarvam-105b", "tts_voice_id": "bulbul-bn-female-1",
+        "language_rule": {"default": "hi-IN",
+                          "by_state": {"West Bengal": "bn-IN"}},
+        "captured_fields": [{"name": "favourite_colour", "type": "string",
+                             "description": "The callee's favourite colour"}]},
+        token=tokenC, expect=201)
+    cidC = campaign6(baseC, tokenC, agentC["agent_id"], "A12 — Costed Batch",
+                     "self_hosted",
+                     "callee_name,phone_number,bank_name,state\n"
+                     "C. Rao,9500000011,Tata Capital,West Bengal\n")
+    _s, repC = call6(baseC, "POST", f"/api/campaigns/{cidC}/dispatch",
+                     token=tokenC)
+    check6("A12: the costed call is placed via Plivo (fake provider)",
+           repC["placed"] == 1 and repC["transport"] == "self_hosted", repC)
+    _s, callsC = call6(baseC, "GET", f"/api/campaigns/{cidC}/calls", token=tokenC)
+    sidC = callsC["calls"][0]["session_id"]
+
+    def _wait_audio12(ws, sink, events, target_bytes, timeout=20):
+        """_wait_audio8 + a playAudio EVENT counter (one event = one
+        pumped 20 ms frame — the TTS cost basis)."""
+        deadline = time.monotonic() + timeout
+        closed = False
+        while len(sink) < target_bytes and time.monotonic() < deadline:
+            try:
+                raw = ws.recv(timeout=max(0.05, deadline - time.monotonic()))
+            except TimeoutError:
+                break
+            except Exception:
+                closed = True
+                break
+            try:
+                ev = json.loads(raw)
+            except Exception:
+                continue
+            if ev.get("event") == "playAudio":
+                events[0] += 1
+                sink.extend(_b64_8.b64decode(
+                    (ev.get("media") or {}).get("payload") or ""))
+        return closed
+
+    audioC = bytearray()
+    evC = [0]
+    wsC = _stream_open8(baseC, tokenC, sidC)
+    _wait_audio12(wsC, audioC, evC, _audio_len8(_R1_8))
+    _media8(wsC)
+    _wait_audio12(wsC, audioC, evC, _audio_len8(_R1_8) + _audio_len8(_R2_8))
+    _media8(wsC)
+    _wait_audio12(wsC, audioC, evC,
+                  _audio_len8(_R1_8) + _audio_len8(_R2_8) + _audio_len8(_R3_8))
+    _wait_closed8(wsC, 5.0)
+    try:
+        wsC.close()
+    except Exception:
+        pass
+    doneC = poll8(baseC, tokenC, cidC, sidC, lambda c: c["final_state"] is not None)
+    cbC = (doneC or {}).get("cost_breakdown") or {}
+    durC = (doneC or {}).get("duration_s") or 0
+    framesC = evC[0]
+    exp_framesC = sum(-(-len(_mock_audio8(t["inputs"][0])) // 160)
+                      for t in MOCK_AI12["tts"])
+    check6("A12: the wire carried exactly one playAudio per pumped frame, "
+           "bytes == the mock's synthesized audio",
+           framesC == exp_framesC and framesC > 0
+           and len(audioC) == sum(len(_mock_audio8(t["inputs"][0]))
+                                  for t in MOCK_AI12["tts"]),
+           (framesC, exp_framesC, len(audioC)))
+    expC = {"telephony": round(2.0 * durC / 60, 4),
+            "stt": round(3.0 * durC / 60, 4),
+            "llm": round(5.0 * durC / 60, 4),
+            "tts": round(7.0 * framesC * 0.02 / 60, 4)}
+    expC["total"] = round(sum(expC.values()), 4)
+    check6("A12: finalize computes the REAL breakdown from the rate card — "
+           "telephony/STT/LLM from duration, TTS from pumped frames only",
+           doneC is not None
+           and all(cbC.get(k) == v for k, v in expC.items())
+           and cbC.get("currency") == "INR" and cbC.get("mode") == "self_hosted"
+           and cbC.get("cost_source") == "rate_card"
+           and cbC.get("rates_per_min") == {"telephony": 2.0, "stt": 3.0,
+                                            "llm": 5.0, "tts": 7.0}
+           and set(cbC.get("basis") or {}) == {"telephony", "stt", "llm", "tts"}
+           and cbC.get("total") > 0,
+           (durC, framesC, cbC))
+
+    # ── real cost: the browser-test channel (telephony 0, labelled) ──
+    ttsB0 = len(MOCK_AI12["tts"])
+    _s, btB = call6(baseC, "POST", "/api/browser-tests", {
+        "agent_id": agentC["agent_id"],
+        "lead": {"name": "Browser Cost", "phone_number": "9000000098",
+                 "bank_name": "Tata Capital", "state": "West Bengal"}},
+        token=tokenC, expect=201)
+    sidB = btB["session_id"]
+    clientB = _bt_open(baseC, sidB, tokenC)
+    clientB.until(lambda: any(e.get("event") == "ready" for e in clientB.events), 10)
+    clientB.ws.send(_pcm11(1000))
+    clientB.until(lambda: any(t["text"] == _R2_8 for t in clientB.turns()), 25)
+    clientB.ws.send(_pcm11(1200))
+    endedB = clientB.until(
+        lambda: any(e.get("event") == "ended" for e in clientB.events), 25)
+    check6("A12: the browser cost call completes the scripted conversation",
+           bool(endedB), [e.get("event") for e in clientB.events][-4:])
+    try:
+        clientB.ws.close()
+    except Exception:
+        pass
+    doneB = _bt_poll(baseC, tokenC, sidB, lambda c: c["final_state"] is not None)
+    cbB = (doneB or {}).get("cost_breakdown") or {}
+    durB = (doneB or {}).get("duration_s") or 0
+    framesB = sum(-(-len(_mock_audio8(t["inputs"][0])) // 160)
+                  for t in MOCK_AI12["tts"][ttsB0:])
+    expB = {"stt": round(3.0 * durB / 60, 4), "llm": round(5.0 * durB / 60, 4),
+            "tts": round(7.0 * framesB * 0.02 / 60, 4)}
+    check6("A12: browser-test calls cost the real legs the same way — "
+           "telephony 0 and labelled browser",
+           doneB is not None and cbB.get("telephony") == 0
+           and "browser" in (cbB.get("basis") or {}).get("telephony", "")
+           and all(cbB.get(k) == v for k, v in expB.items())
+           and cbB.get("total") == round(sum(expB.values()), 4)
+           and cbB.get("channel") == "browser-test"
+           and doneB["disposition"] == "ANSWERED",
+           (durB, framesB, cbB))
+
+    # ── edge: a very long transcript still classifies ────────────────
+    _s, agentLong = call6(baseC, "POST", "/api/agents", {
+        "name": "A12 Long Survey Agent",
+        "prompt": _SCRIPTED_PROMPT_8 + "\nA12 LONG SURVEY\n",
+        "llm_model": "sarvam-105b", "tts_voice_id": "bulbul-bn-female-1",
+        "language_rule": {"default": "hi-IN",
+                          "by_state": {"West Bengal": "bn-IN"}},
+        "captured_fields": [{"name": "favourite_colour", "type": "string",
+                             "description": "The callee's favourite colour"}]},
+        token=tokenC, expect=201)
+    cls0L = len(MOCK_AI12["classify"])
+    _s, btL = call6(baseC, "POST", "/api/browser-tests", {
+        "agent_id": agentLong["agent_id"],
+        "lead": {"name": "Long Tester", "phone_number": "9000000097",
+                 "bank_name": "Tata Capital", "state": "West Bengal"}},
+        token=tokenC, expect=201)
+    clientL = _bt_open(baseC, btL["session_id"], tokenC)
+    clientL.until(lambda: any(e.get("event") == "ready" for e in clientL.events), 10)
+    long_turn = clientL.until(
+        lambda: any(t["text"] == _LONG12 for t in clientL.turns()), 40)
+    check6("A12: a very long agent turn streams and lands in the transcript whole",
+           bool(long_turn), len(clientL.turns()))
+    clientL.ws.send(_pcm11(1000))
+    clientL.until(lambda: any(t["text"] == _R2_8 for t in clientL.turns()), 25)
+    clientL.ws.send(_pcm11(1200))
+    clientL.until(lambda: any(e.get("event") == "ended" for e in clientL.events), 25)
+    try:
+        clientL.ws.close()
+    except Exception:
+        pass
+    doneL = _bt_poll(baseC, tokenC, btL["session_id"],
+                     lambda c: c["final_state"] is not None)
+    clsL = MOCK_AI12["classify"][cls0L:]
+    check6("A12: the classifier still classifies the very long transcript — "
+           "real bucket, no crash, no review-flag excuse",
+           doneL is not None and doneL["final_state"] == "COMPLETED"
+           and doneL["disposition"] == "ANSWERED"
+           and doneL["review_required"] is False
+           and any(t["speaker"] == "agent" and t["text"] == _LONG12
+                   for t in doneL["transcript"])
+           and len(clsL) == 1
+           and len(clsL[0]["messages"][1]["content"]) > len(_LONG12),
+           doneL and (doneL["disposition"], len(doneL["transcript"])))
+
+    # ── cost aggregates: campaign + dashboard, per currency ─────────
+    _s, resC = call6(baseC, "GET", f"/api/campaigns/{cidC}/results", token=tokenC)
+    check6("A12: campaign results aggregate cost — total + cost per connected call",
+           resC["costs"] == [{"currency": "INR", "total": cbC["total"],
+                              "calls": 1, "connected_calls": 1,
+                              "cost_per_connected": cbC["total"]}],
+           resC["costs"])
+    totAll = round(cbC["total"] + cbB["total"]
+                   + ((doneL or {}).get("cost_breakdown") or {}).get("total", 0), 4)
+    _s, dashC = call6(baseC, "GET", "/api/dashboard", token=tokenC)
+    check6("A12: the dashboard aggregates tenant cost per currency "
+           "(INR only — currencies are never mixed)",
+           dashC["costs"] == [{"currency": "INR", "total": totAll, "calls": 3,
+                               "connected_calls": 3,
+                               "cost_per_connected": round(totAll / 3, 4)}],
+           dashC["costs"])
+
+    # ── cross-tenant fuzz on every surface ───────────────────────────
+    _s, tenant2 = call6(baseC, "POST", "/api/tenants",
+                        {"name": "A12 Other Co", "market": "IN"})
+    _s, login2 = call6(baseC, "POST", "/api/auth/login", {
+        "email": tenant2["admin_email"], "password": tenant2["admin_password"]})
+    token2 = login2["access_token"]
+    call6(baseC, "GET", f"/api/campaigns/{cidC}/results", token=token2, expect=404)
+    call6(baseC, "GET", f"/api/campaigns/{cidC}/calls", token=token2, expect=404)
+    call6(baseC, "POST", f"/api/campaigns/{cidC}/dispatch", token=token2, expect=404)
+    call6(baseC, "POST", f"/api/campaigns/{cidC}/status", {"status": "paused"},
+          token=token2, expect=404)
+    call6(baseC, "POST", "/api/browser-tests", {"agent_id": agentC["agent_id"]},
+          token=token2, expect=404)
+    call6(baseC, "POST", "/api/results",
+          {"session_id": sidC, "state": "COMPLETED"}, token=token2, expect=404)
+    _s, callsX = call6(baseC, "GET", f"/api/calls?campaign_id={cidC}", token=token2)
+    _s, dashX = call6(baseC, "GET", "/api/dashboard", token=token2)
+    check6("A12: cross-tenant fuzz — the other tenant sees 404s and zeros everywhere",
+           callsX["total"] == 0 and dashX["calls_total"] == 0
+           and dashX["results_total"] == 0 and dashX["costs"] == [],
+           (callsX["total"], dashX["calls_total"], dashX["costs"]))
+
+    # ── managed edges: hang + malformed + duplicate webhook ×3 ──────
+    FAKE12 = {"numbers": [], "flip": None, "seq": 0}
+    HANG12 = "9300000099"
+
+    class _FakeProvider12(BaseHTTPRequestHandler):
+        """A Vapi-shaped fake with failure modes: one number accepts and
+        then hangs (the transport must time out), one is rejected 400,
+        and an armed flip completes the campaign mid-dispatch."""
+
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b""
+            if self.path == "/call/phone":
+                try:
+                    body = json.loads(raw) if raw else {}
+                except Exception:
+                    body = {}
+                num = ((body.get("customer") or {}).get("number") or "")
+                FAKE12["numbers"].append(num)
+                if num == HANG12:
+                    time.sleep(30)  # accepts, then hangs — caller gives up at 15 s
+                flip = FAKE12.get("flip")
+                if flip and flip.get("armed"):
+                    flip["armed"] = False
+                    try:
+                        req = urllib.request.Request(
+                            flip["base"] + "/api/campaigns/" + flip["campaign_id"]
+                            + "/status",
+                            data=json.dumps({"status": "completed"}).encode(),
+                            method="POST",
+                            headers={"Content-Type": "application/json",
+                                     "Authorization": "Bearer " + flip["token"]})
+                        urllib.request.urlopen(req, timeout=10).read()
+                    except Exception:
+                        pass
+                if "abc" in num:
+                    code, payload = 400, {"error": "invalid phone number"}
+                else:
+                    FAKE12["seq"] += 1
+                    code, payload = 200, {"id": f"call_12_{FAKE12['seq']}",
+                                          "status": "queued"}
+                data = json.dumps(payload).encode()
+                try:
+                    self.send_response(code)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                except Exception:
+                    pass  # hang case: the caller already gave up
+                return
+            data = b"{}"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    _fake12_server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeProvider12)
+    threading.Thread(target=_fake12_server.serve_forever, daemon=True).start()
+    FAKE12_URL = f"http://127.0.0.1:{_fake12_server.server_address[1]}"
+
+    baseE = start_app6(18117, "edge", {
+        "TELEPHONY_MODE": "managed", "VAPI_API_KEY": "sk-fake-edge",
+        "VAPI_BASE_URL": FAKE12_URL})
+    tokenE = login6(baseE)
+    _s, agentsE = call6(baseE, "GET", "/api/agents", token=tokenE)
+    agentE = agentsE[0]["agent_id"]
+    cidE = campaign6(baseE, tokenE, agentE, "A12 — Edge Batch", "managed",
+                     "callee_name,phone_number,bank_name,state\n"
+                     "Hang Victim,9300000099,Tata Capital,West Bengal\n"
+                     "Bad Number,abc123,Tata Capital,West Bengal\n"
+                     "Good Caller,9300000011,Tata Capital,West Bengal\n")
+    stE, repE = _raw12(baseE, "POST", f"/api/campaigns/{cidE}/dispatch",
+                       token=tokenE, timeout=120)
+    check6("A12: a hanging provider + a malformed number fail honestly — "
+           "the batch continues and places the good lead",
+           stE == 200 and repE["placed"] == 1 and repE["finalized"] == 2,
+           (stE, repE))
+    _s, callsE = call6(baseE, "GET", f"/api/campaigns/{cidE}/calls", token=tokenE)
+    byNumE = {c["to_number"]: c for c in callsE["calls"]}
+    check6("A12: hang → FAILED (provider_error, network error on the record); "
+           "malformed → FAILED (rejected at placement, HTTP 400); "
+           "the good lead is in flight",
+           byNumE[HANG12]["final_state"] == "FAILED"
+           and byNumE[HANG12]["end_reason"] == "provider_error"
+           and "network error" in (byNumE[HANG12]["summary"] or "")
+           and byNumE["abc123"]["final_state"] == "FAILED"
+           and "rejected the call placement (HTTP 400)" in (
+               byNumE["abc123"]["summary"] or "")
+           and byNumE["9300000011"]["final_state"] is None,
+           {k: (v["final_state"], (v["summary"] or "")[:52])
+            for k, v in byNumE.items()})
+    goodE = byNumE["9300000011"]
+    r1 = _webhook12(baseE, goodE["session_id"], "call_a12_" + goodE["session_id"][-6:],
+                    seconds=47, cost={"total": 0.05, "transport": 0.05})
+    r2 = _webhook12(baseE, goodE["session_id"], "call_a12_" + goodE["session_id"][-6:],
+                    seconds=47, cost={"total": 0.05, "transport": 0.05})
+    r3 = _webhook12(baseE, goodE["session_id"], "call_a12_" + goodE["session_id"][-6:],
+                    seconds=47, cost={"total": 0.05, "transport": 0.05})
+    check6("A12: the same end-of-call report delivered 3× still writes ONE result",
+           r1[1].get("created") is True and r2[1].get("created") is False
+           and r3[1].get("created") is False, (r1[1], r2[1], r3[1]))
+    _s, resE = call6(baseE, "GET", f"/api/campaigns/{cidE}/results", token=tokenE)
+    goodRow = _row12(baseE, tokenE, goodE["session_id"])
+    check6("A12: campaign totals count the good call once; its cost is the "
+           "provider's own reported figure, kept verbatim",
+           resE["results_count"] == 3 and resE["attempts_made"] == 3
+           and goodRow["cost_breakdown"]["total"] == 0.05
+           and goodRow["cost_breakdown"]["cost_source"] == "provider",
+           (resE["results_count"], goodRow["cost_breakdown"]))
+
+    # ── managed fallback: no cost in the report → telephony-only ────
+    cidM = campaign6(baseE, tokenE, agentE, "A12 — Managed Cost", "managed",
+                     "callee_name,phone_number,bank_name,state\n"
+                     "Cost One,9300000021,Tata Capital,West Bengal\n"
+                     "Cost Two,9300000022,Tata Capital,West Bengal\n")
+    call6(baseE, "POST", f"/api/campaigns/{cidM}/dispatch", token=tokenE)
+    _s, callsM = call6(baseE, "GET", f"/api/campaigns/{cidM}/calls", token=tokenE)
+    m1, m2 = callsM["calls"][0], callsM["calls"][1]
+    _webhook12(baseE, m1["session_id"], "call_a12_" + m1["session_id"][-6:], seconds=120)
+    rowM1 = _row12(baseE, tokenE, m1["session_id"])
+    cbM1 = rowM1["cost_breakdown"]
+    check6("A12: a report WITHOUT a cost breakdown falls back to the rate "
+           "card — no rate yet → honest zeros, the rest marked not-reported",
+           cbM1["cost_source"] == "rate_card" and cbM1["total"] == 0
+           and "not reported" in cbM1["basis"]["stt"], cbM1)
+    call6(baseE, "PUT", "/api/settings/providers/vapi",
+          {"fields": {"rate_telephony_per_min": "1.5"}}, token=tokenE)
+    _webhook12(baseE, m2["session_id"], "call_a12_" + m2["session_id"][-6:], seconds=120)
+    cbM2 = _row12(baseE, tokenE, m2["session_id"])["cost_breakdown"]
+    check6("A12: with a telephony rate set, the fallback prices telephony "
+           "only — 1.5 × 2 min = 3.0 USD, legs honestly zero",
+           cbM2["telephony"] == 3.0 and cbM2["total"] == 3.0
+           and cbM2["stt"] == 0 and cbM2["llm"] == 0 and cbM2["tts"] == 0
+           and cbM2["currency"] == "USD" and cbM2["cost_source"] == "rate_card",
+           cbM2)
+
+    # ── edge: the campaign is completed mid-dispatch ─────────────────
+    cidF = campaign6(baseE, tokenE, agentE, "A12 — Flip Batch", "managed",
+                     "callee_name,phone_number,bank_name,state\n"
+                     "Flip One,9300000031,Tata Capital,West Bengal\n"
+                     "Flip Two,9300000032,Tata Capital,West Bengal\n"
+                     "Flip Three,9300000033,Tata Capital,West Bengal\n")
+    FAKE12["flip"] = {"armed": True, "base": baseE, "token": tokenE,
+                      "campaign_id": cidF}
+    stF, repF = _raw12(baseE, "POST", f"/api/campaigns/{cidF}/dispatch",
+                       token=tokenE, timeout=60)
+    FAKE12["flip"] = None
+    flip_calls = [n for n in FAKE12["numbers"] if n.startswith("930000003")]
+    check6("A12: campaign completed MID-dispatch — the remaining leads are "
+           "never dispatched (their queued attempts are withdrawn)",
+           stF == 200 and repF["placed"] == 1 and repF["created"] == 1
+           and repF["cancelled_inactive"] == 2 and len(flip_calls) == 1,
+           (stF, repF, flip_calls))
+    _s, callsF = call6(baseE, "GET", f"/api/campaigns/{cidF}/calls", token=tokenE)
+    _s, campF = call6(baseE, "GET", f"/api/campaigns/{cidF}", token=tokenE)
+    call6(baseE, "POST", f"/api/campaigns/{cidF}/dispatch", token=tokenE, expect=400)
+    check6("A12: after the mid-dispatch stop — one session only, campaign "
+           "completed, re-dispatch refused",
+           callsF["total"] == 1 and campF["status"] == "completed",
+           (callsF["total"], campF["status"]))
+
+    # ── edge: the tenant concurrency cap binds across campaigns ────
+    _s, tenantK = call6(baseE, "POST", "/api/tenants", {
+        "name": "A12 Concurrency Co", "market": "IN", "concurrency_limit": 2})
+    _s, loginK = call6(baseE, "POST", "/api/auth/login", {
+        "email": tenantK["admin_email"], "password": tenantK["admin_password"]})
+    tokenK = loginK["access_token"]
+    _s, agentK = call6(baseE, "POST", "/api/agents", {
+        "name": "A12 Concurrency Agent", "prompt": _SCRIPTED_PROMPT_8},
+        token=tokenK, expect=201)
+    cidKA = campaign6(baseE, tokenK, agentK["agent_id"], "A12 — Concurrency A",
+                      "managed",
+                      "callee_name,phone_number,bank_name,state\n"
+                      "K A1,9300000041,Tata Capital,West Bengal\n"
+                      "K A2,9300000042,Tata Capital,West Bengal\n"
+                      "K A3,9300000043,Tata Capital,West Bengal\n")
+    cidKB = campaign6(baseE, tokenK, agentK["agent_id"], "A12 — Concurrency B",
+                      "managed",
+                      "callee_name,phone_number,bank_name,state\n"
+                      "K B1,9300000051,Tata Capital,West Bengal\n"
+                      "K B2,9300000052,Tata Capital,West Bengal\n")
+    _s, repKA = call6(baseE, "POST", f"/api/campaigns/{cidKA}/dispatch",
+                      token=tokenK)
+    _s, repKB = call6(baseE, "POST", f"/api/campaigns/{cidKB}/dispatch",
+                      token=tokenK)
+    check6("A12: the tenant concurrency cap binds ACROSS campaigns — "
+           "A admits 2 of 3, B admits none while A is in flight",
+           repKA["created"] == 2 and repKA["placed"] == 2
+           and repKA["concurrency_capped"] == 1
+           and repKB["created"] == 0 and repKB["concurrency_capped"] == 2,
+           (repKA, repKB))
+    _s, callsKA = call6(baseE, "GET", f"/api/campaigns/{cidKA}/calls",
+                        token=tokenK)
+    for c in callsKA["calls"]:
+        _webhook12(baseE, c["session_id"], "call_a12_" + c["session_id"][-6:],
+                   seconds=30, cost={"total": 0.02})
+    _s, repKA2 = call6(baseE, "POST", f"/api/campaigns/{cidKA}/dispatch",
+                       None, tokenK)
+    _s, repKB2 = call6(baseE, "POST", f"/api/campaigns/{cidKB}/dispatch",
+                       None, tokenK)
+    check6("A12: with A's first two calls finalized, A admits its last "
+           "lead and B admits one of two — A's fresh call holds a slot",
+           repKA2["created"] == 1 and repKA2["placed"] == 1
+           and repKB2["created"] == 1 and repKB2["concurrency_capped"] == 1,
+           (repKA2, repKB2))
+    _s, callsKA3 = call6(baseE, "GET", f"/api/campaigns/{cidKA}/calls",
+                         None, tokenK)
+    _s, callsKB3 = call6(baseE, "GET", f"/api/campaigns/{cidKB}/calls",
+                         None, tokenK)
+    for c in callsKA3["calls"] + callsKB3["calls"]:
+        if c["final_state"] is None:
+            _webhook12(baseE, c["session_id"],
+                       "call_a12_" + c["session_id"][-6:],
+                       seconds=30, cost={"total": 0.02})
+    _s, repKB4 = call6(baseE, "POST", f"/api/campaigns/{cidKB}/dispatch",
+                       None, tokenK)
+    _s, callsKA4 = call6(baseE, "GET", f"/api/campaigns/{cidKA}/calls",
+                         None, tokenK)
+    _s, callsKB4 = call6(baseE, "GET", f"/api/campaigns/{cidKB}/calls",
+                         None, tokenK)
+    check6("A12: once every in-flight call finalizes, B's held lead is "
+           "admitted too — A ends with 3 sessions, B with 2",
+           repKB4["created"] == 1 and callsKA4["total"] == 3
+           and callsKB4["total"] == 2,
+           (repKB4, callsKA4["total"], callsKB4["total"]))
+    _ai12_server.shutdown()
+    _stt12_server.shutdown()
+    _fake12_server.shutdown()
+
 finally:
     for _p in _procs6:
         _p.terminate()

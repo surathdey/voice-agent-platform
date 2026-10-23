@@ -1,5 +1,140 @@
 # BUILD LOG
 
+## Chunk 11 — Phase A: A12 Real Per-Call Cost, Edge Cases, Load (2026-10-23)
+
+### Built
+- **Rate cards** (`app/costing.py` + the provider registry): per-minute
+  rate fields on the existing provider cards — Vapi telephony (USD),
+  Plivo telephony (INR), Sarvam STT / LLM / TTS (INR) — plain tenant
+  settings like every other provider field, resolved tenant → env →
+  unset, and shipped **empty**: an unset rate honestly costs 0; there
+  is no price list anywhere in the code. The Settings UI gains a
+  "Rate card" group on each provider; the same rates exist as
+  optional env fallbacks (`VAPI_RATE_…`, `PLIVO_RATE_…`,
+  `SARVAM_RATE_…`) wired through `.env.example` + compose.
+- **Finalize-time computation**, inside `finalize_attempt` (still the
+  single writer of results): a stub breakdown passes through
+  untouched (zeros, mode "stub" — no fake money). A breakdown a
+  provider reported itself (Vapi's own figures in the end-of-call
+  report) is **kept verbatim**, stamped `cost_source: "provider"` —
+  the stamp is applied only when the report actually carried
+  figures; a report without any gets the rate-card fallback:
+  telephony-only priced from the call duration, the other legs zero
+  with a "not reported for this call" basis note. Everything else
+  is computed from the rate card: telephony + STT from call
+  duration; **LLM from call duration** — the honest basis, stated
+  in the breakdown, because the Sarvam chat responses in this
+  integration carry no usage figures to price per-token; **TTS from
+  the synthesized audio actually pumped** — the conversation engine
+  now counts pumped 160-byte μ-law frames (20 ms each) on every
+  exit path, barge-in included, and both stream handlers (Plivo +
+  browser) pass the count to finalize, so an interrupted sentence
+  costs only the frames that were sent. Every computed breakdown
+  carries per-leg basis notes and the rate snapshot used.
+  Browser-test channel: the same computation, telephony 0 with a
+  "browser channel" basis note.
+- **Aggregates**: campaign results and the Dashboard now sum cost
+  **per currency, never mixed** — total, costed calls, connected
+  calls, cost per connected call. Stub results are excluded
+  (simulated money is not money). The Calls detail shows the full
+  breakdown with its basis notes; the Results card and Dashboard
+  show the per-currency totals.
+- **Edge behaviour in the dispatcher**: admission now respects the
+  tenant concurrency limit **across campaigns** (in-flight sessions
+  of all the tenant's campaigns count; held leads are reported as
+  `concurrency_capped` and stay pending). The worker re-reads the
+  campaign's status before **every** attempt: a campaign paused or
+  completed mid-dispatch stops cleanly — the sessions this dispatch
+  created but never ran are withdrawn (no provider call, no result,
+  no attempt count) and reported as `cancelled_inactive`.
+- **No migration** (010 stays unused): rate cards live in the
+  provider-settings JSON; costs in the existing `cost_breakdown`
+  JSON.
+
+### Verification (native, fresh SQLite DBs — same Docker caveat as chunks 1–10)
+- `scripts/smoke_test.py`: **580 passed, 0 failed** (the 478
+  pre-existing checks all green, plus 102 new A12 checks including
+  the settings round-trips inside them). `vite build` clean.
+- **Load**: a stub campaign with **500 leads** dispatched to
+  completion — 500 sessions, exactly 500 results (exactly-one-result
+  under volume), per-disposition counts summing to 500 — in ≈7–9 s
+  wall-clock across runs (9.0 s on the final full-suite run).
+  Zero-lead dispatch is a clean no-op with a clear message.
+- **Real cost, exact**: against mock Sarvam + the fake Plivo, a
+  scripted call's breakdown equals rate × duration for telephony /
+  STT / LLM and rate × pumped-frames × 20 ms for TTS — with the
+  wire's playAudio event count matching the mock's synthesized
+  frames one-for-one. A browser test on the same rates prices its
+  legs identically, telephony 0. A 120-sentence agent turn
+  (~3,000 characters) classifies normally — no crash, no
+  truncation, no review-flag excuse.
+- **Managed edges** against a purpose-built fake provider: a number
+  that accepts then hangs ends FAILED (end_reason provider_error,
+  "network error" on the record) after the transport timeout; a
+  malformed number ends FAILED ("rejected the call placement
+  (HTTP 400)"); the batch still places the good lead. The same
+  end-of-call report delivered **3× writes exactly one result**,
+  its provider-reported 0.05 kept verbatim. A report without
+  figures falls back to telephony-only — 1.5 × 2 min = 3.0 USD
+  once the rate is set, honest zeros before.
+- **Mid-dispatch completion**: the fake completes the campaign
+  inside the first placement — the dispatch places exactly 1 call,
+  withdraws the other 2 queued attempts, and a re-dispatch is
+  refused (campaign completed). **Concurrency**: tenant limit 2 —
+  campaign A admits 2 of 3, campaign B admits 0; after A's calls
+  finalize, A admits its last lead and B one of two (A's fresh call
+  holds the other slot); once everything finalizes, B's held lead
+  is admitted.
+- **Cross-tenant fuzz**: the second tenant gets 404 on the first
+  tenant's campaign results / calls / dispatch / status,
+  browser-test create and result submit — and zeros (incl. empty
+  costs) on the filtered Calls list and its own Dashboard.
+
+### Known limitations (deliberate, for this chunk)
+- LLM cost is per-minute of call duration, not per-token: the
+  Sarvam responses in this integration carry no usage object. If a
+  future API version returns usage, the rate field and the basis
+  note are the only places that need to change.
+- TTS frame counting is exact on the self-hosted and browser paths
+  (our own pump). Managed calls rely on the provider's reported
+  cost or the telephony-only fallback — there is no frame stream
+  to count on that side.
+- The worker is still synchronous inside the dispatch request (the
+  A10 caveat): the concurrency cap is admission control across
+  campaigns, not parallel in-flight execution. The 500-lead figure
+  is the stub transport on SQLite; PostgreSQL + real transports
+  will differ.
+- Rate cards are per provider, not per campaign/voice/language —
+  contracted rates are provider-level in practice; the settings
+  shape allows a finer card later without a migration.
+
+### Phase A — COMPLETE
+Phase A (steps A1–A12, chunks 1–11) is built and verified end to
+end: multi-tenant platform with tenant-scoped everything; the
+Agent Config Studio with the single-prompt model (versioned,
+append-only); campaigns bound to one agent with CSV lead intake;
+provider settings with masked secrets and honest test-connection;
+the orchestrator (market-local schedule admission, retries,
+cross-campaign concurrency admission, mid-dispatch stop) behind
+the one idempotent finalize path that writes every §8.2 result;
+both orchestration modes — managed (Vapi) and self-hosted (Plivo
+answer/stream + Sarvam Saaras STT → Sarvam LLM → Bulbul TTS, with
+barge-in and silence handling) — producing the identical result
+shape; the browser test harness on the same engine; and real
+per-call costing from tenant rate cards with per-currency
+aggregates. **580 automated checks pass; the console builds
+clean.** What Phase A has never done is place a real call: every
+transport is verified against local fakes/mocks by design. The
+first live test (Vapi, with the owner's own credentials, pulled
+once on his machine) is the owner's next step, and Phase B builds
+the five agents on this platform — RPI first, as the reference.
+
+### Next step
+**Phase B, step B1 — the RPI Verification agent** as the reference
+agent on this platform (its seeded sample becomes the real B1
+configuration), followed by the owner's one-time pull + live Vapi
+test when he is ready.
+
 ## Chunk 10 — Phase A: A11 Browser Test Harness (2026-10-23)
 
 ### Built
