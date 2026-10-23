@@ -17,6 +17,15 @@ per-language Vapi voice profiles in the tenant settings. A real
 transport runs only when TELEPHONY_MODE equals the campaign's mode AND
 the tenant's provider is ready; stub remains the default everywhere
 else. The conversation brain — Sarvam STT/LLM/TTS — is A7/A8.)
+Chunk 6: A7 (STT live — a Sarvam Saaras streaming session opens per
+self-hosted call inside the Plivo media stream, in the lead's resolved
+language; Plivo media frames are forwarded to it, partial transcripts
+ride an in-memory live view, final segments persist to the session as
+they arrive and land in the §8.2 result. No Sarvam config → no STT leg
+and the stream behaves exactly like the A6 spike; an STT failure is
+recorded on the session and marks the transcript partial — the call
+itself never fails because the ear did. The reply brain — LLM/TTS —
+is A8.)
 """
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,7 +36,7 @@ from .config import settings
 from .db import SessionLocal, init_db
 from .routers import agents, auth, calls, campaigns, settings as settings_router, telephony, tenants
 
-app = FastAPI(title="Voice Agent Platform", version="0.5.0")
+app = FastAPI(title="Voice Agent Platform", version="0.6.0")
 
 app.add_middleware(
     CORSMiddleware,

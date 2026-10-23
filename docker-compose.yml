@@ -50,6 +50,8 @@ services:
       SARVAM_API_KEY: ${SARVAM_API_KEY:-}
       VAPI_BASE_URL: ${VAPI_BASE_URL:-https://api.vapi.ai}
       PLIVO_BASE_URL: ${PLIVO_BASE_URL:-https://api.plivo.com}
+      SARVAM_WS_URL: ${SARVAM_WS_URL:-wss://api.sarvam.ai}
+      SARVAM_STT_MODEL: ${SARVAM_STT_MODEL:-saaras:v2.5}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8000}
       WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
       SEED_TENANT_NAME: ${SEED_TENANT_NAME:-QGBS}

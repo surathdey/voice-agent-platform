@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 
 from ..db import get_db
 from ..deps import get_current_user
+from .. import stt as stt_module
 from ..models import CallResult, CallSession, Campaign, Lead, User
 from ..orchestrator import Dispatcher, receive_result
 from ..schemas import CallListOut, CallOut, DispatchOut, ResultIn, ResultOut
@@ -37,6 +38,21 @@ def _campaign_scoped(db: Session, user: User, campaign_id: str) -> Campaign:
     if c is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Campaign not found")
     return c
+
+
+def _transcript_view(s: CallSession, result: CallResult | None) -> list:
+    """The transcript for one call view: the persisted turns (finals are
+    written to the session as they arrive, A7), plus — for a call still
+    IN_CALL — the live partial segment from the in-memory STT view,
+    marked "partial": true. The overlay is display-only; it is never
+    written back."""
+    turns = list(s.transcript or [])
+    if result is None and s.state == "IN_CALL":
+        partial = stt_module.live_partial(s.session_id)
+        if partial:
+            turns.append({"speaker": "customer", "text": partial,
+                          "offset_s": 0.0, "partial": True})
+    return turns
 
 
 def _call_out(db: Session, s: CallSession) -> CallOut:
@@ -75,7 +91,10 @@ def _call_out(db: Session, s: CallSession) -> CallOut:
         captured_fields=(result.captured_fields or {}) if result else {},
         duration_s=result.duration_s if result else 0,
         recording_url=s.recording_url or "",
-        transcript=s.transcript or [],
+        transcript=_transcript_view(s, result),
+        stt_status=s.stt_status or "",
+        stt_language=s.stt_language or "",
+        stt_detail=s.stt_detail or "",
         cost_breakdown=cost,
         started_at=s.started_at.isoformat() if s.started_at else None,
         answered_at=s.answered_at.isoformat() if s.answered_at else None,

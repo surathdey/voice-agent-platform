@@ -130,6 +130,26 @@ cd frontend && npm install && npm run dev   # http://localhost:5173, proxies /ap
       brain is A7/A8) and finalizes with an honestly labelled spike
       result.
 
+**A7 — STT live (Sarvam Saaras in the self-hosted stream)**
+- [ ] On a self-hosted call with a Sarvam key configured, opening the
+      media stream also opens ONE Saaras streaming session for the call,
+      in the language the agent's language rule resolves for the lead
+      (West Bengal → bn-IN, otherwise hi-IN) — watch the Calls page:
+      the row's **STT** pill shows `STT · bn-IN` while the call runs.
+- [ ] Click a call row to expand it: final transcript segments appear
+      as the customer speaks (persisted as they arrive), and the
+      in-flight partial segment shows marked *(live…)*. The §8.2 result
+      at the end carries the same accumulated transcript.
+- [ ] Remove the Sarvam key and stream another call: the row shows
+      **STT off**, the transcript is empty and the result is the A6
+      spike outcome — no STT leg exists without a key.
+- [ ] Point `SARVAM_WS_URL` at a dead address and stream a call: the
+      row shows **STT failed** (hover for the reason), the transcript
+      is headed by a `[TRANSCRIPT PARTIAL …]` marker, and the call
+      still completes normally — a dead ear never fails a call.
+- [ ] Nothing speaks back yet and no disposition is produced on
+      self-hosted calls: the reply brain (LLM → Bulbul TTS) is A8.
+
 ## Design decisions that override the design doc
 
 1. **Single prompt (owner, 2026-10-23).** The design doc's three-layer prompt
@@ -154,11 +174,13 @@ backend/    FastAPI app (app/models.py = all six design entities + prompt_versio
             idempotent finalize path for §8.2 results;
             app/transports.py = the real transports (A6): Vapi start-call +
             report mapping, Plivo create-call + answer XML + spike outcomes;
+            app/stt.py = the STT leg (A7): Saaras streaming client, live
+            transcript view, per-session STT persistence;
             app/routers/ = auth, tenants, agents, campaigns, settings, calls,
             telephony (provider webhook / answer / stream routes);
-            migrations/001–004 = DDL of record)
+            migrations/001–005 = DDL of record)
 frontend/   React (Vite) console — theme tokens in src/theme.css (wireframe design language);
             pages: Agents, AgentEditor, Campaigns, CampaignWizard, CampaignDetail, LeadsUpload, Settings, Calls
-scripts/    smoke_test.py — automated acceptance checks (A1 + A2 + A3 + A4 + A5 + A6)
+scripts/    smoke_test.py — automated acceptance checks (A1 + A2 + A3 + A4 + A5 + A6 + A7)
 docker-compose.yml   db (PostgreSQL 16) + backend + frontend (nginx)
 ```

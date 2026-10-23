@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Smoke tests for Phase A chunks 1–5 (A1–A6) against a running server.
+"""Smoke tests for Phase A chunks 1–6 (A1–A7) against a running server.
 
 Usage:  python3 scripts/smoke_test.py [base_url]     (default http://localhost:8000)
         Run with the backend venv python (backend/.venv/bin/python) —
-        the A6 section boots its own app instances with that interpreter
-        and needs its `websockets` package for the stream test.
+        the A6/A7 sections boot their own app instances with that
+        interpreter and need its `websockets` package for the stream
+        tests and the mock Saaras server.
 Covers: health · login · tenant scoping (A1 acceptance) · agent CRUD ·
 single-prompt versioning + rollback (A2) · campaign CRUD bound to one agent,
 status lifecycle, CSV lead upload with column mapping, product identifiers,
@@ -20,7 +21,13 @@ local FAKE provider — Vapi start-call payload (single prompt, tenant
 defaults, per-language voice profiles by language + agent voice gender),
 end-of-call webhook → exactly one §8.2 result, duplicate webhook no-op,
 Plivo create-call + answer XML + placeholder stream finalize, status
-callback finalize, stub-mode + mode-mismatch honesty gates (A6).
+callback finalize, stub-mode + mode-mismatch honesty gates (A6) · the
+STT leg against a local MOCK Saaras WebSocket server — session opened
+per call in the lead's resolved language with the tenant key, media
+frames forwarded, partial transcript on the live view, final segments
+persisted mid-call and carried into the §8.2 result; STT-down path
+(failure recorded, transcript marked partial, call still finalizes
+once); no-config path identical to the A6 spike (A7).
 
 Run against a FRESH database: like the earlier chunks, the suite seeds its
 own tenants/agents/campaigns/settings and asserts exact fresh-state values.
@@ -1015,6 +1022,273 @@ try:
     check6("mode mismatch (managed platform, self-hosted campaign, Plivo ready) still runs the stub",
            repX["transport"] == "stub" and repX["provider_ready"] is True
            and repX["finalized"] == 2 and repX["placed"] == 0, repX)
+    print("── A7: STT live — mock Saaras server, no live Sarvam calls ──")
+    # The Plivo stream endpoint now runs the STT leg: a Sarvam Saaras
+    # streaming session per call. SARVAM_WS_URL is the override seam — this
+    # section points it at a local MOCK Saaras WebSocket server (scripted
+    # partial/final transcripts) for the live path, a dead port for the
+    # STT-down path, and nowhere for the no-config path. No real Sarvam
+    # call is made anywhere in this suite.
+    import base64 as _b64_7
+    from websockets.sync.client import connect as _ws_connect7
+    from websockets.sync.server import serve as _ws_serve7
+
+    MOCK_STT = {"connections": [], "audio_frames": 0}
+    _STT_FINAL_1 = "Nomoskar, ami Tata Capital theke bolchi."
+    _STT_FINAL_2 = "Apni ki nijer porichoy nishchit korte parben?"
+
+
+    def _mock_saaras(ws):
+        req = ws.request
+        info = {
+            "path": req.path if req else "",
+            "api_key": (req.headers.get("api-subscription-key") if req else ""),
+            "frames": 0,
+        }
+        MOCK_STT["connections"].append(info)
+        try:
+            for raw in ws:
+                try:
+                    msg = json.loads(raw)
+                except Exception:
+                    continue
+                if "audio" not in msg:
+                    continue
+                info["frames"] += 1
+                MOCK_STT["audio_frames"] += 1
+                n = info["frames"]
+                if n == 1:
+                    ws.send(json.dumps({"type": "data", "data": {
+                        "transcript": "Nomoskar, ami", "is_final": False}}))
+                elif n == 2:
+                    ws.send(json.dumps({"type": "data", "data": {
+                        "transcript": _STT_FINAL_1, "is_final": True}}))
+                elif n == 3:
+                    ws.send(json.dumps({"type": "data", "data": {
+                        "transcript": _STT_FINAL_2, "is_final": True}}))
+        except Exception:
+            pass  # client went away mid-stream — the mock just stops
+
+
+    _stt_server = _ws_serve7(_mock_saaras, "127.0.0.1", 0)
+    threading.Thread(target=_stt_server.serve_forever, daemon=True).start()
+    MOCK_STT_URL = f"ws://127.0.0.1:{_stt_server.socket.getsockname()[1]}"
+
+    import socket as _socket7
+    _dead_sock = _socket7.socket()
+    _dead_sock.bind(("127.0.0.1", 0))
+    DEAD_STT_URL = f"ws://127.0.0.1:{_dead_sock.getsockname()[1]}"
+    _dead_sock.close()  # nothing listens there — connections are refused
+
+    _procs7_mark = len(_procs6)
+
+
+    def poll_call7(base, token, cid, sid, pred, tries=48, nap=0.25):
+        last = None
+        for _ in range(tries):
+            _s, cl = call6(base, "GET", f"/api/campaigns/{cid}/calls", token=token)
+            last = next((c for c in cl["calls"] if c["session_id"] == sid), None)
+            if last is not None and pred(last):
+                return last
+            time.sleep(nap)
+        return last
+
+
+    def stream_events7(ws_url, sid):
+        """Open a Plivo-stream client and send `start`; returns the socket
+        (caller sends media / stop)."""
+        ws = _ws_connect7(ws_url)
+        ws.send(json.dumps({"event": "start", "start": {
+            "streamId": "str-stt-1", "callId": "call-stt-1",
+            "customParameters": {"session_id": sid}}}))
+        return ws
+
+
+    def media7(ws, n=1):
+        payload = _b64_7.b64encode(b"\xff" * 160).decode()  # one μ-law-ish frame
+        for _ in range(n):
+            ws.send(json.dumps({"event": "media", "media": {"payload": payload}}))
+
+
+    try:
+        # ── live path: Saaras session opens, partials live, finals persist ──
+        baseT = start_app6(18105, "stt-live", {
+            "TELEPHONY_MODE": "self_hosted", "PLIVO_AUTH_ID": "MAFAKEID",
+            "PLIVO_AUTH_TOKEN": "fake-plivo-token", "SARVAM_API_KEY": "sk-fake-sarvam",
+            "SARVAM_WS_URL": MOCK_STT_URL,
+        })
+        tokenT = login6(baseT)
+        _, agentsT = call6(baseT, "GET", "/api/agents", token=tokenT)
+        cidT = campaign6(baseT, tokenT, agentsT[0]["agent_id"], "A7 — STT Live Batch",
+                         "self_hosted",
+                         "callee_name,phone_number,bank_name,state\n"
+                         "S. Kar,9400000001,Tata Capital,West Bengal\n")
+        _, repT = call6(baseT, "POST", f"/api/campaigns/{cidT}/dispatch", token=tokenT)
+        check6("A7: dispatch places the Plivo call (STT leg arms at stream time)",
+               repT["transport"] == "self_hosted" and repT["placed"] == 1, repT)
+        _, callsT = call6(baseT, "GET", f"/api/campaigns/{cidT}/calls", token=tokenT)
+        sT = callsT["calls"][0]
+        check6("A7: before the stream, the call carries no STT record yet",
+               sT["stt_status"] == "" and sT["transcript"] == [], sT)
+        _st, xmlT = call6(baseT, "GET", f"/api/telephony/plivo/answer/{sT['session_id']}")
+        ws_url_T = _ET.fromstring(xmlT).find("Stream").text.strip()
+
+        wsT = stream_events7(ws_url_T, sT["session_id"])
+        try:
+            media7(wsT, 1)
+            live1 = poll_call7(baseT, tokenT, cidT, sT["session_id"],
+                               lambda c: any(t.get("partial") for t in c["transcript"]))
+            check6("A7: partial transcript rides the live view mid-call (marked partial)",
+                   live1 is not None
+                   and any(t.get("partial") and t["text"] == "Nomoskar, ami"
+                           for t in live1["transcript"]), live1)
+            check6("A7: session records STT active in the resolved language (bn-IN)",
+                   live1 is not None and live1["stt_status"] == "active"
+                   and live1["stt_language"] == "bn-IN", live1)
+            media7(wsT, 1)
+            live2 = poll_call7(baseT, tokenT, cidT, sT["session_id"],
+                               lambda c: any(t["text"] == _STT_FINAL_1 and not t.get("partial")
+                                             for t in c["transcript"]))
+            check6("A7: first final segment persisted to the session AS IT ARRIVES",
+                   live2 is not None and live2["final_state"] is None
+                   and not any(t.get("partial") for t in live2["transcript"]), live2)
+            media7(wsT, 1)
+            live3 = poll_call7(baseT, tokenT, cidT, sT["session_id"],
+                               lambda c: sum(1 for t in c["transcript"]
+                                             if not t.get("partial")) >= 2)
+            check6("A7: second final segment appended in order",
+                   live3 is not None
+                   and [t["text"] for t in live3["transcript"]] == [_STT_FINAL_1, _STT_FINAL_2],
+                   live3)
+        finally:
+            try:
+                wsT.send(json.dumps({"event": "stop"}))
+            except Exception:
+                pass
+            wsT.close()
+        doneT = poll_call7(baseT, tokenT, cidT, sT["session_id"],
+                           lambda c: c["final_state"] is not None)
+        check6("A7: finalize outcome carries the REAL accumulated transcript",
+               doneT is not None and doneT["final_state"] == "COMPLETED"
+               and [t["text"] for t in doneT["transcript"]] == [_STT_FINAL_1, _STT_FINAL_2]
+               and all(t["speaker"] == "customer" for t in doneT["transcript"])
+               and "live Sarvam Saaras transcription" in doneT["summary"]
+               and "PARTIAL" not in doneT["summary"], doneT)
+        check6("A7: session keeps stt_status=active + language after the call",
+               doneT is not None and doneT["stt_status"] == "active"
+               and doneT["stt_language"] == "bn-IN" and doneT["stt_detail"] == "", doneT)
+        check6("A7: mock Saaras saw ONE connection, opened for bn-IN with the tenant key",
+               len(MOCK_STT["connections"]) == 1
+               and "language-code=bn-IN" in MOCK_STT["connections"][0]["path"]
+               and MOCK_STT["connections"][0]["api_key"] == "sk-fake-sarvam",
+               MOCK_STT["connections"])
+        check6("A7: Plivo media frames were forwarded to Saaras as audio messages",
+               MOCK_STT["connections"][0]["frames"] == 3
+               and MOCK_STT["audio_frames"] == 3, MOCK_STT)
+        call6(baseT, "POST", f"/api/telephony/plivo/status/{sT['session_id']}",
+              form={"CallStatus": "completed", "CallUUID": "uuid-stt-1", "Duration": "99"})
+        _, callsT2 = call6(baseT, "GET", f"/api/campaigns/{cidT}/calls", token=tokenT)
+        doneT2 = next(c for c in callsT2["calls"] if c["session_id"] == sT["session_id"])
+        check6("A7: a late status callback cannot rewrite the STT result (idempotent)",
+               [t["text"] for t in doneT2["transcript"]] == [_STT_FINAL_1, _STT_FINAL_2]
+               and doneT2["duration_s"] == doneT["duration_s"], doneT2)
+
+        # ── STT-down path: failure recorded, transcript partial, call fine ──
+        print("── A7: STT down — the call survives a failed Saaras session ──")
+        baseD = start_app6(18106, "stt-down", {
+            "TELEPHONY_MODE": "self_hosted", "PLIVO_AUTH_ID": "MAFAKEID",
+            "PLIVO_AUTH_TOKEN": "fake-plivo-token", "SARVAM_API_KEY": "sk-fake-sarvam",
+            "SARVAM_WS_URL": DEAD_STT_URL,
+        })
+        tokenD = login6(baseD)
+        _, agentsD = call6(baseD, "GET", "/api/agents", token=tokenD)
+        cidD = campaign6(baseD, tokenD, agentsD[0]["agent_id"], "A7 — STT Down Batch",
+                         "self_hosted",
+                         "callee_name,phone_number,bank_name,state\n"
+                         "R. Jha,9400000002,Tata Capital,Bihar\n")
+        call6(baseD, "POST", f"/api/campaigns/{cidD}/dispatch", token=tokenD)
+        _, callsD = call6(baseD, "GET", f"/api/campaigns/{cidD}/calls", token=tokenD)
+        sD = callsD["calls"][0]
+        wsD = stream_events7(
+            f"ws://127.0.0.1:18106/api/telephony/plivo/stream/{sD['session_id']}",
+            sD["session_id"])
+        try:
+            media7(wsD, 2)
+            time.sleep(0.5)  # let the refused connection land as a failure
+        finally:
+            try:
+                wsD.send(json.dumps({"event": "stop"}))
+            except Exception:
+                pass
+            wsD.close()
+        doneD = poll_call7(baseD, tokenD, cidD, sD["session_id"],
+                           lambda c: c["final_state"] is not None)
+        check6("A7: STT failure recorded on the session (failed + reason + language)",
+               doneD is not None and doneD["stt_status"] == "failed"
+               and doneD["stt_language"] == "hi-IN" and bool(doneD["stt_detail"]), doneD)
+        check6("A7: the call still finalizes COMPLETED, exactly once, transcript marked PARTIAL",
+               doneD is not None and doneD["final_state"] == "COMPLETED"
+               and doneD["transcript"] and doneD["transcript"][0]["speaker"] == "system"
+               and "TRANSCRIPT PARTIAL" in doneD["transcript"][0]["text"]
+               and "STT session failed" in doneD["summary"]
+               and "SELF-HOSTED SPIKE" in doneD["summary"], doneD)
+        check6("A7: the dead-endpoint attempt never reached the mock Saaras",
+               len(MOCK_STT["connections"]) == 1, len(MOCK_STT["connections"]))
+
+        # ── no-config path: stream behaves exactly like the A6 spike ───────
+        print("── A7: no Sarvam config at stream time — A6 spike behaviour ──")
+        baseN = start_app6(18107, "stt-noconfig", {
+            "TELEPHONY_MODE": "self_hosted", "PLIVO_AUTH_ID": "MAFAKEID",
+            "PLIVO_AUTH_TOKEN": "fake-plivo-token",
+            "SARVAM_WS_URL": MOCK_STT_URL,  # key arrives via TENANT settings only
+        })
+        tokenN = login6(baseN)
+        _, agentsN = call6(baseN, "GET", "/api/agents", token=tokenN)
+        call6(baseN, "PUT", "/api/settings/providers/sarvam",
+              {"fields": {"api_key": "sk-tenant-sarvam"}}, token=tokenN)
+        cidN = campaign6(baseN, tokenN, agentsN[0]["agent_id"], "A7 — No-Config Batch",
+                         "self_hosted",
+                         "callee_name,phone_number,bank_name,state\n"
+                         "T. Ray,9400000003,Tata Capital,West Bengal\n")
+        _, repN = call6(baseN, "POST", f"/api/campaigns/{cidN}/dispatch", token=tokenN)
+        check6("A7: tenant-configured Sarvam made the campaign dispatchable for real",
+               repN["transport"] == "self_hosted" and repN["placed"] == 1, repN)
+        # The key is removed AFTER placement — at stream time the tenant has
+        # no Sarvam config anywhere (env is blank in this instance).
+        call6(baseN, "DELETE", "/api/settings/providers/sarvam", token=tokenN)
+        _, callsN = call6(baseN, "GET", f"/api/campaigns/{cidN}/calls", token=tokenN)
+        sN = callsN["calls"][0]
+        wsN = stream_events7(
+            f"ws://127.0.0.1:18107/api/telephony/plivo/stream/{sN['session_id']}",
+            sN["session_id"])
+        try:
+            media7(wsN, 2)
+        finally:
+            try:
+                wsN.send(json.dumps({"event": "stop"}))
+            except Exception:
+                pass
+            wsN.close()
+        doneN = poll_call7(baseN, tokenN, cidN, sN["session_id"],
+                           lambda c: c["final_state"] is not None)
+        check6("A7: no-config stream = the A6 spike outcome, word for word in kind",
+               doneN is not None and doneN["final_state"] == "COMPLETED"
+               and doneN["stt_status"] == "not_configured"
+               and doneN["transcript"] == []
+               and "SELF-HOSTED SPIKE" in doneN["summary"]
+               and "No speech was generated or heard" in doneN["summary"], doneN)
+        check6("A7: without a key, NO Saaras connection was even attempted",
+               len(MOCK_STT["connections"]) == 1, len(MOCK_STT["connections"]))
+    finally:
+        for _p in _procs6[_procs7_mark:]:
+            _p.terminate()
+        for _p in _procs6[_procs7_mark:]:
+            try:
+                _p.wait(timeout=5)
+            except Exception:
+                _p.kill()
+        _stt_server.shutdown()
+
 finally:
     for _p in _procs6:
         _p.terminate()

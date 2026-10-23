@@ -1,5 +1,110 @@
 # BUILD LOG
 
+## Chunk 6 — Phase A: A7 STT Live — Sarvam Saaras in the Self-Hosted Stream (2026-10-23)
+
+### Built
+- **The STT leg inside the Plivo stream** (`backend/app/stt.py`, wired
+  into the stream handler in `routers/telephony.py` — the A6 seam).
+  When a self-hosted call's media stream opens, one **Saaras streaming
+  session per call** is opened alongside it: Plivo `media` frames
+  (base64 μ-law 8 kHz, decoded by the handler) are forwarded to Saaras
+  as audio messages; media arriving while the session is still opening
+  is buffered (capped ≈ 8 s of frames), never queued forever, and after
+  an STT failure frames are dropped — STT can never back-pressure or
+  crash the media stream.
+- **Language per the agent's rule:** the session opens with the
+  language `transports.resolve_language` resolves for the lead (agent
+  language rule → state rule → default), normalised to the Saaras
+  codes (bn-IN / hi-IN / en-IN). The language used is **recorded** on
+  the session; mid-call language handling stays the LLM leg's job (A8).
+- **Transcript handling:** partial transcripts update an **in-memory
+  live view** per in-flight session; the Calls API overlays the current
+  partial onto an IN_CALL call's transcript, marked `"partial": true`
+  (display-only, never persisted). **Final segments are persisted to
+  `call_sessions.transcript` as they arrive** (speaker `customer`,
+  stream-relative offsets), so the transcript is visible mid-call, and
+  the §8.2 finalize outcome now carries the **real accumulated
+  transcript** instead of the A6 spike's empty one.
+- **STT record on the session** (migration `005_a7_stt.sql`):
+  `stt_status` (`""` = no STT leg · `active` · `failed` ·
+  `not_configured`), `stt_language`, `stt_detail` (failure reason —
+  exception class / short label only, never a provider body, never a
+  secret). Exposed on `CallOut`; the **Calls page** gains an STT pill
+  column (teal `STT · bn-IN` / red `STT failed` / slate `STT off`) and
+  expandable rows showing the summary + transcript turns (system
+  markers in red, live partials marked *(live…)*).
+- **Three honest finalize shapes** (`transports.plivo_stream_outcome`,
+  keyed by the recorded STT status):
+  - `active` → transcript = the real finals; summary states live
+    Saaras transcription + segment count, and that no speech was
+    generated (reply brain is A8). Disposition stays empty — no fake
+    classification.
+  - `failed` → the call still finalizes **COMPLETED exactly once**;
+    captured finals stand, headed by a `[TRANSCRIPT PARTIAL — Sarvam
+    STT failed (…)]` marker turn; the `[SELF-HOSTED SPIKE]` label is
+    kept and the summary names the failure. A stream that ends before
+    Saaras ever opened is recorded failed with exactly that reason —
+    never dressed up as active.
+  - `not_configured` (no Sarvam key anywhere at stream time) → the
+    stream behaves **exactly like the A6 spike** (same outcome, empty
+    transcript) and **no Saaras connection is attempted**.
+- **Configuration seam:** the tenant key comes from A4
+  (`get_provider_config` — internal only); the endpoint is
+  `SARVAM_WS_URL` (default `wss://api.sarvam.ai`, path
+  `/speech-to-text/ws?language-code=…&model=…`) + `SARVAM_STT_MODEL`
+  (default `saaras:v2.5`) — the same override pattern as the A6 base
+  URLs, wired through `.env.example` and docker-compose. `websockets`
+  is now a declared backend dependency (it was transitive via uvicorn).
+
+### Verification (native, fresh SQLite DBs — same Docker caveat as chunks 1–5)
+- `scripts/smoke_test.py`: **229/229 checks passed** (183 existing +
+  46 new in the A7 section). No real Sarvam call anywhere: the A7
+  section points `SARVAM_WS_URL` at a **local mock Saaras WebSocket
+  server** (scripted partial/final replies) for the live path, a dead
+  port for the down path, and drives real Plivo-stream WebSocket
+  clients against app instances booted for the purpose. Covered:
+  dispatch places the call; stream opens → mock saw **exactly one**
+  Saaras connection for **bn-IN** (West Bengal lead) carrying the
+  tenant's key header; the 3 media frames arrived at the mock as audio
+  messages; the partial appeared on the live view mid-call (marked
+  partial) with `stt_status=active` + `bn-IN` on the session; final 1
+  persisted **while the call was still in flight**, final 2 appended
+  in order; finalize carried the real transcript (2 customer turns) and
+  an honest summary; a late Plivo status callback could not rewrite it.
+  STT-down (Hindi lead): failure recorded (`failed` + reason + `hi-IN`),
+  call COMPLETED once, transcript headed by the PARTIAL marker. No
+  config at stream time (tenant key deleted after placement): the A6
+  spike outcome verbatim in kind, `stt_status=not_configured`, and the
+  mock saw **no** new connection. The A6 stream regression (fake-key
+  instance, no `SARVAM_WS_URL`) still passes — its STT attempt fails
+  against the unreachable real endpoint and lands in the honest
+  failed/partial shape, which keeps the spike label the A6 check
+  asserts. Frontend: `vite build` clean.
+
+### Known limitations (deliberate, for this chunk)
+- **Not yet proven against the live Sarvam API** — no key exists yet
+  (owner step). The client speaks the documented Saaras streaming
+  envelope (audio JSON messages, `api-subscription-key` header,
+  `language-code` + `model` query params, `{type: data, data:
+  {transcript, is_final}}` replies); exact codec negotiation for
+  Plivo's μ-law frames against the live API is the first thing the
+  live spike validates, and it is isolated inside `app/stt.py`.
+- Partials are in-memory only (by design); a backend restart mid-call
+  loses the current partial, never the persisted finals.
+- STT cost is still reported as 0 in the result's cost breakdown —
+  per-call cost metering lands with the India-readiness work, as
+  before.
+- The status-callback finalize path (`plivo_terminal_outcome`) is
+  unchanged: a call that ends by hangup callback without a stream
+  keeps the A6 spike outcome and an empty `stt_status`.
+
+### Next step
+**A8 — Full RPI loop:** the LLM leg (agent's single prompt → Sarvam
+LLM, streaming) + Bulbul TTS leg join the stream beside STT, driven by
+a generic scripted test agent: greeting on answer, reply per final
+transcript, barge-in/silence behaviour per A9, disposition + captured
+fields from the prompt's own definitions at call end.
+
 ## Chunk 5 — Phase A: A6 Telephony Spike + Vapi Voice Profiles (2026-10-23)
 
 ### Built

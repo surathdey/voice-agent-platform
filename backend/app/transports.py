@@ -432,9 +432,67 @@ def plivo_answer_xml(session_id: str) -> str:
     )
 
 
-def plivo_stream_outcome(duration_s: int) -> dict:
-    """The honest spike result for a call whose media stream opened and
-    closed: the transport path is proven, no conversation took place."""
+def plivo_stream_outcome(duration_s: int, stt_status: str = "",
+                         stt_language: str = "", stt_detail: str = "",
+                         transcript: list | None = None) -> dict:
+    """§8.2 outcome for a call whose media stream opened and closed.
+
+    Three honest shapes, by how the A7 STT leg went (stt_status is the
+    record on the session row; the stream handler passes it through):
+
+    - "active" — Saaras transcribed the call: the transcript is the REAL
+      accumulated final segments; the summary says STT is live and that
+      no speech was generated (the reply brain is A8).
+    - "failed" — the STT session failed to open or dropped: whatever
+      finals were captured stand, headed by a [TRANSCRIPT PARTIAL]
+      marker turn, and the spike label stays — the transport path ran,
+      the ear did not.
+    - "" / "not_configured" — the original A6 spike outcome, unchanged:
+      no Sarvam config, no STT leg, transcript empty.
+    """
+    if stt_status == "active":
+        turns = list(transcript or [])
+        return {
+            "final_state": "COMPLETED",
+            "end_reason": "stream_closed",
+            "disposition": "",
+            "confidence": 0.0,
+            "summary": (f"[SELF-HOSTED] Plivo call completed with live Sarvam "
+                        f"Saaras transcription ({stt_language or 'language n/a'}) "
+                        f"— {len(turns)} final segment(s) captured in the "
+                        "transcript. No speech was generated — the reply "
+                        "brain (LLM → Bulbul TTS) lands in A8."),
+            "captured_fields": {},
+            "duration_s": int(duration_s or 0),
+            "recording_url": "",
+            "transcript": turns,
+            "cost_breakdown": _zero_cost("self_hosted", "INR"),
+        }
+    if stt_status == "failed":
+        reason = stt_detail or "unknown error"
+        turns = [{
+            "speaker": "system",
+            "text": (f"[TRANSCRIPT PARTIAL — Sarvam STT failed ({reason}). "
+                     "Only the segments captured before the failure are "
+                     "shown.]"),
+            "offset_s": 0.0,
+        }] + list(transcript or [])
+        return {
+            "final_state": "COMPLETED",
+            "end_reason": "stream_closed",
+            "disposition": "",
+            "confidence": 0.0,
+            "summary": ("[SELF-HOSTED SPIKE] Plivo call connected and the media "
+                        f"stream opened and closed cleanly, but the Sarvam STT "
+                        f"session failed ({reason}) — the transcript is "
+                        "partial. No speech was generated — the conversation "
+                        "brain (LLM → TTS) lands in A8."),
+            "captured_fields": {},
+            "duration_s": int(duration_s or 0),
+            "recording_url": "",
+            "transcript": turns,
+            "cost_breakdown": _zero_cost("self_hosted", "INR"),
+        }
     return {
         "final_state": "COMPLETED",
         "end_reason": "stream_closed",

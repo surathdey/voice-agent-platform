@@ -5,3 +5,7 @@ psycopg2-binary>=2.9
 pydantic>=2.6
 PyJWT>=2.8
 python-multipart>=0.0.9
+# A7: the self-hosted STT leg speaks WebSocket to Sarvam Saaras (uvicorn
+# [standard] already brings it in for the Plivo stream endpoint; the
+# backend now imports it directly, so it is declared).
+websockets>=12

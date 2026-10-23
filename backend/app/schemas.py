@@ -262,6 +262,15 @@ class CallOut(BaseModel):
     duration_s: int = 0
     recording_url: str = ""
     transcript: List[dict] = []
+    # Self-hosted STT leg (A7): "" when the call had no STT leg (stub /
+    # managed / never streamed); else active | failed | not_configured,
+    # plus the Saaras language the session opened with and the failure
+    # reason when failed. Transcript turns may carry "partial": true —
+    # the live in-flight segment of a call still IN_CALL (in-memory
+    # only; finals are persisted as they arrive).
+    stt_status: str = ""
+    stt_language: str = ""
+    stt_detail: str = ""
     cost_breakdown: dict = Field(default_factory=dict)
     started_at: Optional[str] = None
     answered_at: Optional[str] = None

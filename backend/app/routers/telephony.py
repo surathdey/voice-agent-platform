@@ -18,13 +18,20 @@ are called by the providers, so each route carries its own auth:
   statuses finalize through the same path.
 - POST /api/telephony/plivo/stream-status/{session_id} — stream status
   callbacks from the Stream element; recorded, never finalize from here.
-- WS  /api/telephony/plivo/stream/{session_id} — THE A7 SEAM: the
-  placeholder media-stream endpoint. In this chunk it consumes Plivo's
-  stream events (start / media / stop), marks the session IN_CALL on
-  start, speaks nothing, and when the stream closes it finalizes the
-  attempt with the honestly-labelled spike outcome. A7/A8 replace the
-  inside of this handler with the Sarvam STT → LLM → TTS loop.
+- WS  /api/telephony/plivo/stream/{session_id} — the media-stream
+  endpoint. Consumes Plivo's stream events (start / media / stop),
+  marks the session IN_CALL on start, and when the stream closes
+  finalizes the attempt exactly once through finalize_attempt.
+  **A7: the STT leg lives inside this handler** — a Sarvam Saaras
+  streaming session is opened per call (app.stt) with the lead's
+  resolved language, Plivo media frames are forwarded to it, final
+  transcript segments are persisted to the session as they arrive, and
+  the finalize outcome carries the real accumulated transcript. With
+  no Sarvam config the leg does not exist (stt_status not_configured)
+  and the handler behaves exactly like the A6 spike. A8 adds the
+  LLM → TTS reply legs beside the STT leg.
 """
+import base64
 import hmac
 import json
 from datetime import datetime
@@ -33,10 +40,10 @@ from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, statu
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy.orm import Session
 
-from .. import orchestrator, transports
+from .. import orchestrator, stt, transports
 from ..config import settings
 from ..db import SessionLocal, get_db
-from ..models import CallSession
+from ..models import AgentConfig, CallSession, Campaign, Lead
 
 router = APIRouter(tags=["telephony"])
 
@@ -160,20 +167,47 @@ async def plivo_stream_status(session_id: str, request: Request,
 
 @router.websocket("/api/telephony/plivo/stream/{session_id}")
 async def plivo_stream(websocket: WebSocket, session_id: str):
-    """Placeholder media-stream endpoint — the A7 seam (see module doc).
+    """Media-stream endpoint with the A7 STT leg inside (see module doc).
 
     Plivo speaks first: a `start` event (stream + call ids, custom
-    parameters), then `media` frames (base64 μ-law audio — ignored in
-    this chunk), then `stop`. On close, the attempt is finalized once
-    through orchestrator.finalize_attempt with the spike outcome.
+    parameters), then `media` frames (base64 μ-law audio), then `stop`.
+    On `start` — the call is answered — the Saaras session opens with
+    the lead's resolved language and media frames are forwarded to it;
+    finals land on session.transcript as they arrive. On close, the
+    attempt is finalized once through orchestrator.finalize_attempt
+    with the STT-aware stream outcome (transports.plivo_stream_outcome).
+    STT failures never crash the stream: they are recorded on the
+    session and the call finalizes with a partial transcript.
     """
     await websocket.accept()
     db = SessionLocal()
+    pipeline: stt.SaarasSttSession | None = None
+    live: dict | None = None
     try:
         session = db.get(CallSession, session_id)
         if session is None:
             await websocket.close(code=4404)
             return
+
+        # Resolve the call's language + the tenant's Sarvam config once,
+        # up front: the STT leg exists only when Sarvam is configured
+        # (A4). The resolved language is recorded either way.
+        campaign = db.get(Campaign, session.campaign_id)
+        agent = db.get(AgentConfig, campaign.agent_id) if campaign else None
+        lead = db.get(Lead, session.lead_id)
+        language = stt.saaras_language(
+            transports.resolve_language(agent, lead) if agent and lead else "hi-IN")
+        configured, api_key = stt.stt_config(session.tenant_id, db)
+        session.stt_language = language
+        if configured:
+            session.stt_status = "connecting"
+            live = stt.new_live_view(session_id, language, "connecting")
+            pipeline = stt.SaarasSttSession(session_id, api_key, language, live)
+        else:
+            session.stt_status = "not_configured"
+            live = stt.new_live_view(session_id, language, "not_configured")
+        db.commit()
+
         try:
             while True:
                 raw = await websocket.receive_text()
@@ -189,15 +223,46 @@ async def plivo_stream(websocket: WebSocket, session_id: str):
                         if s.answered_at is None:
                             s.answered_at = datetime.utcnow()
                         db.commit()
+                    if pipeline is not None:
+                        await pipeline.start()
+                elif kind == "media":
+                    if pipeline is not None:
+                        payload = (event.get("media") or {}).get("payload") or ""
+                        try:
+                            audio = base64.b64decode(payload)
+                        except Exception:
+                            audio = b""
+                        if audio:
+                            await pipeline.feed(audio)
                 elif kind == "stop":
                     break
-                # "media" frames are consumed and dropped — no brain yet.
         except Exception:
             pass  # disconnect / transport error: the stream is over either way
+
+        if pipeline is not None:
+            await pipeline.stop()
         s = db.get(CallSession, session_id)
         if s is not None:
             anchor = s.answered_at or s.started_at
             duration = int((datetime.utcnow() - anchor).total_seconds()) if anchor else 0
-            orchestrator.finalize_attempt(db, s, transports.plivo_stream_outcome(duration))
+            status_now = (live or {}).get("status", "") or s.stt_status or ""
+            detail_now = (live or {}).get("detail", "") or ""
+            if status_now == "connecting":
+                # The stream ended before Saaras ever opened — recorded
+                # honestly as a failed STT leg, never as "active".
+                status_now = "failed"
+                detail_now = "STT session did not open before the stream ended"
+            if pipeline is not None:
+                s.stt_status = status_now
+                s.stt_detail = detail_now[:500]
+                db.commit()
+            orchestrator.finalize_attempt(db, s, transports.plivo_stream_outcome(
+                duration,
+                stt_status=status_now if pipeline is not None else "not_configured",
+                stt_language=language,
+                stt_detail=detail_now,
+                transcript=(live or {}).get("finals", []),
+            ))
     finally:
+        stt.end_live_view(session_id)
         db.close()

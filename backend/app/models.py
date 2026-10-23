@@ -197,6 +197,13 @@ class CallSession(Base):
     recording_url: Mapped[str] = mapped_column(String(500), default="")
     end_reason: Mapped[str] = mapped_column(String(60), default="")
     transcript: Mapped[list] = mapped_column(JSON, default=list)  # [{speaker, text, offset_s}]
+    # Self-hosted STT leg (A7): the Sarvam Saaras session opened for this
+    # call. stt_status: "" (no STT leg — stub / managed / never streamed)
+    # | active | failed | not_configured. stt_detail carries the reason
+    # when failed (exception class / short label — never provider bodies).
+    stt_status: Mapped[str] = mapped_column(String(20), default="")
+    stt_language: Mapped[str] = mapped_column(String(20), default="")
+    stt_detail: Mapped[str] = mapped_column(String(500), default="")
 
     __table_args__ = (UniqueConstraint("tenant_id", "attempt_id", name="uq_session_attempt"),)
 

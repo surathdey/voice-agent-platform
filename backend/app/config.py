@@ -62,6 +62,13 @@ class Settings:
     EXOTEL_API_TOKEN: str = os.getenv("EXOTEL_API_TOKEN", "")
     EXOTEL_SUBDOMAIN: str = os.getenv("EXOTEL_SUBDOMAIN", "")
     SARVAM_API_KEY: str = os.getenv("SARVAM_API_KEY", "")
+    # Sarvam Saaras STT streaming (A7): WebSocket base of the Sarvam API.
+    # The STT client appends /speech-to-text/ws plus the session's
+    # language/model query params. Overridable so tests can point the STT
+    # leg at a local mock Saaras server — same seam pattern as
+    # VAPI_BASE_URL / PLIVO_BASE_URL (A6).
+    SARVAM_WS_URL: str = os.getenv("SARVAM_WS_URL", "wss://api.sarvam.ai")
+    SARVAM_STT_MODEL: str = os.getenv("SARVAM_STT_MODEL", "saaras:v2.5")
 
     # Seeded demo tenant / login (created on first boot if absent)
     SEED_TENANT_NAME: str = os.getenv("SEED_TENANT_NAME", "QGBS")
