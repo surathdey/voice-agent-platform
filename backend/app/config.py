@@ -69,6 +69,13 @@ class Settings:
     # VAPI_BASE_URL / PLIVO_BASE_URL (A6).
     SARVAM_WS_URL: str = os.getenv("SARVAM_WS_URL", "wss://api.sarvam.ai")
     SARVAM_STT_MODEL: str = os.getenv("SARVAM_STT_MODEL", "saaras:v2.5")
+    # Sarvam HTTP API (A8): chat completions (the LLM leg) and Bulbul TTS
+    # live under this base — {base}/chat/completions and
+    # {base}/text-to-speech, authenticated with the same tenant Sarvam
+    # key (api-subscription-key header). Overridable so tests can point
+    # both legs at a local mock Sarvam HTTP server.
+    SARVAM_BASE_URL: str = os.getenv("SARVAM_BASE_URL", "https://api.sarvam.ai")
+    SARVAM_TTS_MODEL: str = os.getenv("SARVAM_TTS_MODEL", "bulbul:v2")
 
     # Seeded demo tenant / login (created on first boot if absent)
     SEED_TENANT_NAME: str = os.getenv("SEED_TENANT_NAME", "QGBS")

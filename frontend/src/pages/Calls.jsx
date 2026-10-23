@@ -5,11 +5,13 @@ import { api } from '../api'
    in A5). Each row is the §8.2 result view: state, disposition, duration,
    the mode the campaign ran in and the transport that actually carried
    the call (the stub in this build — labelled, never disguised). From
-   A7, self-hosted rows also carry the STT leg's record (Saaras status +
-   language) and expanding a row shows the summary and the transcript —
-   finals are persisted as they arrive, and a call still in progress
-   shows its live partial segment, marked. The full per-call journey
-   view (timeline) arrives with A10. */
+   A7, self-hosted rows also carry the pipeline legs' record (STT ·
+   LLM · TTS status, from A8) and expanding a row shows the summary and
+   the transcript — finals are persisted as they arrive, and a call
+   still in progress shows its live partial segment, marked. A result
+   the post-call classifier could not trust carries a "Needs review"
+   flag (its disposition stays empty rather than guessed). The full
+   per-call journey view (timeline) arrives with A10. */
 const STATE_PILL = {
   QUEUED: 'navy', DIALING: 'gold', IN_CALL: 'gold',
   COMPLETED: 'teal', NO_ANSWER: 'slate', BUSY: 'slate',
@@ -28,15 +30,26 @@ function fmtTime(iso) {
   return new Date(iso + (iso.endsWith('Z') ? '' : 'Z')).toLocaleString()
 }
 
-function SttPill({ c }) {
-  if (!c.stt_status) return '—'
-  if (c.stt_status === 'active')
-    return <span className="pill teal">STT{c.stt_language ? ` · ${c.stt_language}` : ''}</span>
-  if (c.stt_status === 'failed')
-    return <span className="pill red" title={c.stt_detail || ''}>STT failed{c.stt_language ? ` · ${c.stt_language}` : ''}</span>
-  if (c.stt_status === 'connecting')
-    return <span className="pill gold">STT connecting</span>
-  return <span className="pill slate">STT off</span>
+function LegsCell({ c }) {
+  const legs = [
+    ['STT', c.stt_status, c.stt_detail, c.stt_language],
+    ['LLM', c.llm_status, c.llm_detail, ''],
+    ['TTS', c.tts_status, c.tts_detail, ''],
+  ].filter(([, status]) => status)
+  if (!legs.length) return '—'
+  return (
+    <span style={{ display: 'inline-flex', flexDirection: 'column', gap: 2 }}>
+      {legs.map(([label, status, detail, lang]) => (
+        status === 'active'
+          ? <span key={label} className="pill teal">{label}{lang ? ` · ${lang}` : ''}</span>
+          : status === 'failed'
+            ? <span key={label} className="pill red" title={detail || ''}>{label} failed{lang ? ` · ${lang}` : ''}</span>
+            : status === 'connecting'
+              ? <span key={label} className="pill gold">{label} connecting</span>
+              : <span key={label} className="pill slate">{label} off</span>
+      ))}
+    </span>
+  )
 }
 
 export default function Calls() {
@@ -82,7 +95,7 @@ export default function Calls() {
             <tr>
               <th>Started</th><th>Campaign</th><th>Lead</th><th>Number</th>
               <th>State</th><th>Disposition</th><th>Duration</th>
-              <th>Mode</th><th>Transport</th><th>STT</th><th className="num">Cost</th>
+              <th>Mode</th><th>Transport</th><th>Legs</th><th className="num">Cost</th>
             </tr>
           </thead>
           <tbody>
@@ -101,7 +114,7 @@ export default function Calls() {
                 <td>{c.transport === 'stub'
                   ? <span className="pill gold">stub</span>
                   : c.transport}</td>
-                <td><SttPill c={c} /></td>
+                <td><LegsCell c={c} /></td>
                 <td className="num">
                   {c.cost_breakdown && c.cost_breakdown.total !== undefined
                     ? `${c.cost_breakdown.total} ${c.cost_breakdown.currency || ''}`.trim()
@@ -111,6 +124,14 @@ export default function Calls() {
               {openId === c.session_id && (
                 <tr>
                   <td colSpan={11} style={{ background: 'var(--bg)', whiteSpace: 'normal' }}>
+                    {c.review_required && (
+                      <div style={{ marginBottom: 6 }}>
+                        <span className="pill red">Needs review</span>{' '}
+                        <span style={{ color: 'var(--slate)', fontSize: 13 }}>
+                          classification could not produce a trustworthy disposition — see the summary.
+                        </span>
+                      </div>
+                    )}
                     {c.summary && <div style={{ marginBottom: 6 }}>{c.summary}</div>}
                     {(c.transcript || []).length === 0 && !c.summary && (
                       <span style={{ color: 'var(--slate)' }}>No transcript for this call.</span>

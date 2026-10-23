@@ -3,7 +3,7 @@
 
 Usage:  python3 scripts/smoke_test.py [base_url]     (default http://localhost:8000)
         Run with the backend venv python (backend/.venv/bin/python) —
-        the A6/A7 sections boot their own app instances with that
+        the A6/A7/A8 sections boot their own app instances with that
         interpreter and need its `websockets` package for the stream
         tests and the mock Saaras server.
 Covers: health · login · tenant scoping (A1 acceptance) · agent CRUD ·
@@ -1288,6 +1288,507 @@ try:
             except Exception:
                 _p.kill()
         _stt_server.shutdown()
+
+    print("── A8: full conversation loop — mock Sarvam HTTP (LLM + TTS) + mock Saaras ──")
+    # The self-hosted stream now runs the whole brain: Saaras finals drive
+    # Sarvam chat completions (the agent's single prompt as system prompt),
+    # replies are sentence-chunked into Bulbul TTS, and the audio returns
+    # to the Plivo stream as playAudio frames. SARVAM_BASE_URL is the
+    # override seam — this section points it at a local MOCK Sarvam HTTP
+    # server (scripted SSE chat + scripted classifier + dummy-audio TTS),
+    # SARVAM_WS_URL at a fresh mock Saaras. A dead HTTP port plays the
+    # LLM-down scenario. No real provider is called anywhere.
+    import base64 as _b64_8
+    from websockets.sync.client import connect as _ws_connect8
+
+    _L1_8 = "My favourite colour is blue."
+    _L2_8 = "For clothes, mostly."
+    _R1_8 = "Hello, this is a short survey call. What is your favourite colour?"
+    _R2_8 = "Blue is a lovely colour. And do you prefer it for clothes or for cars?"
+    _R3_8 = "Thank you for your answers. Have a good day."
+    _SENT_8 = {
+        _R1_8: ["Hello, this is a short survey call.", "What is your favourite colour?"],
+        _R2_8: ["Blue is a lovely colour.", "And do you prefer it for clothes or for cars?"],
+        _R3_8: ["Thank you for your answers.", "Have a good day."],
+    }
+
+
+    def _mock_audio8(text):
+        return ("<tts:" + text + ">").encode() * 3
+
+
+    def _audio_len8(reply):
+        return sum(len(_mock_audio8(s)) for s in _SENT_8[reply])
+
+
+    MOCK_AI = {"chat": [], "classify": [], "tts": [], "classify_mode": "ok"}
+
+
+    class _MockSarvamAI(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def _send(self, code, data, ctype="application/json"):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _json(self, code, obj):
+            self._send(code, json.dumps(obj).encode())
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b""
+            try:
+                body = json.loads(raw) if raw else {}
+            except Exception:
+                body = {}
+            if self.path == "/chat/completions":
+                self._chat(body)
+            elif self.path == "/text-to-speech":
+                MOCK_AI["tts"].append(body)
+                text = (body.get("inputs") or [""])[0]
+                self._json(200, {"audios": [_b64_8.b64encode(_mock_audio8(text)).decode()]})
+            else:
+                self._json(404, {})
+
+        def _chat(self, body):
+            msgs = body.get("messages") or []
+            system = msgs[0].get("content", "") if msgs else ""
+            if "POST-CALL CLASSIFIER" in system:
+                MOCK_AI["classify"].append(body)
+                mode = MOCK_AI["classify_mode"]
+                if mode == "garbage":
+                    content = "I could not classify this call, sorry."
+                elif mode == "bad_bucket":
+                    content = json.dumps({
+                        "disposition": "NOT_A_BUCKET", "captured_fields": {},
+                        "confidence": 0.4,
+                        "summary": "Mock classifier picked a bucket that does not exist."})
+                else:
+                    content = json.dumps({
+                        "disposition": "ANSWERED",
+                        "captured_fields": {"favourite_colour": "blue"},
+                        "confidence": 0.93,
+                        "summary": "The callee answered both survey questions; favourite colour blue."})
+                self._json(200, {"choices": [
+                    {"message": {"role": "assistant", "content": content}}]})
+                return
+            MOCK_AI["chat"].append(body)
+            users = [m.get("content", "") for m in msgs if m.get("role") == "user"]
+            last = users[-1] if users else ""
+            if last == _L2_8:
+                pieces = ["Thank you for your answers. ", "Have a good day."]
+                end_call = True
+            elif last == _L1_8:
+                pieces = ["Blue is a lovely ", "colour. And do you prefer it ",
+                          "for clothes or for cars?"]
+                end_call = False
+            else:  # the kickoff — greeting + the one survey question
+                pieces = ["Hello, this is a short survey ",
+                          "call. What is your favourite colour?"]
+                end_call = False
+            lines = []
+            for p in pieces:
+                lines.append("data: " + json.dumps(
+                    {"choices": [{"delta": {"content": p}}]}) + "\n\n")
+            if end_call:
+                lines.append("data: " + json.dumps({"choices": [{"delta": {"tool_calls": [
+                    {"index": 0, "id": "call_end_1", "type": "function",
+                     "function": {"name": "end_call", "arguments": ""}}]}}]}) + "\n\n")
+            lines.append("data: [DONE]\n\n")
+            self._send(200, "".join(lines).encode(), "text/event-stream")
+
+
+    _ai_server = ThreadingHTTPServer(("127.0.0.1", 0), _MockSarvamAI)
+    threading.Thread(target=_ai_server.serve_forever, daemon=True).start()
+    MOCK_AI_URL = f"http://127.0.0.1:{_ai_server.server_address[1]}"
+
+    import socket as _socket8
+    _dead_ai = _socket8.socket()
+    _dead_ai.bind(("127.0.0.1", 0))
+    DEAD_AI_URL = f"http://127.0.0.1:{_dead_ai.getsockname()[1]}"
+    _dead_ai.close()  # nothing listens — LLM/TTS calls are refused instantly
+
+    MOCK_STT8 = {"connections": []}
+
+
+    def _mock_saaras8(ws):
+        req = ws.request
+        info = {"path": req.path if req else "", "frames": 0}
+        MOCK_STT8["connections"].append(info)
+        try:
+            for raw in ws:
+                try:
+                    msg = json.loads(raw)
+                except Exception:
+                    continue
+                if "audio" not in msg:
+                    continue
+                info["frames"] += 1
+                line = _L1_8 if info["frames"] == 1 else _L2_8 if info["frames"] == 2 else ""
+                if line:
+                    ws.send(json.dumps({"type": "data", "data": {
+                        "transcript": line, "is_final": True}}))
+        except Exception:
+            pass  # client went away mid-stream — the mock just stops
+
+
+    _stt8_server = _ws_serve7(_mock_saaras8, "127.0.0.1", 0)
+    threading.Thread(target=_stt8_server.serve_forever, daemon=True).start()
+    MOCK_STT8_URL = f"ws://127.0.0.1:{_stt8_server.socket.getsockname()[1]}"
+
+    _SCRIPTED_PROMPT_8 = """ROLE
+    You are a scripted survey test agent used for platform testing. You ask
+    one short survey, politely and briefly, in the call's language.
+
+    FLOW
+    1. Greet {{lead_name}} and ask: "What is your favourite colour?"
+    2. When they answer, repeat their colour back to confirm, and ask:
+       "And do you prefer it for clothes or for cars?"
+    3. When they answer again, thank them warmly, say the approved closing
+       in full, and end the call.
+
+    DISPOSITIONS - classify the finished call into exactly ONE disposition:
+    - ANSWERED: the callee answered the survey questions.
+    - DID_NOT_ANSWER: the callee did not answer the questions.
+
+    CLOSINGS
+    Always close with: "Thank you for your time. Have a good day."
+    """
+
+
+    def poll8(base, token, cid, sid, pred, tries=60, nap=0.25):
+        last = None
+        for _ in range(tries):
+            _s, cl = call6(base, "GET", f"/api/campaigns/{cid}/calls", token=token)
+            last = next((c for c in cl["calls"] if c["session_id"] == sid), None)
+            if last is not None and pred(last):
+                return last
+            time.sleep(nap)
+        return last
+
+
+    def _wait_audio8(ws, sink, target, timeout=15):
+        """Collect playAudio audio until sink holds >= target bytes.
+        Returns True when the server closed the stream."""
+        deadline = time.monotonic() + timeout
+        closed = False
+        while len(sink) < target and time.monotonic() < deadline:
+            try:
+                raw = ws.recv(timeout=max(0.05, deadline - time.monotonic()))
+            except TimeoutError:
+                break
+            except Exception:
+                closed = True
+                break
+            try:
+                ev = json.loads(raw)
+            except Exception:
+                continue
+            if ev.get("event") == "playAudio":
+                sink.extend(_b64_8.b64decode((ev.get("media") or {}).get("payload") or ""))
+        return closed
+
+
+    def _drain8(ws, sink, seconds):
+        """Collect whatever playAudio audio arrives for `seconds` (used to
+        prove NO further audio comes after a guard stops the loop)."""
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            try:
+                raw = ws.recv(timeout=max(0.05, deadline - time.monotonic()))
+            except Exception:
+                break
+            try:
+                ev = json.loads(raw)
+            except Exception:
+                continue
+            if ev.get("event") == "playAudio":
+                sink.extend(_b64_8.b64decode((ev.get("media") or {}).get("payload") or ""))
+
+
+    def _stream_open8(base, token, sid):
+        _st, xml_text = call6(base, "GET", f"/api/telephony/plivo/answer/{sid}")
+        ws_url = _ET.fromstring(xml_text).find("Stream").text.strip()
+        ws = _ws_connect8(ws_url)
+        ws.send(json.dumps({"event": "start", "start": {
+            "streamId": "str-a8", "callId": "call-a8",
+            "customParameters": {"session_id": sid}}}))
+        return ws
+
+
+    def _media8(ws):
+        ws.send(json.dumps({"event": "media", "media": {
+            "payload": _b64_8.b64encode(b"\xff" * 160).decode()}}))
+
+
+    def _stream_stop8(ws):
+        try:
+            ws.send(json.dumps({"event": "stop"}))
+        except Exception:
+            pass
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+
+    def _wait_closed8(ws, seconds=5):
+        """Wait until the SERVER closes the stream (the end_call path
+        ends the stream handler-side; the client just observes)."""
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            try:
+                ws.recv(timeout=max(0.05, deadline - time.monotonic()))
+            except TimeoutError:
+                return False
+            except Exception:
+                return True
+        return False
+
+
+    # ── the full loop: greeting → question → follow-up → closing ──────
+    baseA8 = start_app6(18108, "conv-live", {
+        "TELEPHONY_MODE": "self_hosted", "PLIVO_AUTH_ID": "MAFAKEID",
+        "PLIVO_AUTH_TOKEN": "fake-plivo-token", "SARVAM_API_KEY": "sk-fake-sarvam",
+        "SARVAM_WS_URL": MOCK_STT8_URL, "SARVAM_BASE_URL": MOCK_AI_URL,
+    })
+    tokenA8 = login6(baseA8)
+    _, scripted = call6(baseA8, "POST", "/api/agents", {
+        "name": "A8 Scripted Survey Agent",
+        "purpose": "Generic scripted test agent (design A8 acceptance)",
+        "prompt": _SCRIPTED_PROMPT_8,
+        "llm_model": "sarvam-105b",
+        "tts_voice_id": "bulbul-bn-female-1",
+        "language_rule": {"default": "hi-IN", "by_state": {"West Bengal": "bn-IN"}},
+        "captured_fields": [{"name": "favourite_colour", "type": "string",
+                             "description": "The callee's favourite colour"}],
+    }, token=tokenA8, expect=201)
+    check6("A8: scripted test agent created with its single prompt + captured field",
+           scripted["name"] == "A8 Scripted Survey Agent"
+           and scripted["max_turns"] == 50, scripted.get("name"))
+    cidA8 = campaign6(baseA8, tokenA8, scripted["agent_id"], "A8 — Conversation Batch",
+                      "self_hosted",
+                      "callee_name,phone_number,bank_name,state\n"
+                      "P. Sen,9500000001,Tata Capital,West Bengal\n"
+                      "Q. Das,9500000002,Tata Capital,West Bengal\n"
+                      "R. Mitra,9500000003,Tata Capital,West Bengal\n")
+    _, repA8 = call6(baseA8, "POST", f"/api/campaigns/{cidA8}/dispatch", token=tokenA8)
+    check6("A8: dispatch places the three Plivo calls",
+           repA8["transport"] == "self_hosted" and repA8["placed"] == 3, repA8)
+    _, callsA8 = call6(baseA8, "GET", f"/api/campaigns/{cidA8}/calls", token=tokenA8)
+    sessA8 = {c["to_number"]: c for c in callsA8["calls"]}
+
+    chat0, tts0, cls0 = len(MOCK_AI["chat"]), len(MOCK_AI["tts"]), len(MOCK_AI["classify"])
+    sA1 = sessA8["9500000001"]
+    audioA = bytearray()
+    wsA = _stream_open8(baseA8, tokenA8, sA1["session_id"])
+    closedA = _wait_audio8(wsA, audioA, _audio_len8(_R1_8))
+    check6("A8: the agent speaks FIRST — the opening's audio arrives before any callee media",
+           len(audioA) == _audio_len8(_R1_8) and not closedA, len(audioA))
+    _media8(wsA)
+    _wait_audio8(wsA, audioA, _audio_len8(_R1_8) + _audio_len8(_R2_8))
+    check6("A8: callee line 1 (STT final) drives reply turn 2 — its audio follows",
+           len(audioA) == _audio_len8(_R1_8) + _audio_len8(_R2_8), len(audioA))
+    _media8(wsA)
+    closedA = _wait_audio8(wsA, audioA,
+                           _audio_len8(_R1_8) + _audio_len8(_R2_8) + _audio_len8(_R3_8))
+    closedA = _wait_closed8(wsA, 5.0) or closedA
+    check6("A8: closing spoken in full, then the model's end_call action closes the stream",
+           closedA and len(audioA) == (_audio_len8(_R1_8) + _audio_len8(_R2_8)
+                                       + _audio_len8(_R3_8)), (closedA, len(audioA)))
+    try:
+        wsA.close()
+    except Exception:
+        pass
+    doneA = poll8(baseA8, tokenA8, cidA8, sA1["session_id"],
+                  lambda c: c["final_state"] is not None)
+    check6("A8: finalize — COMPLETED via agent_end_call, all three legs active (bn-IN)",
+           doneA is not None and doneA["final_state"] == "COMPLETED"
+           and doneA["end_reason"] == "agent_end_call"
+           and doneA["stt_status"] == "active" and doneA["stt_language"] == "bn-IN"
+           and doneA["llm_status"] == "active" and doneA["tts_status"] == "active",
+           doneA and {k: doneA[k] for k in ("final_state", "end_reason", "llm_status", "tts_status")})
+    check6("A8: the result transcript is the REAL conversation, interleaved in order",
+           doneA is not None
+           and [t["text"] for t in doneA["transcript"]] == [_R1_8, _L1_8, _R2_8, _L2_8, _R3_8]
+           and [t["speaker"] for t in doneA["transcript"]] ==
+               ["agent", "customer", "agent", "customer", "agent"],
+           doneA and doneA["transcript"])
+    check6("A8: classification against the prompt's own DISPOSITIONS — bucket + captured field",
+           doneA is not None and doneA["disposition"] == "ANSWERED"
+           and doneA["captured_fields"].get("favourite_colour") == "blue"
+           and doneA["review_required"] is False
+           and "Full conversation loop" in doneA["summary"], doneA)
+    chatA = MOCK_AI["chat"][chat0:]
+    check6("A8: three LLM turns ran (kickoff + two replies), history accumulating",
+           len(chatA) == 3
+           and any(m.get("role") == "assistant" and m.get("content") == _R1_8
+                   for m in chatA[2]["messages"])
+           and any(m.get("role") == "user" and m.get("content") == _L1_8
+                   for m in chatA[2]["messages"]), len(chatA))
+    check6("A8: the system prompt is the agent's single prompt, lead variables bound",
+           "P. Sen" in chatA[0]["messages"][0]["content"]
+           and "{{lead_name}}" not in chatA[0]["messages"][0]["content"]
+           and "DISPOSITIONS" in chatA[0]["messages"][0]["content"],
+           chatA[0]["messages"][0]["content"][:80])
+    ttsA = MOCK_AI["tts"][tts0:]
+    check6("A8: Bulbul synthesized one request per reply sentence, agent voice + call language",
+           [t["inputs"][0] for t in ttsA] ==
+               _SENT_8[_R1_8] + _SENT_8[_R2_8] + _SENT_8[_R3_8]
+           and all(t["speaker"] == "bulbul-bn-female-1" for t in ttsA)
+           and all(t["target_language_code"] == "bn-IN" for t in ttsA), ttsA)
+    check6("A8: the playAudio frames carry exactly the synthesized audio, in order",
+           bytes(audioA) == b"".join(_mock_audio8(t["inputs"][0]) for t in ttsA),
+           len(audioA))
+    clsA = MOCK_AI["classify"][cls0:]
+    check6("A8: exactly one classifier call, fed the prompt's buckets + the real transcript",
+           len(clsA) == 1
+           and "ANSWERED" in clsA[0]["messages"][1]["content"]
+           and _L1_8 in clsA[0]["messages"][1]["content"]
+           and _R3_8 in clsA[0]["messages"][1]["content"], len(clsA))
+
+    # ── classifier honesty: unknown bucket and garbage output ─────────
+    MOCK_AI["classify_mode"] = "bad_bucket"
+    sA2 = sessA8["9500000002"]
+    audioB = bytearray()
+    wsB = _stream_open8(baseA8, tokenA8, sA2["session_id"])
+    _wait_audio8(wsB, audioB, _audio_len8(_R1_8))
+    _media8(wsB)
+    _media8(wsB)
+    _drain8(wsB, audioB, 2.0)
+    _stream_stop8(wsB)
+    doneB = poll8(baseA8, tokenA8, cidA8, sA2["session_id"],
+                  lambda c: c["final_state"] is not None)
+    check6("A8: a bucket outside the prompt's set is NEVER stored — review flag instead",
+           doneB is not None and doneB["disposition"] == ""
+           and doneB["review_required"] is True
+           and "Flagged for review" in doneB["summary"], doneB)
+    MOCK_AI["classify_mode"] = "garbage"
+    sA3 = sessA8["9500000003"]
+    audioC = bytearray()
+    wsC = _stream_open8(baseA8, tokenA8, sA3["session_id"])
+    _wait_audio8(wsC, audioC, _audio_len8(_R1_8))
+    _media8(wsC)
+    _media8(wsC)
+    _drain8(wsC, audioC, 2.0)
+    _stream_stop8(wsC)
+    doneC = poll8(baseA8, tokenA8, cidA8, sA3["session_id"],
+                  lambda c: c["final_state"] is not None)
+    check6("A8: unparseable classifier output also lands as review, not a guessed bucket",
+           doneC is not None and doneC["disposition"] == ""
+           and doneC["review_required"] is True, doneC)
+    MOCK_AI["classify_mode"] = "ok"
+
+    # ── guards: max_turns and max_duration end the loop honestly ────
+    _, agent_mt = call6(baseA8, "POST", "/api/agents", {
+        "name": "A8 Max Turns Agent", "prompt": _SCRIPTED_PROMPT_8,
+        "tts_voice_id": "bulbul-bn-female-1", "max_turns": 1,
+        "language_rule": {"default": "hi-IN", "by_state": {"West Bengal": "bn-IN"}},
+        "captured_fields": [{"name": "favourite_colour", "type": "string",
+                             "description": "The callee's favourite colour"}],
+    }, token=tokenA8, expect=201)
+    cidMT = campaign6(baseA8, tokenA8, agent_mt["agent_id"], "A8 — Max Turns Batch",
+                      "self_hosted",
+                      "callee_name,phone_number,bank_name,state\n"
+                      "S. Pal,9500000011,Tata Capital,West Bengal\n")
+    call6(baseA8, "POST", f"/api/campaigns/{cidMT}/dispatch", token=tokenA8)
+    _, callsMT = call6(baseA8, "GET", f"/api/campaigns/{cidMT}/calls", token=tokenA8)
+    sMT = callsMT["calls"][0]
+    chat_mt0 = len(MOCK_AI["chat"])
+    audioMT = bytearray()
+    wsMT = _stream_open8(baseA8, tokenA8, sMT["session_id"])
+    _wait_audio8(wsMT, audioMT, _audio_len8(_R1_8))
+    _media8(wsMT)  # callee answers — but the one allowed turn is spent
+    _drain8(wsMT, audioMT, 2.5)
+    check6("A8: max_turns guard — no second reply is generated or spoken",
+           len(audioMT) == _audio_len8(_R1_8)
+           and len(MOCK_AI["chat"]) - chat_mt0 == 1, len(audioMT))
+    _stream_stop8(wsMT)
+    doneMT = poll8(baseA8, tokenA8, cidMT, sMT["session_id"],
+                   lambda c: c["final_state"] is not None)
+    check6("A8: the guarded call finalizes with end_reason max_turns",
+           doneMT is not None and doneMT["end_reason"] == "max_turns"
+           and [t["speaker"] for t in doneMT["transcript"]] == ["agent", "customer"],
+           doneMT and doneMT["end_reason"])
+
+    _, agent_md = call6(baseA8, "POST", "/api/agents", {
+        "name": "A8 Max Duration Agent", "prompt": _SCRIPTED_PROMPT_8,
+        "tts_voice_id": "bulbul-bn-female-1", "max_duration_s": 1,
+        "language_rule": {"default": "hi-IN", "by_state": {"West Bengal": "bn-IN"}},
+        "captured_fields": [{"name": "favourite_colour", "type": "string",
+                             "description": "The callee's favourite colour"}],
+    }, token=tokenA8, expect=201)
+    cidMD = campaign6(baseA8, tokenA8, agent_md["agent_id"], "A8 — Max Duration Batch",
+                      "self_hosted",
+                      "callee_name,phone_number,bank_name,state\n"
+                      "T. Ray,9500000012,Tata Capital,West Bengal\n")
+    call6(baseA8, "POST", f"/api/campaigns/{cidMD}/dispatch", token=tokenA8)
+    _, callsMD = call6(baseA8, "GET", f"/api/campaigns/{cidMD}/calls", token=tokenA8)
+    sMD = callsMD["calls"][0]
+    audioMD = bytearray()
+    wsMD = _stream_open8(baseA8, tokenA8, sMD["session_id"])
+    _wait_audio8(wsMD, audioMD, _audio_len8(_R1_8))
+    time.sleep(1.4)  # let the 1-second duration limit lapse
+    _media8(wsMD)  # the answer arrives too late — the guard has ended the loop
+    _drain8(wsMD, audioMD, 2.0)
+    check6("A8: max_duration guard — the late answer gets no reply",
+           len(audioMD) == _audio_len8(_R1_8), len(audioMD))
+    _stream_stop8(wsMD)
+    doneMD = poll8(baseA8, tokenA8, cidMD, sMD["session_id"],
+                   lambda c: c["final_state"] is not None)
+    check6("A8: the duration-guarded call finalizes with end_reason max_duration",
+           doneMD is not None and doneMD["end_reason"] == "max_duration",
+           doneMD and doneMD["end_reason"])
+
+    # ── LLM leg down: STT lives, the brain fails, honesty holds ──────
+    print("── A8: LLM down — degraded finalize, review flag, no faked conversation ──")
+    baseD8 = start_app6(18109, "conv-llmdown", {
+        "TELEPHONY_MODE": "self_hosted", "PLIVO_AUTH_ID": "MAFAKEID",
+        "PLIVO_AUTH_TOKEN": "fake-plivo-token", "SARVAM_API_KEY": "sk-fake-sarvam",
+        "SARVAM_WS_URL": MOCK_STT8_URL, "SARVAM_BASE_URL": DEAD_AI_URL,
+    })
+    tokenD8 = login6(baseD8)
+    _, agentsD8 = call6(baseD8, "GET", "/api/agents", token=tokenD8)
+    cidD8 = campaign6(baseD8, tokenD8, agentsD8[0]["agent_id"], "A8 — LLM Down Batch",
+                      "self_hosted",
+                      "callee_name,phone_number,bank_name,state\n"
+                      "U. Jha,9500000021,Tata Capital,Bihar\n")
+    call6(baseD8, "POST", f"/api/campaigns/{cidD8}/dispatch", token=tokenD8)
+    _, callsD8 = call6(baseD8, "GET", f"/api/campaigns/{cidD8}/calls", token=tokenD8)
+    sD8 = callsD8["calls"][0]
+    audioD = bytearray()
+    wsD8 = _stream_open8(baseD8, tokenD8, sD8["session_id"])
+    _media8(wsD8)
+    _media8(wsD8)
+    liveD = poll8(baseD8, tokenD8, cidD8, sD8["session_id"],
+                  lambda c: sum(1 for t in c["transcript"] if not t.get("partial")) >= 2)
+    check6("A8: with the LLM down, STT finals still land on the session live",
+           liveD is not None
+           and [t["text"] for t in liveD["transcript"]] == [_L1_8, _L2_8], liveD)
+    _drain8(wsD8, audioD, 1.5)
+    check6("A8: no audio was ever sent back — the brain produced nothing to speak",
+           len(audioD) == 0, len(audioD))
+    _stream_stop8(wsD8)
+    doneD8 = poll8(baseD8, tokenD8, cidD8, sD8["session_id"],
+                   lambda c: c["final_state"] is not None)
+    check6("A8: degraded finalize — legs recorded (STT active, LLM + TTS failed)",
+           doneD8 is not None and doneD8["final_state"] == "COMPLETED"
+           and doneD8["stt_status"] == "active"
+           and doneD8["llm_status"] == "failed" and bool(doneD8["llm_detail"])
+           and doneD8["tts_status"] == "failed", doneD8)
+    check6("A8: degraded outcome — STT transcript stands, disposition empty, review flagged",
+           doneD8 is not None
+           and [t["text"] for t in doneD8["transcript"]] == [_L1_8, _L2_8]
+           and doneD8["disposition"] == "" and doneD8["review_required"] is True
+           and "live Sarvam Saaras transcription" in doneD8["summary"]
+           and "flagged for review" in doneD8["summary"], doneD8)
+
+    _ai_server.shutdown()
+    _stt8_server.shutdown()
 
 finally:
     for _p in _procs6:

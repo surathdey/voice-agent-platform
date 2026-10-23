@@ -65,6 +65,7 @@ class AgentIn(BaseModel):
     language_rule: dict = Field(default_factory=dict)
     captured_fields: List[CapturedField] = []
     max_duration_s: int = 300
+    max_turns: int = 50  # conversation-loop guard (A8)
     silence_prompt_after_s: int = 8
 
 
@@ -271,6 +272,17 @@ class CallOut(BaseModel):
     stt_status: str = ""
     stt_language: str = ""
     stt_detail: str = ""
+    # Self-hosted LLM + TTS legs (A8): same status vocabulary as the STT
+    # leg ("" when the call never streamed, else active | failed |
+    # not_configured) with failure detail. review_required is the §8.2
+    # result's flag: classification could not produce a trustworthy
+    # disposition (reason in summary) — the disposition stays "" rather
+    # than an invented or out-of-set bucket.
+    llm_status: str = ""
+    llm_detail: str = ""
+    tts_status: str = ""
+    tts_detail: str = ""
+    review_required: bool = False
     cost_breakdown: dict = Field(default_factory=dict)
     started_at: Optional[str] = None
     answered_at: Optional[str] = None

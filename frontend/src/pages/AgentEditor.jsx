@@ -7,7 +7,7 @@ const EMPTY = {
   llm_model: 'sarvam-105b', stt_provider: 'saaras', stt_language: 'hi-IN',
   tts_provider: 'bulbul', tts_voice_id: '', voice_gender: 'female',
   language_rule: { default: 'hi-IN', by_state: {} },
-  captured_fields: [], max_duration_s: 300, silence_prompt_after_s: 8,
+  captured_fields: [], max_duration_s: 300, max_turns: 50, silence_prompt_after_s: 8,
 }
 
 const FIELD_TYPES = ['string', 'date', 'number', 'boolean']
@@ -144,11 +144,13 @@ export default function AgentEditor({ agentId, onBack }) {
               <option value="male">Male</option>
             </select>
             <div className="hint">Managed mode: selects the female / male voice ID in the tenant's Vapi voice profile for the call's language.</div></div>
-          <div className="field"><label>Max call duration (seconds) · silence prompt after (s)</label>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+          <div className="field"><label>Max call duration (s) · max turns · silence prompt after (s)</label>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8 }}>
               <input type="number" value={form.max_duration_s} onChange={(e) => set('max_duration_s', Number(e.target.value))} />
+              <input type="number" value={form.max_turns ?? 50} onChange={(e) => set('max_turns', Number(e.target.value))} />
               <input type="number" value={form.silence_prompt_after_s} onChange={(e) => set('silence_prompt_after_s', Number(e.target.value))} />
-            </div></div>
+            </div>
+            <div className="hint">Max turns / duration are the self-hosted conversation loop's guards (A8) — a call that hits either ends honestly with that end reason.</div></div>
         </div>
 
         <div className="section-title"><span className="marker">3</span> Language rule (structured)</div>

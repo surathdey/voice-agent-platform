@@ -5,13 +5,16 @@ Voice Agent Platform V2 (Greenfield + QGBS MVP)*. Agents are **data, not
 code**: each agent is one prompt plus structured voice/model/language
 configuration, run in campaigns against lead lists.
 
-**This build = Phase A, chunks 1–5: A1 (tenancy + core data model), A2
+**This build = Phase A, chunks 1–7: A1 (tenancy + core data model), A2
 (Agent Config Studio), A3 (Campaigns & Leads), A4 (Provider Settings),
-A5 (Orchestrator skeleton — dispatch + stub transport + §8.2 results) and
+A5 (Orchestrator skeleton — dispatch + stub transport + §8.2 results),
 A6 (Telephony spike — real Vapi + Plivo transports behind the same
-boundary, per-language Vapi voice profiles).**
+boundary, per-language Vapi voice profiles), A7 (STT live — Sarvam
+Saaras inside the media stream) and A8 (the full conversation loop —
+Saaras finals → Sarvam LLM → Bulbul TTS, with post-call classification
+against the agent prompt's own disposition definitions).**
 See `BUILD-LOG.md` for what is verified and what comes next
-(A7: Sarvam STT inside the media stream).
+(A9: barge-in / silence handling inside the loop).
 
 ## Run it (Docker — the owner's route)
 
@@ -49,7 +52,7 @@ cd frontend && npm install && npm run dev   # http://localhost:5173, proxies /ap
 - [ ] `GET /api/health` returns `telephony_mode: "stub"`.
 - [ ] Create a second tenant (`POST /api/tenants`), log in as its admin:
       it sees **zero** agents, and QGBS agent URLs return 404
-      (run `backend/.venv/bin/python scripts/smoke_test.py` — 183 checks automate all of this).
+      (run `backend/.venv/bin/python scripts/smoke_test.py` — 311 checks automate all of this).
 
 **A2 — Agent Config Studio**
 - [ ] Agents library matches the wireframe layout: cards with LLM, STT/TTS,
@@ -126,9 +129,8 @@ cd frontend && npm install && npm run dev   # http://localhost:5173, proxies /ap
       `WEBHOOK_SECRET` + a public `PUBLIC_BASE_URL` for a live run).
 - [ ] Self-hosted dispatch (`TELEPHONY_MODE=self_hosted` + Plivo +
       Sarvam) places Plivo calls whose answer URL opens the media
-      stream; in this build the stream speaks nothing yet (the Sarvam
-      brain is A7/A8) and finalizes with an honestly labelled spike
-      result.
+      stream; A7/A8 fill that stream with live transcription and the
+      conversation brain (below).
 
 **A7 — STT live (Sarvam Saaras in the self-hosted stream)**
 - [ ] On a self-hosted call with a Sarvam key configured, opening the
@@ -147,8 +149,38 @@ cd frontend && npm install && npm run dev   # http://localhost:5173, proxies /ap
       row shows **STT failed** (hover for the reason), the transcript
       is headed by a `[TRANSCRIPT PARTIAL …]` marker, and the call
       still completes normally — a dead ear never fails a call.
-- [ ] Nothing speaks back yet and no disposition is produced on
-      self-hosted calls: the reply brain (LLM → Bulbul TTS) is A8.
+- [ ] Self-hosted calls transcribe but (in A7 alone) speak nothing back
+      and produce no disposition: the reply brain (LLM → Bulbul TTS)
+      is A8, next.
+
+**A8 — Full conversation loop (STT → LLM → TTS in the self-hosted stream)**
+- [ ] On a self-hosted call with a Sarvam key configured, the agent
+      speaks FIRST: the LLM opens the conversation from the agent
+      prompt's FLOW, with the prompt itself as the system prompt
+      (verbatim, lead variables like `{{lead_name}}` bound per call).
+- [ ] Each final transcript segment drives one reply turn; replies are
+      sentence-chunked into Bulbul TTS (the agent's voice; per call
+      language) and the audio streams back into the call as it is
+      generated. The Calls row's **Legs** column shows STT · LLM · TTS.
+- [ ] When the prompt's flow reaches its closing, the model calls the
+      end-call action: the closing is spoken in full, the stream ends,
+      and the result's end reason is `agent_end_call`.
+- [ ] Expand the finished call: the transcript is the REAL conversation
+      (agent and customer turns interleaved, in order), and the result
+      carries a **disposition + captured fields** classified after the
+      call against the DISPOSITIONS definitions inside the agent's own
+      single prompt — no separate rule store anywhere.
+- [ ] Agent limits are honoured: set **Max turns** to 1 in the studio
+      and the callee's answer gets no reply (end reason `max_turns`);
+      a 1-second max duration ends the loop the same honest way
+      (`max_duration`).
+- [ ] Point `SARVAM_BASE_URL` at a dead address and stream a call: STT
+      still transcribes live, nothing is spoken, the Legs column shows
+      LLM/TTS failed, the disposition stays empty and the result is
+      flagged **Needs review** — a dead brain degrades, never fakes.
+- [ ] A classifier answer outside the prompt's bucket set (or
+      unparseable) is never stored: disposition stays empty and the
+      result is flagged for review with the reason in the summary.
 
 ## Design decisions that override the design doc
 
@@ -176,11 +208,15 @@ backend/    FastAPI app (app/models.py = all six design entities + prompt_versio
             report mapping, Plivo create-call + answer XML + spike outcomes;
             app/stt.py = the STT leg (A7): Saaras streaming client, live
             transcript view, per-session STT persistence;
+            app/conversation.py = the conversation brain (A8): Sarvam
+            chat-completions client (prompt as system prompt, end_call
+            tool), sentence chunker, Bulbul TTS client, the per-call turn
+            engine, and the post-call classifier;
             app/routers/ = auth, tenants, agents, campaigns, settings, calls,
             telephony (provider webhook / answer / stream routes);
-            migrations/001–005 = DDL of record)
+            migrations/001–006 = DDL of record)
 frontend/   React (Vite) console — theme tokens in src/theme.css (wireframe design language);
             pages: Agents, AgentEditor, Campaigns, CampaignWizard, CampaignDetail, LeadsUpload, Settings, Calls
-scripts/    smoke_test.py — automated acceptance checks (A1 + A2 + A3 + A4 + A5 + A6 + A7)
+scripts/    smoke_test.py — automated acceptance checks (A1 + A2 + A3 + A4 + A5 + A6 + A7 + A8)
 docker-compose.yml   db (PostgreSQL 16) + backend + frontend (nginx)
 ```

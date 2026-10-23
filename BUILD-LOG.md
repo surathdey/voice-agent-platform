@@ -1,5 +1,111 @@
 # BUILD LOG
 
+## Chunk 7 — Phase A: A8 Full Conversation Loop — STT → LLM → TTS in the Self-Hosted Stream (2026-10-23)
+
+### Built
+- **The conversation brain** (`backend/app/conversation.py`, wired into
+  the stream handler in `routers/telephony.py` beside the A7 STT leg).
+  When a self-hosted call's Sarvam key is configured, a
+  `ConversationEngine` runs for the call: one kickoff turn at stream
+  `start` (the agent speaks first — the LLM opens from the prompt's
+  FLOW via a fixed "call connected" kickoff, no greeting text in code),
+  then one reply turn per STT final, until the callee hangs up, the
+  stream stops, the model ends the call, or a guard fires.
+- **LLM leg:** Sarvam chat completions, streaming. The system prompt is
+  the agent's **single prompt verbatim**, with lead variables bound per
+  call (`{{lead_name}}`, `{{bank_name}}`, … — the same binding the Vapi
+  leg performs; the stored prompt is never mutated). History accumulates
+  across turns. One tool is offered — `end_call`: when the model calls
+  it after the closing, the engine ends the stream (end reason
+  `agent_end_call`). HTTP runs in worker threads bridged to the event
+  loop via queues, so the media receive loop never blocks; request
+  sockets carry a timeout so a dead provider fails the leg instead of
+  hanging the call.
+- **TTS leg:** the reply stream is sentence-chunked (terminators
+  `. ! ? । …`); each completed sentence goes to Bulbul in its own
+  request (design §8.4 — one synthesis stream per reply sentence) with
+  the agent's voice — `tts_voice_id` when set, else derived from call
+  language + the agent's voice gender — and the audio returns into the
+  Plivo stream as `playAudio` μ-law frames at 8 kHz.
+- **Guards (agent limits, finally wired end to end):** `max_turns`
+  (new — migration `006_a8_conversation.sql`, Agent Studio field beside
+  max duration, create/update API) and `max_duration_s` end the loop
+  honestly with end reasons `max_turns` / `max_duration`.
+- **Post-call classification (the design's Post-Call Processor):** at
+  finalize, one non-streamed LLM call whose context is the agent's own
+  prompt (its DISPOSITIONS are the only allowed buckets) + the real
+  transcript returns disposition + captured fields + confidence as
+  JSON. Captured fields are filtered/coerced to the agent's declared
+  schema. An unknown bucket, unparseable output, or a failed classifier
+  call stores **no** disposition: the result is flagged
+  `review_required` with the reason in the summary — never an invented
+  bucket.
+- **Per-leg record:** sessions carry `llm_status` / `llm_detail` /
+  `tts_status` / `tts_detail` beside the A7 STT fields, and results
+  carry `review_required` (migration 006). The Calls page now shows a
+  **Legs** column (STT · LLM · TTS pills) and a **Needs review** flag on
+  flagged rows. `SARVAM_BASE_URL` / `SARVAM_TTS_MODEL` env seams added
+  (`.env.example`, compose) — the same Sarvam key serves all three legs.
+- **Honest degradation, three shapes:** full loop (real interleaved
+  transcript + classification); brain configured but LLM leg failed →
+  the A7 STT-shaped outcome stands (STT transcript, no classification)
+  + a summary note naming the failure + review flag; LLM leg that never
+  completed one turn before the stream ended is recorded **failed**
+  at drain time, never left dressed as "active". The end-call close is
+  signalled to the handler (an event raced against the receive pump) —
+  closing the socket from the engine task proved unreliable under
+  Starlette, so the handler ends the stream by returning, as in A6/A7.
+
+### Verification
+- `scripts/smoke_test.py`: **311 passed, 0 failed** (all A1–A7 checks
+  intact — including the A7 live-transcript shape surviving beside a
+  configured-but-unreachable brain — plus the new A8 section, all
+  against local mocks: mock Sarvam HTTP + mock Saaras; no real
+  provider called). The A8 section's scripted survey agent drives a
+  full simulated call and asserts: the agent speaks first (audio
+  arrives before any callee media); system prompt = the rendered
+  single prompt (lead name bound, no `{{…}}` left); three LLM turns
+  with accumulating history; Bulbul called once per reply sentence,
+  in order, with the agent's speaker + the call language (bn-IN);
+  the playAudio bytes are exactly the synthesized audio in order;
+  the model's `end_call` closes the stream after the full closing;
+  finalize = COMPLETED / `agent_end_call`, transcript interleaved
+  [agent, customer, agent, customer, agent], disposition `ANSWERED`,
+  captured `favourite_colour = blue`, all three legs active.
+  Classifier honesty: unknown bucket and garbage output both land as
+  empty disposition + review flag. Guards: `max_turns = 1` (no second
+  reply generated or spoken; end reason `max_turns`) and
+  `max_duration_s = 1` (late answer unanswered; `max_duration`).
+  LLM-down instance (dead `SARVAM_BASE_URL`): STT finals still persist
+  live, zero audio is ever sent, finalize records LLM + TTS failed,
+  STT transcript stands, disposition empty, review flagged.
+  Frontend: `vite build` clean.
+
+### Known limitations (deliberate, for this chunk)
+- **Not yet proven against the live Sarvam API** — no key exists yet
+  (owner step, unchanged). The LLM/TTS clients speak the documented
+  Sarvam shapes (chat-completions SSE deltas incl. `tool_calls`,
+  Bulbul `audios[]` base64, `api-subscription-key` header) against
+  local mocks that mirror them; first live contact may need envelope
+  adjustments, isolated inside `app/conversation.py`.
+- Bulbul audio is forwarded as returned (the request asks for
+  8000 Hz); real-time pacing of outbound frames rides on Bulbul's
+  streaming in production hardening — the mock returns whole
+  sentences at once.
+- A turn that hangs past the finish drain (~2.5 s) is cancelled; its
+  worker thread is left to its socket timeout and only ever writes
+  into a dead queue.
+- Cost breakdown remains zeros in self-hosted results — per-call cost
+  metering lands with the India-readiness work, as before.
+- No barge-in yet: callee speech during an agent reply is transcribed
+  and answered next turn, but the reply audio is never interrupted —
+  that is A9, with silence handling.
+
+### Next step
+**A9 — Barge-in / silence handling:** interrupt outbound audio when
+the callee starts speaking mid-reply; silence prompts per the agent's
+`silence_prompt_after_s`; no-input timeouts that close honestly.
+
 ## Chunk 6 — Phase A: A7 STT Live — Sarvam Saaras in the Self-Hosted Stream (2026-10-23)
 
 ### Built

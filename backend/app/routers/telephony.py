@@ -28,9 +28,20 @@ are called by the providers, so each route carries its own auth:
   transcript segments are persisted to the session as they arrive, and
   the finalize outcome carries the real accumulated transcript. With
   no Sarvam config the leg does not exist (stt_status not_configured)
-  and the handler behaves exactly like the A6 spike. A8 adds the
-  LLM → TTS reply legs beside the STT leg.
+  and the handler behaves exactly like the A6 spike.
+  **A8: the conversation brain lives here too** — when Sarvam is
+  configured, a ConversationEngine (app.conversation) runs beside the
+  STT leg: it speaks the opening first (LLM turn from the agent's
+  single prompt), replies to each STT final (LLM → sentence-chunked
+  Bulbul TTS → playAudio frames back into this stream), and ends the
+  call on the model's end_call action or a guard. At close the engine
+  drains, the transcript is classified against the prompt's own
+  DISPOSITIONS (app.conversation.classify_call), and the attempt
+  finalizes with the real conversation. If the LLM leg failed, the
+  outcome degrades honestly to the STT-shaped record plus a review
+  flag — never a faked conversation or disposition.
 """
+import asyncio
 import base64
 import hmac
 import json
@@ -40,7 +51,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, statu
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy.orm import Session
 
-from .. import orchestrator, stt, transports
+from .. import conversation, orchestrator, stt, transports
 from ..config import settings
 from ..db import SessionLocal, get_db
 from ..models import AgentConfig, CallSession, Campaign, Lead
@@ -167,22 +178,46 @@ async def plivo_stream_status(session_id: str, request: Request,
 
 @router.websocket("/api/telephony/plivo/stream/{session_id}")
 async def plivo_stream(websocket: WebSocket, session_id: str):
-    """Media-stream endpoint with the A7 STT leg inside (see module doc).
+    """Media-stream endpoint with the A7 STT leg and the A8 conversation
+    brain inside (see module doc).
 
     Plivo speaks first: a `start` event (stream + call ids, custom
     parameters), then `media` frames (base64 μ-law audio), then `stop`.
     On `start` — the call is answered — the Saaras session opens with
-    the lead's resolved language and media frames are forwarded to it;
-    finals land on session.transcript as they arrive. On close, the
-    attempt is finalized once through orchestrator.finalize_attempt
-    with the STT-aware stream outcome (transports.plivo_stream_outcome).
-    STT failures never crash the stream: they are recorded on the
-    session and the call finalizes with a partial transcript.
+    the lead's resolved language, media frames are forwarded to it, and
+    the conversation engine speaks the opening line and replies to each
+    final (audio returning as playAudio frames). On close, the engine
+    drains, the transcript is classified, and the attempt is finalized
+    once through orchestrator.finalize_attempt. Leg failures never
+    crash the stream: they are recorded on the session and degrade the
+    outcome honestly.
     """
     await websocket.accept()
     db = SessionLocal()
     pipeline: stt.SaarasSttSession | None = None
+    engine: conversation.ConversationEngine | None = None
     live: dict | None = None
+
+    async def _send_audio(frame: bytes) -> None:
+        """One outbound audio frame to the call, in Plivo's playAudio
+        shape (μ-law 8 kHz, base64 payload)."""
+        await websocket.send_text(json.dumps({
+            "event": "playAudio",
+            "media": {"contentType": "audio/x-mulaw", "sampleRate": 8000,
+                      "payload": base64.b64encode(frame).decode()},
+        }))
+
+    # The engine's end-call action sets this event instead of closing
+    # the socket itself: closing a Starlette WebSocket from a second
+    # task while the handler is blocked in receive_text() does not
+    # reliably reach the client. The handler races its receive pump
+    # against the event and ends the stream by returning, which closes
+    # the socket deterministically (the A6/A7 close pattern).
+    engine_end = asyncio.Event()
+
+    async def _close_stream() -> None:
+        engine_end.set()
+
     try:
         session = db.get(CallSession, session_id)
         if session is None:
@@ -190,8 +225,9 @@ async def plivo_stream(websocket: WebSocket, session_id: str):
             return
 
         # Resolve the call's language + the tenant's Sarvam config once,
-        # up front: the STT leg exists only when Sarvam is configured
-        # (A4). The resolved language is recorded either way.
+        # up front: the STT leg and the conversation brain exist only
+        # when Sarvam is configured (A4 — one key serves all three
+        # legs). The resolved language is recorded either way.
         campaign = db.get(Campaign, session.campaign_id)
         agent = db.get(AgentConfig, campaign.agent_id) if campaign else None
         lead = db.get(Lead, session.lead_id)
@@ -203,44 +239,69 @@ async def plivo_stream(websocket: WebSocket, session_id: str):
             session.stt_status = "connecting"
             live = stt.new_live_view(session_id, language, "connecting")
             pipeline = stt.SaarasSttSession(session_id, api_key, language, live)
+            if agent is not None and campaign is not None and lead is not None:
+                engine = conversation.ConversationEngine(
+                    session_id=session_id, agent=agent, campaign=campaign,
+                    lead=lead, language=language, api_key=api_key,
+                    send_audio=_send_audio, close_stream=_close_stream)
+                pipeline.on_final = engine.enqueue_final
         else:
             session.stt_status = "not_configured"
             live = stt.new_live_view(session_id, language, "not_configured")
         db.commit()
 
-        try:
-            while True:
-                raw = await websocket.receive_text()
-                try:
-                    event = json.loads(raw)
-                except Exception:
-                    continue
-                kind = event.get("event")
-                if kind == "start":
-                    s = db.get(CallSession, session_id)
-                    if s is not None and s.state in ("QUEUED", "DIALING"):
-                        s.state = "IN_CALL"
-                        if s.answered_at is None:
-                            s.answered_at = datetime.utcnow()
-                        db.commit()
-                    if pipeline is not None:
-                        await pipeline.start()
-                elif kind == "media":
-                    if pipeline is not None:
-                        payload = (event.get("media") or {}).get("payload") or ""
-                        try:
-                            audio = base64.b64decode(payload)
-                        except Exception:
-                            audio = b""
-                        if audio:
-                            await pipeline.feed(audio)
-                elif kind == "stop":
-                    break
-        except Exception:
-            pass  # disconnect / transport error: the stream is over either way
+        async def _pump() -> None:
+            """The receive loop: Plivo stream events in, media frames
+            forwarded to the STT leg. Ends on `stop`, on disconnect, or
+            when cancelled because the engine ended the call."""
+            try:
+                while True:
+                    raw = await websocket.receive_text()
+                    try:
+                        event = json.loads(raw)
+                    except Exception:
+                        continue
+                    kind = event.get("event")
+                    if kind == "start":
+                        s = db.get(CallSession, session_id)
+                        if s is not None and s.state in ("QUEUED", "DIALING"):
+                            s.state = "IN_CALL"
+                            if s.answered_at is None:
+                                s.answered_at = datetime.utcnow()
+                            db.commit()
+                        if pipeline is not None:
+                            await pipeline.start()
+                        if engine is not None:
+                            await engine.start()
+                    elif kind == "media":
+                        if pipeline is not None:
+                            payload = (event.get("media") or {}).get("payload") or ""
+                            try:
+                                audio = base64.b64decode(payload)
+                            except Exception:
+                                audio = b""
+                            if audio:
+                                await pipeline.feed(audio)
+                    elif kind == "stop":
+                        break
+            except Exception:
+                pass  # disconnect / transport error: the stream is over either way
+
+        pump = asyncio.ensure_future(_pump())
+        waiters = [pump]
+        if engine is not None:
+            waiters.append(asyncio.ensure_future(engine_end.wait()))
+        _done, _pending = await asyncio.wait(
+            waiters, return_when=asyncio.FIRST_COMPLETED)
+        for _t in _pending:
+            _t.cancel()
+        if pump in _done and not pump.cancelled():
+            pump.exception()  # retrieve (the pump swallows its own errors)
 
         if pipeline is not None:
             await pipeline.stop()
+        if engine is not None:
+            await engine.finish()
         s = db.get(CallSession, session_id)
         if s is not None:
             anchor = s.answered_at or s.started_at
@@ -255,14 +316,57 @@ async def plivo_stream(websocket: WebSocket, session_id: str):
             if pipeline is not None:
                 s.stt_status = status_now
                 s.stt_detail = detail_now[:500]
-                db.commit()
-            orchestrator.finalize_attempt(db, s, transports.plivo_stream_outcome(
-                duration,
-                stt_status=status_now if pipeline is not None else "not_configured",
-                stt_language=language,
-                stt_detail=detail_now,
-                transcript=(live or {}).get("finals", []),
-            ))
+            legs = (engine.legs() if engine is not None else {
+                "llm_status": "not_configured", "llm_detail": "",
+                "tts_status": "not_configured", "tts_detail": ""})
+            s.llm_status = legs["llm_status"]
+            s.llm_detail = legs["llm_detail"][:500]
+            s.tts_status = legs["tts_status"]
+            s.tts_detail = legs["tts_detail"][:500]
+            db.commit()
+            if engine is not None and engine.llm_status != "failed" \
+                    and any(t.get("speaker") == "agent" for t in engine.turns):
+                # The full loop ran — classify the real transcript
+                # against the agent prompt's own disposition definitions.
+                classification = await asyncio.to_thread(
+                    conversation.classify_call, api_key, engine.model,
+                    engine.rendered_prompt, engine.captured_fields,
+                    engine.turns)
+                outcome = conversation.conversation_outcome(
+                    duration, engine.turns,
+                    engine.end_reason or "stream_closed",
+                    classification,
+                    stt_status=status_now, stt_detail=detail_now,
+                    llm_status=engine.llm_status,
+                    tts_status=engine.tts_status)
+            elif engine is not None:
+                # The brain was configured but its LLM leg failed: the
+                # call degrades to the STT-shaped record (A7 shapes) —
+                # the transcript is whatever STT captured, no
+                # classification was possible, and the result is
+                # flagged for review rather than dressed up.
+                outcome = transports.plivo_stream_outcome(
+                    duration,
+                    stt_status=status_now,
+                    stt_language=language,
+                    stt_detail=detail_now,
+                    transcript=(live or {}).get("finals", []),
+                )
+                outcome["summary"] += (
+                    " The conversation brain (Sarvam LLM) failed for this "
+                    f"call ({engine.llm_detail or 'unknown error'}) — no "
+                    "reply was spoken and no classification was possible; "
+                    "flagged for review.")
+                outcome["review_required"] = True
+            else:
+                outcome = transports.plivo_stream_outcome(
+                    duration,
+                    stt_status=status_now if pipeline is not None else "not_configured",
+                    stt_language=language,
+                    stt_detail=detail_now,
+                    transcript=(live or {}).get("finals", []),
+                )
+            orchestrator.finalize_attempt(db, s, outcome)
     finally:
         stt.end_live_view(session_id)
         db.close()

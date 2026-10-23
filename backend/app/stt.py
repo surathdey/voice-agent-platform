@@ -139,14 +139,22 @@ def record_stt_status(session_id: str, status: str, language: str = "",
     _write(session_id, _m)
 
 
-def append_final_turn(session_id: str, turn: dict) -> None:
-    """Persist one final transcript segment as it arrives (the Calls UI
-    reads session.transcript — finals become visible mid-call)."""
+def append_turn(session_id: str, turn: dict) -> None:
+    """Persist one transcript turn as it happens (the Calls UI reads
+    session.transcript — turns become visible mid-call). Used by the
+    STT leg for customer finals and by the A8 conversation engine for
+    agent turns, so the stored transcript interleaves in real order."""
     def _m(s):
         turns = list(s.transcript or [])
         turns.append(turn)
         s.transcript = turns
     _write(session_id, _m)
+
+
+def append_final_turn(session_id: str, turn: dict) -> None:
+    """Persist one final STT segment as it arrives (A7 name for the
+    customer side of append_turn)."""
+    append_turn(session_id, turn)
 
 
 # ── The Saaras streaming client (one connection per call) ───────────────
@@ -192,10 +200,15 @@ class SaarasSttSession:
     """
 
     def __init__(self, session_id: str, api_key: str, language: str,
-                 view: dict):
+                 view: dict, on_final=None):
         self.session_id = session_id
         self.language = language
         self.view = view
+        # A8: the conversation engine registers here to be told about
+        # each final segment the moment it lands (it drives the reply
+        # loop). Called with the turn dict, on the event loop, guarded —
+        # a consumer bug must never break the STT session.
+        self.on_final = on_final
         self._api_key = api_key
         base = (settings.SARVAM_WS_URL or "wss://api.sarvam.ai").rstrip("/")
         self._url = (f"{base}/speech-to-text/ws"
@@ -261,6 +274,11 @@ class SaarasSttSession:
             self.view["finals"].append(turn)
             self.view["partial"] = ""
             append_final_turn(self.session_id, turn)
+            if self.on_final is not None:
+                try:
+                    self.on_final(turn)
+                except Exception:
+                    pass  # a consumer must never break the STT session
         else:
             self.view["partial"] = text
 

@@ -95,6 +95,9 @@ class AgentConfig(Base):
     # e.g. [{"name": "promise_date", "type": "date", "description": "..."}]
     captured_fields: Mapped[list] = mapped_column(JSON, default=list)
     max_duration_s: Mapped[int] = mapped_column(Integer, default=300)
+    # Conversation-loop guard (A8): the self-hosted engine ends the call
+    # honestly (end_reason max_turns) once this many agent turns have run.
+    max_turns: Mapped[int] = mapped_column(Integer, default=50)
     silence_prompt_after_s: Mapped[int] = mapped_column(Integer, default=8)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
@@ -204,6 +207,14 @@ class CallSession(Base):
     stt_status: Mapped[str] = mapped_column(String(20), default="")
     stt_language: Mapped[str] = mapped_column(String(20), default="")
     stt_detail: Mapped[str] = mapped_column(String(500), default="")
+    # Self-hosted LLM + TTS legs (A8): the conversation brain that ran
+    # beside the STT leg. Same vocabulary as stt_status ("" = the call
+    # never streamed; active | failed | not_configured) with the same
+    # detail discipline — exception class / short label only.
+    llm_status: Mapped[str] = mapped_column(String(20), default="")
+    llm_detail: Mapped[str] = mapped_column(String(500), default="")
+    tts_status: Mapped[str] = mapped_column(String(20), default="")
+    tts_detail: Mapped[str] = mapped_column(String(500), default="")
 
     __table_args__ = (UniqueConstraint("tenant_id", "attempt_id", name="uq_session_attempt"),)
 
@@ -250,6 +261,12 @@ class CallResult(Base):
     session_id: Mapped[str] = mapped_column(ForeignKey("call_sessions.session_id"), unique=True, nullable=False)
     disposition: Mapped[str] = mapped_column(String(60), default="")
     confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    # Review flag (A8): set when the post-call classification could not
+    # produce a trustworthy disposition (classifier down, unparseable
+    # output, or a bucket outside the agent prompt's own set — an
+    # unknown bucket is NEVER stored as the disposition). The reason
+    # rides in summary; the Human Queue (Phase B) consumes this flag.
+    review_required: Mapped[bool] = mapped_column(Boolean, default=False)
     summary: Mapped[str] = mapped_column(Text, default="")
     captured_fields: Mapped[dict] = mapped_column(JSON, default=dict)
     duration_s: Mapped[int] = mapped_column(Integer, default=0)
