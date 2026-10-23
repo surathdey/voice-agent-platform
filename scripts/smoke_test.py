@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""Smoke tests for Phase A chunks 1–2 (A1, A2, A3) against a running server.
+"""Smoke tests for Phase A chunks 1–3 (A1, A2, A3, A4) against a running server.
 
 Usage:  python3 scripts/smoke_test.py [base_url]     (default http://localhost:8000)
 Covers: health · login · tenant scoping (A1 acceptance) · agent CRUD ·
 single-prompt versioning + rollback (A2) · campaign CRUD bound to one agent,
 status lifecycle, CSV lead upload with column mapping, product identifiers,
-tenant isolation on campaigns/leads, no from-number in the campaign schema (A3).
+tenant isolation on campaigns/leads, no from-number in the campaign schema
+(A3) · per-tenant provider settings, secret masking (sentinel keys never
+appear in any response), Test connection stub/failed honesty, campaign
+provider flagging, health per-mode providers (A4).
+
+Run against a FRESH database: like the earlier chunks, the suite seeds its
+own tenants/agents/campaigns/settings and asserts exact fresh-state values.
 """
 import json
 import sys
@@ -268,6 +274,120 @@ call_upload(f"/api/campaigns/{cid}/leads/upload", RPI_CSV, token=token2,
             fields={"mapping": json.dumps(preview["suggested_mapping"])}, expect=404)
 call("POST", "/api/campaigns", {"agent_id": rpi["agent_id"], "name": "Cross-tenant"},
      token=token2, expect=422)  # cannot bind another tenant's agent
+
+print("── A4: provider settings — fresh state ───────")
+call("GET", "/api/settings/providers", expect=401)  # unauthenticated
+_, plist = call("GET", "/api/settings/providers", token=token)
+by_key = {p["provider"]: p for p in plist}
+assert set(by_key) == {"vapi", "twilio", "plivo", "exotel", "sarvam"}, sorted(by_key)
+assert by_key["vapi"]["status"] == "stub" and by_key["vapi"]["configured"] is False, by_key["vapi"]
+assert by_key["plivo"]["status"] == "stub" and by_key["sarvam"]["status"] == "stub", by_key
+assert by_key["twilio"]["status"] == "not_configured", by_key["twilio"]
+assert by_key["exotel"]["status"] == "not_configured", by_key["exotel"]
+print("  PASS  fresh tenant: primary providers report stub; optional ones not_configured")
+
+print("── A4: campaign flagged when its mode has no provider ──")
+_, campA = call("POST", "/api/campaigns", {
+    "agent_id": rpi["agent_id"], "name": "A4 flag check — self-hosted",
+    "provider_mode": "self_hosted",
+}, token=token, expect=201)
+assert campA["provider_configured"] is False and campA["provider_flag"], campA
+assert "stub" in campA["provider_flag"], campA
+print(f"  PASS  campaign created but flagged: {campA['provider_flag'][:60]}…")
+
+print("── A4: settings CRUD + secret masking ────────")
+VAPI_SENTINEL = "sk-live-SENTINELvapi0000111122223333wxyz"
+PLIVO_TOKEN_SENTINEL = "PLIVOtokenSENTINELaaaabbbbccccdddd9999"
+SARVAM_SENTINEL = "sk-sarvam-SENTINELeeeeffffgggghhhh7777"
+_, saved = call("PUT", "/api/settings/providers/vapi",
+                {"fields": {"api_key": VAPI_SENTINEL}}, token=token)
+assert saved["configured"] is True and saved["status"] == "configured", saved
+f0 = saved["fields"][0]
+assert f0["is_set"] and f0["masked"] == "••••wxyz" and f0["value"] is None, f0
+assert VAPI_SENTINEL not in json.dumps(saved), "full Vapi key leaked in PUT response"
+print("  PASS  vapi saved — response carries only ••••wxyz, never the key")
+_, reread = call("GET", "/api/settings/providers/vapi", token=token)
+assert reread["fields"][0]["masked"] == "••••wxyz", reread
+assert VAPI_SENTINEL not in json.dumps(reread), "full Vapi key leaked on re-read"
+_, kept = call("PUT", "/api/settings/providers/vapi",
+               {"fields": {"api_key": ""}}, token=token)
+assert kept["fields"][0]["masked"] == "••••wxyz", kept
+print("  PASS  masked on re-read; blank secret on save keeps the stored key")
+_, withmv = call("PUT", "/api/settings/providers/vapi",
+                 {"fields": {"default_model": "gpt-4o-mini", "default_voice": "aria-voice-1"}},
+                 token=token)
+mvf = {f["name"]: f for f in withmv["fields"]}
+assert mvf["api_key"]["masked"] == "••••wxyz", mvf  # key untouched by the config save
+assert mvf["default_model"]["value"] == "gpt-4o-mini" and mvf["default_model"]["secret"] is False, mvf
+assert mvf["default_voice"]["value"] == "aria-voice-1", mvf
+print("  PASS  Vapi tenant-default model + voice stored as plain config fields")
+call("PUT", "/api/settings/providers/vapi", {"fields": {"nope": "x"}}, token=token, expect=422)
+call("GET", "/api/settings/providers/nope", token=token, expect=404)
+
+print("── A4: configure self-hosted — campaign flag clears ──")
+_, plivo = call("PUT", "/api/settings/providers/plivo",
+                {"fields": {"auth_id": "MA_SENTINEL_ID", "auth_token": PLIVO_TOKEN_SENTINEL}},
+                token=token)
+pf = {f["name"]: f for f in plivo["fields"]}
+assert pf["auth_id"]["value"] == "MA_SENTINEL_ID" and pf["auth_id"]["secret"] is False, pf
+assert pf["auth_token"]["masked"].endswith("9999"), pf
+assert PLIVO_TOKEN_SENTINEL not in json.dumps(plivo), "Plivo token leaked in PUT response"
+_, sarv = call("PUT", "/api/settings/providers/sarvam",
+               {"fields": {"api_key": SARVAM_SENTINEL}}, token=token)
+assert sarv["configured"] is True, sarv
+_, campA2 = call("GET", f"/api/campaigns/{campA['campaign_id']}", token=token)
+assert campA2["provider_configured"] is True and campA2["provider_flag"] is None, campA2
+_, campM = call("POST", "/api/campaigns", {
+    "agent_id": rpi["agent_id"], "name": "A4 flag check — managed", "provider_mode": "managed",
+}, token=token, expect=201)
+assert campM["provider_configured"] is True and campM["provider_flag"] is None, campM
+print("  PASS  Plivo + Sarvam configured → self-hosted flag cleared; Vapi → managed clear")
+_, plist_all = call("GET", "/api/settings/providers", token=token)
+blob = json.dumps(plist_all)
+for s in (VAPI_SENTINEL, PLIVO_TOKEN_SENTINEL, SARVAM_SENTINEL):
+    assert s not in blob, "a full secret leaked into the providers list response"
+print("  PASS  no full secret appears anywhere in the providers list response")
+
+print("── A4: incomplete config + delete ────────────")
+_, tw = call("PUT", "/api/settings/providers/twilio",
+             {"fields": {"account_sid": "AC_SENTINEL"}}, token=token)
+assert tw["configured"] is False and tw["status"] == "not_configured", tw
+_, tw2 = call("PUT", "/api/settings/providers/twilio",
+              {"fields": {"auth_token": "twilioSENTINELtoken00001111zzzz"}}, token=token)
+assert tw2["configured"] is True, tw2
+assert tw2["fields"][1]["masked"] == "••••zzzz", tw2
+_, twd = call("DELETE", "/api/settings/providers/twilio", token=token)
+assert twd["status"] == "not_configured" and twd["configured"] is False, twd
+print("  PASS  partial credentials stay not_configured; DELETE reverts cleanly")
+
+print("── A4: test connection — stub & fake keys ────")
+_, tstub = call("POST", "/api/settings/providers/sarvam/test", token=token2)
+assert tstub["status"] == "stub" and "no" in tstub["message"].lower(), tstub
+print(f"  PASS  unconfigured provider tests as stub: {tstub['message'][:60]}…")
+_, tfake = call("POST", "/api/settings/providers/vapi/test", token=token)
+assert tfake["status"] == "failed" and tfake["message"], tfake
+print(f"  PASS  fake Vapi key honestly reports failed: {tfake['message'][:70]}")
+_, after = call("GET", "/api/settings/providers/vapi", token=token)
+assert after["status"] == "failed" and after["last_test_status"] == "failed", after
+assert VAPI_SENTINEL not in json.dumps(after)
+
+print("── A4: tenant isolation on settings ──────────")
+_, plist2 = call("GET", "/api/settings/providers", token=token2)
+blob2 = json.dumps(plist2)
+for s in (VAPI_SENTINEL, PLIVO_TOKEN_SENTINEL, SARVAM_SENTINEL):
+    assert s not in blob2, "another tenant's secret leaked into tenant 2's settings"
+by2 = {p["provider"]: p for p in plist2}
+assert by2["vapi"]["configured"] is False and by2["plivo"]["configured"] is False, by2
+assert by2["sarvam"]["configured"] is False, by2
+print("  PASS  tenant 2 sees none of QGBS's provider settings or secrets")
+
+print("── A4: health reports providers per mode ─────")
+_, health2 = call("GET", "/api/health")
+assert set(health2["providers"]) == {"managed", "self_hosted"}, health2
+assert health2["providers"]["managed"] == {"vapi": False, "twilio": False}, health2
+assert health2["providers"]["self_hosted"] == {"plivo": False, "exotel": False, "sarvam": False}, health2
+assert VAPI_SENTINEL not in json.dumps(health2) and SARVAM_SENTINEL not in json.dumps(health2)
+print("  PASS  health: per-mode booleans from the .env fallback only — no tenant values")
 
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

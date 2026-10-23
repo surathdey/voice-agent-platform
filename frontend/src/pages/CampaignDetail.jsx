@@ -72,6 +72,12 @@ export default function CampaignDetail({ campaignId, onBack }) {
 
       {error && <div className="error">{error}</div>}
 
+      {campaign.provider_flag && (
+        <div className="guidance" style={{ marginBottom: 18 }}>
+          <b>Stub mode:</b> {campaign.provider_flag}
+        </div>
+      )}
+
       <div style={{ display: 'flex', gap: 12, marginBottom: 18 }}>
         <button className="btn secondary" onClick={onBack}>← All campaigns</button>
       </div>

@@ -146,6 +146,10 @@ class CampaignOut(CampaignIn):
     identifier_type: str = ""            # derived from product
     identifier_label: str = ""
     lead_count: int = 0
+    # A4: is a real provider configured for this campaign's mode? A campaign
+    # with no provider is ALLOWED (it runs in stub mode) but flagged.
+    provider_configured: bool = False
+    provider_flag: Optional[str] = None
     created_at: Optional[str] = None
 
 
@@ -176,3 +180,55 @@ class UploadResultOut(BaseModel):
     created: int
     duplicates_skipped: int
     invalid_skipped: int
+
+
+# ── Provider settings (A4) ────────────────────────────────────────────────
+# Secrets are WRITE-ONLY in this API: ProviderSettingIn accepts values;
+# ProviderOut carries masked forms only (•••• + last 4) — a full secret is
+# never present in any response (enforced by smoke tests with sentinels).
+
+class ProviderSettingIn(BaseModel):
+    """Save one provider's tenant settings. Secret fields are write-only:
+    send a non-empty value to replace, or omit / send "" to keep the stored
+    value (the client never receives the secret, so it cannot echo it back).
+    Non-secret fields are set to the sent value ("" clears)."""
+    fields: dict[str, str] = Field(default_factory=dict)
+    enabled: Optional[bool] = None
+
+
+class ProviderFieldOut(BaseModel):
+    name: str
+    label: str
+    secret: bool
+    required: bool
+    is_set: bool
+    source: Optional[str] = None         # tenant | env | None
+    value: Optional[str] = None          # non-secret fields only
+    masked: Optional[str] = None         # secret fields only: •••• + last 4
+
+
+class ProviderOut(BaseModel):
+    provider: str                        # vapi | twilio | plivo | exotel | sarvam
+    mode: str                            # managed | self_hosted
+    label: str
+    description: str = ""
+    optional: bool = False
+    configured: bool = False
+    source: Optional[str] = None         # tenant | env | None
+    enabled: bool = True
+    # not_configured | stub | configured | connected | failed
+    status: str = "not_configured"
+    status_detail: str = ""
+    fields: List[ProviderFieldOut] = []
+    last_test_status: str = ""
+    last_test_message: str = ""
+    last_test_at: Optional[str] = None
+
+
+class ProviderTestOut(BaseModel):
+    provider: str
+    status: str                          # connected | failed | stub
+    message: str
+    checked_at: str
+    latency_ms: int = 0
+    persisted: bool = False

@@ -50,7 +50,7 @@ export default function Agents({ onOpen, onNew }) {
       </div>
 
       <p className="footnote">
-        Editing an agent edits its prompt pack in one place; every campaign using that agent picks up the change.
+        Editing an agent edits its single prompt in one place; every campaign using that agent picks up the change.
         Prompt edits are versioned — history stays reviewable and any version can be restored.
       </p>
     </div>

@@ -5,9 +5,10 @@ Voice Agent Platform V2 (Greenfield + QGBS MVP)*. Agents are **data, not
 code**: each agent is one prompt plus structured voice/model/language
 configuration, run in campaigns against lead lists.
 
-**This build = Phase A, chunks 1–2: A1 (tenancy + core data model), A2
-(Agent Config Studio) and A3 (Campaigns & Leads).** See `BUILD-LOG.md` for
-what is verified and what comes next (A4: provider settings).
+**This build = Phase A, chunks 1–3: A1 (tenancy + core data model), A2
+(Agent Config Studio), A3 (Campaigns & Leads) and A4 (Provider Settings).**
+See `BUILD-LOG.md` for what is verified and what comes next
+(A5: orchestrator skeleton).
 
 ## Run it (Docker — the owner's route)
 
@@ -21,9 +22,10 @@ docker compose up --build
 - **Demo login:** `demo@qgbs.example` / `demo-password` (tenant **QGBS**, seeded on first boot with a sample *RPI Verification* agent)
 
 No provider keys are needed to test: `TELEPHONY_MODE=stub` (see `.env.example`)
-means everything except live calling works. Add `VAPI_API_KEY` /
-`PLIVO_AUTH_ID` / `PLIVO_AUTH_TOKEN` / `SARVAM_API_KEY` later — they are
-placeholders until the telephony chunks (A4–A6) land.
+means everything except live calling works. Provider credentials can be
+supplied per tenant in the console under **Settings → Providers** (tenant
+values override the `.env` placeholders; secrets there are stored
+server-side and only ever shown masked, `••••` + last 4).
 
 ## Run it natively (development)
 
@@ -44,7 +46,7 @@ cd frontend && npm install && npm run dev   # http://localhost:5173, proxies /ap
 - [ ] `GET /api/health` returns `telephony_mode: "stub"`.
 - [ ] Create a second tenant (`POST /api/tenants`), log in as its admin:
       it sees **zero** agents, and QGBS agent URLs return 404
-      (run `python3 scripts/smoke_test.py` — 46 checks automate all of this).
+      (run `python3 scripts/smoke_test.py` — 68 checks automate all of this).
 
 **A2 — Agent Config Studio**
 - [ ] Agents library matches the wireframe layout: cards with LLM, STT/TTS,
@@ -70,6 +72,22 @@ cd frontend && npm install && npm run dev   # http://localhost:5173, proxies /ap
       (draft → active ⇄ paused → completed); the leads table shows **only
       that campaign's** leads.
 
+**A4 — Provider Settings**
+- [ ] Settings → Providers lists both modes: Vapi + Twilio (managed),
+      Plivo + Exotel + Sarvam (self-hosted). A fresh tenant shows the
+      primary providers as **Stub** and the optional ones **Not configured**.
+- [ ] Save a key: it re-reads as `••••` + last 4 only — the full secret
+      never appears in any screen or API response again.
+- [ ] The Vapi card also holds the tenant-default **model + voice** used
+      at managed dispatch (the Agent editor's Voice & model section is for
+      self-hosted mode — its info note says so).
+- [ ] “Test connection” with nothing saved reports **stub** honestly; with
+      a fake key it reports **failed** (it really tries; success is never
+      faked). Tenant B cannot see tenant A's settings.
+- [ ] A campaign whose mode has no working provider still saves, but its
+      page carries the stub-mode flag naming what's missing; configuring
+      the providers (Plivo + Sarvam, or Vapi) clears it.
+
 ## Design decisions that override the design doc
 
 1. **Single prompt (owner, 2026-10-23).** The design doc's three-layer prompt
@@ -87,11 +105,13 @@ cd frontend && npm install && npm run dev   # http://localhost:5173, proxies /ap
 ## Layout
 
 ```
-backend/    FastAPI app (app/models.py = all six design entities + prompt_versions,
-            app/routers/ = auth, tenants, agents, campaigns;
-            migrations/001_initial.sql + 002_a3_campaign_fields.sql = DDL of record)
+backend/    FastAPI app (app/models.py = all six design entities + prompt_versions
+            + provider_settings; app/providers.py = provider registry, masked
+            views, credential resolution, Test connection;
+            app/routers/ = auth, tenants, agents, campaigns, settings;
+            migrations/001–003 = DDL of record)
 frontend/   React (Vite) console — theme tokens in src/theme.css (wireframe design language);
-            pages: Agents, AgentEditor, Campaigns, CampaignWizard, CampaignDetail, LeadsUpload
-scripts/    smoke_test.py — automated acceptance checks (A1 + A2 + A3)
+            pages: Agents, AgentEditor, Campaigns, CampaignWizard, CampaignDetail, LeadsUpload, Settings
+scripts/    smoke_test.py — automated acceptance checks (A1 + A2 + A3 + A4)
 docker-compose.yml   db (PostgreSQL 16) + backend + frontend (nginx)
 ```

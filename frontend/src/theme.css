@@ -133,6 +133,12 @@ textarea.prompt {
   padding: 13px 16px; font-size: 13.5px; color: var(--ink); margin-bottom: 14px;
 }
 .guidance b { color: var(--navy); }
+.info-note {
+  font-size: 13px; color: var(--slate); background: #f4f6f8;
+  border-left: 3px solid var(--teal); border-radius: 6px;
+  padding: 9px 12px; margin: 0 0 14px;
+}
+.info-note b { color: var(--navy); }
 .section-title { font-size: 16px; margin: 26px 0 12px; display: flex; align-items: center; gap: 10px; }
 .section-title:first-child { margin-top: 0; }
 .marker {
@@ -249,3 +255,25 @@ select.map-target { font-size: 13.5px; }
 .review-block .t { font-weight: 700; color: var(--navy); font-size: 13.5px; }
 .review-block .b { font-size: 13.5px; color: var(--ink); }
 .review-block .edit { color: var(--teal); font-weight: 600; font-size: 13px; background: none; border: 0; padding: 0; }
+
+/* ── Provider settings (A4) ─────────────────────────────────────────────── */
+.pill.red { background: var(--danger); }
+.provider-card { display: flex; flex-direction: column; }
+.provider-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.provider-head h3 { font-size: 16px; }
+.provider-card .purpose { color: var(--slate); font-size: 13.5px; margin-top: 4px; }
+.status-detail { font-size: 13px; color: var(--ink); margin-top: 6px; }
+.masked { font-family: var(--mono); font-size: 13px; }
+.src-tag {
+  display: inline-block; margin-left: 8px; background: var(--gold-soft); color: var(--navy);
+  border: 1px solid var(--gold); border-radius: 12px; padding: 0 8px;
+  font-size: 11px; font-weight: 700; vertical-align: 1px;
+}
+.last-test { font-size: 12.5px; color: var(--slate); margin-top: 10px; border-top: 1px solid #e7edf2; padding-top: 9px; }
+.last-test b { color: var(--navy); text-transform: capitalize; }
+.provider-actions { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
+.provider-form { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 14px;
+  display: flex; flex-direction: column; gap: 10px; }
+.check-row { display: flex; align-items: center; gap: 8px; text-transform: none;
+  letter-spacing: 0; font-size: 13.5px; color: var(--ink); font-weight: 500; }
+.check-row input { width: auto; }

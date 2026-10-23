@@ -1,5 +1,97 @@
 # BUILD LOG
 
+## Chunk 3 — Phase A: A4 Provider Settings (2026-10-23)
+
+### Built
+- **Provider registry + per-tenant secret store** (design §7 “Provider
+  settings”, §8.5; A4 acceptance). New table `provider_settings` (migration
+  `003_a4_provider_settings.sql`): one row per (tenant, provider) holding
+  all configured field values — identifiers and secrets — server-side only.
+  Registry in `backend/app/providers.py` covers both orchestration modes:
+  **managed** → Vapi (primary), Twilio (optional); **self-hosted** → Plivo
+  (telephony, primary), Exotel (telephony alternative), Sarvam (STT/LLM/TTS).
+- **Resolution order:** tenant value → platform `.env` fallback →
+  `TELEPHONY_MODE=stub` global fallback (nothing configured = simulated).
+  New env fallbacks `TWILIO_*`, `EXOTEL_*` added to `config.py`,
+  `.env.example` and the compose passthrough.
+- **Secrets are write-only.** Every read goes through one masked view
+  (`••••` + last 4 for secret fields; plain values only for identifiers
+  like Auth ID / Account SID). A blank secret on save means “keep the
+  stored value” (the client can never echo a secret back — it never
+  receives one). Saving changed credentials clears the stale test verdict.
+  Statuses: `not_configured` (optional unset / partial / disabled) ·
+  `stub` (primary provider, no credentials — calls simulated) ·
+  `configured` (saved, untested) · `connected` / `failed` (last test).
+- **Test connection** (`POST /api/settings/providers/{provider}/test`):
+  a real, lightweight check per provider (Vapi call-list, Twilio/Plivo/
+  Exotel account fetch, Sarvam minimal translate) with a 6s timeout.
+  Nothing configured → an honest **stub** report and no network call.
+  Failure is reported as failure — success is never faked; result messages
+  carry status codes / error classes only, never secrets or raw provider
+  bodies. The verdict persists on the tenant row and shows in the UI.
+- **Orchestrator plumbing for A5:** internal `get_provider_config(tenant_id,
+  mode)` returns readiness + raw values (server-side only — never
+  serialised to an API response). Managed is ready with Vapi; self-hosted
+  needs Sarvam **and** one telephony provider (Plivo or Exotel).
+- **Campaign flagging:** `CampaignOut` gains `provider_configured` +
+  `provider_flag`. A campaign whose mode has no working provider is still
+  creatable/launchable, but carries a flag naming what's missing — shown
+  as a banner on the campaign page (“calls will run in stub mode…
+  Settings → Providers”).
+- **Health:** `/api/health` now also reports `providers` per mode
+  (booleans from the .env fallback only — health has no tenant context, so
+  tenant values never appear there).
+- **Frontend:** **Settings → Providers** screen in the same theme tokens —
+  per-mode sections, provider cards with status badges (Not configured /
+  Stub / Configured / Connected / Failed), masked key display with
+  tenant/.env source tags, edit form (password fields, “leave blank to
+  keep ••••1234”), enable toggle, Remove (revert to fallback), and a Test
+  connection button with the honest result inline. Settings nav enabled.
+- **Copy fix (folded in):** `Agents.jsx` footnote said “edits its prompt
+  pack” — the superseded three-layer wording; now “edits its **single
+  prompt** in one place”, per the owner's single-prompt decision.
+- **Owner-testing clarifications (folded in):** (1) the Agent editor's
+  Voice & model section now carries an info note — those Sarvam/Saaras/
+  Bulbul settings apply in **self-hosted** mode; in managed mode the
+  campaign runs on Vapi with its own models/voices, and only the agent's
+  prompt + language rule carry over. (2) The Vapi provider entry gains
+  tenant-default **model** and **voice** config fields (plain, non-secret;
+  `.env` fallbacks `VAPI_DEFAULT_MODEL` / `VAPI_DEFAULT_VOICE`) alongside
+  the API key, since managed dispatch needs them.
+
+### Verification (native, fresh SQLite DB — same Docker caveat as chunks 1–2)
+- `scripts/smoke_test.py`: **68/68 checks passed** (46 existing + 22 new
+  A4 checks/assert groups): fresh tenant → primary providers `stub`,
+  optional ones `not_configured`; self-hosted campaign created **with**
+  the stub flag; sentinel keys saved for Vapi/Plivo/Sarvam appear **in no
+  response** — not in PUT, GET, the providers list, health, or tenant 2's
+  views — only `••••` + last 4; blank-secret save keeps the stored key;
+  unknown field → 422, unknown provider → 404; partial Twilio config stays
+  `not_configured`, DELETE reverts; Test connection with nothing
+  configured → `stub` (no call made); Test connection with a deliberately
+  fake Vapi key → **`failed`** (in this sandbox the check failed on
+  reachability — TimeoutError; the verdict path is the same for a 401);
+  the failure persists as the provider's status; tenant 2 sees none of
+  QGBS's settings. Server log contains zero occurrences of the sentinels.
+- `get_provider_config` exercised directly: self-hosted ready once Plivo +
+  Sarvam are set, raw values present internally, source = tenant.
+- Frontend: `vite build` clean.
+
+### Known limitations (deliberate, for this chunk)
+- The Sarvam check performs one minimal real translation when a key is
+  present (negligible quota); all other checks are read-only account fetches.
+- Secrets sit in a JSON column of the app database (the design's secret
+  store at this scale). Envelope encryption / external vault is production
+  hardening, noted for the pre-launch pass — the API-side contract (never
+  returned, never logged) already holds.
+- A test verdict persists only when a tenant settings row exists;
+  .env-only configuration can be tested live but its verdict is not stored.
+
+### Next step
+**A5 — Orchestrator skeleton:** the dispatch boundary (design §8.1) that
+consumes `get_provider_config`, admits attempts per schedule/concurrency,
+and drives CallSession states in stub mode end-to-end.
+
 ## Chunk 2 — Phase A: A3 Campaigns & Leads (2026-10-23)
 
 ### Built

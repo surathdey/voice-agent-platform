@@ -23,6 +23,7 @@ import re
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 
+from .. import providers as prov
 from ..db import get_db
 from ..deps import get_current_user
 from ..models import AgentConfig, Campaign, Lead, User
@@ -130,6 +131,15 @@ def _agent_scoped(db: Session, user: User, agent_id: str) -> AgentConfig:
 def _out(db: Session, c: Campaign) -> CampaignOut:
     agent = db.get(AgentConfig, c.agent_id)
     meta = PRODUCTS.get(c.product, PRODUCTS["other"])
+    # A4: flag campaigns whose mode has no working provider — creating and
+    # running them is allowed, but their calls run in stub mode.
+    ready, missing = prov.mode_readiness(db, c.tenant_id, c.provider_mode)
+    flag = None
+    if not ready:
+        mode_label = "managed" if c.provider_mode == "managed" else "self-hosted"
+        flag = (f"No working provider configured for {mode_label} mode "
+                f"(missing: {', '.join(missing)}) — calls will run in stub mode. "
+                "Configure it under Settings → Providers.")
     return CampaignOut(
         campaign_id=c.campaign_id, tenant_id=c.tenant_id,
         agent_id=c.agent_id, agent_name=agent.name if agent else "",
@@ -140,6 +150,7 @@ def _out(db: Session, c: Campaign) -> CampaignOut:
         schedule=c.schedule or {}, retry_rules=c.retry_rules or {},
         routing_rules=c.routing_rules or [],
         lead_count=db.query(Lead).filter(Lead.campaign_id == c.campaign_id).count(),
+        provider_configured=ready, provider_flag=flag,
         created_at=c.created_at.isoformat() if c.created_at else None,
     )
 

@@ -196,6 +196,38 @@ class CallSession(Base):
     __table_args__ = (UniqueConstraint("tenant_id", "attempt_id", name="uq_session_attempt"),)
 
 
+class ProviderSetting(Base):
+    """Per-tenant provider credentials/config (A4 — design §7 “Provider
+    settings”, §8.5). One row per (tenant, provider).
+
+    `fields` holds ALL configured values for the provider — identifiers
+    (auth id, account sid, subdomain) AND secrets (tokens, API keys). This
+    table is the secret store: values are server-side only. No API response
+    ever serialises a secret value — reads return masked forms only
+    (app.providers.mask), and secrets are never written to logs.
+
+    Resolution (app.providers.get_provider_config): a tenant value wins; a
+    missing tenant value falls back to the platform .env; TELEPHONY_MODE=stub
+    remains the global fallback when nothing is configured anywhere.
+    """
+
+    __tablename__ = "provider_settings"
+
+    setting_id: Mapped[str] = mapped_column(String(40), primary_key=True, default=lambda: new_id("pset"))
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.tenant_id"), nullable=False, index=True)
+    provider: Mapped[str] = mapped_column(String(30), nullable=False)  # vapi | twilio | plivo | exotel | sarvam
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    fields: Mapped[dict] = mapped_column(JSON, default=dict)
+    # Last Test-connection outcome (sanitised message — never contains a secret).
+    last_test_status: Mapped[str] = mapped_column(String(20), default="")  # connected | failed | stub
+    last_test_message: Mapped[str] = mapped_column(String(500), default="")
+    last_test_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (UniqueConstraint("tenant_id", "provider", name="uq_tenant_provider"),)
+
+
 class CallResult(Base):
     """Terminal record for a session — design §8.2, exactly one per session."""
 

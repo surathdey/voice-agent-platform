@@ -108,6 +108,11 @@ export default function AgentEditor({ agentId, onBack }) {
         </div>
 
         <div className="section-title"><span className="marker">2</span> Voice &amp; model (structured — set per agent)</div>
+        <p className="info-note">
+          These model and voice settings apply in <b>Self-hosted mode</b>. In Managed mode the
+          campaign runs on Vapi, which uses its own models and voices — the agent's prompt and
+          language rule carry over.
+        </p>
         <div className="form-grid">
           <div className="field"><label>LLM model</label>
             <select value={form.llm_model} onChange={(e) => set('llm_model', e.target.value)}>
