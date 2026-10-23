@@ -46,6 +46,7 @@ def _out(db: Session, a: AgentConfig) -> AgentOut:
         purpose=a.purpose, is_reference=a.is_reference, prompt=a.prompt,
         llm_model=a.llm_model, stt_provider=a.stt_provider, stt_language=a.stt_language,
         tts_provider=a.tts_provider, tts_voice_id=a.tts_voice_id,
+        voice_gender=a.voice_gender or "female",
         language_rule=a.language_rule or {}, captured_fields=a.captured_fields or [],
         max_duration_s=a.max_duration_s, silence_prompt_after_s=a.silence_prompt_after_s,
         prompt_version=_latest_version(db, a.agent_id),
@@ -63,6 +64,7 @@ def _apply(a: AgentConfig, body: AgentIn) -> None:
     a.stt_language = body.stt_language
     a.tts_provider = body.tts_provider
     a.tts_voice_id = body.tts_voice_id
+    a.voice_gender = body.voice_gender if body.voice_gender in ("female", "male") else "female"
     a.language_rule = body.language_rule
     a.captured_fields = [f.model_dump() for f in body.captured_fields]
     a.max_duration_s = body.max_duration_s

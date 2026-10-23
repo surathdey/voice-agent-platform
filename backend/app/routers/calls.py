@@ -58,9 +58,14 @@ def _call_out(db: Session, s: CallSession) -> CallOut:
         to_number=s.to_number or (lead.phone_number if lead else ""),
         provider_mode=s.provider_mode,
         # The transport that actually ran the call: stamped into the
-        # result's cost_breakdown at finalize ("stub" in A5). A session
-        # without a result has only ever been touched by the stub here.
-        transport=cost.get("mode") or "stub",
+        # result's cost_breakdown at finalize. Before a result exists,
+        # a session carrying a real provider call id belongs to its
+        # mode's real transport; a session without one (or with the
+        # stub's id) has only ever been touched by the stub.
+        transport=cost.get("mode") or (
+            "stub" if (not s.provider_call_id or s.provider_call_id.startswith("stub_"))
+            else s.provider_mode
+        ),
         state=s.state,
         final_state=s.state if result else None,
         end_reason=s.end_reason or "",

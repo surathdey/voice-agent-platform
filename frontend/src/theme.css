@@ -274,6 +274,8 @@ select.map-target { font-size: 13.5px; }
 .provider-actions { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
 .provider-form { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 14px;
   display: flex; flex-direction: column; gap: 10px; }
+.field-group-title { font-size: 12px; font-weight: 700; letter-spacing: .06em;
+  text-transform: uppercase; color: var(--gold); margin-top: 8px; }
 .check-row { display: flex; align-items: center; gap: 8px; text-transform: none;
   letter-spacing: 0; font-size: 13.5px; color: var(--ink); font-weight: 500; }
 .check-row input { width: auto; }

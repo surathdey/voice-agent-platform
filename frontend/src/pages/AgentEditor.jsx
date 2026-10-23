@@ -5,7 +5,7 @@ const EMPTY = {
   name: '', stage: '', purpose: '', is_reference: false,
   prompt: 'ROLE\n\n\nFLOW\n\n\nDISPOSITIONS\n\n\nCLOSINGS\n',
   llm_model: 'sarvam-105b', stt_provider: 'saaras', stt_language: 'hi-IN',
-  tts_provider: 'bulbul', tts_voice_id: '',
+  tts_provider: 'bulbul', tts_voice_id: '', voice_gender: 'female',
   language_rule: { default: 'hi-IN', by_state: {} },
   captured_fields: [], max_duration_s: 300, silence_prompt_after_s: 8,
 }
@@ -111,7 +111,8 @@ export default function AgentEditor({ agentId, onBack }) {
         <p className="info-note">
           These model and voice settings apply in <b>Self-hosted mode</b>. In Managed mode the
           campaign runs on Vapi, which uses its own models and voices — the agent's prompt and
-          language rule carry over.
+          language rule carry over, and the <b>voice gender</b> below picks the female / male
+          voice from the tenant's per-language Vapi voice profile (Settings → Providers → Vapi).
         </p>
         <div className="form-grid">
           <div className="field"><label>LLM model</label>
@@ -137,6 +138,12 @@ export default function AgentEditor({ agentId, onBack }) {
               </select>
               <input value={form.tts_voice_id} onChange={(e) => set('tts_voice_id', e.target.value)} placeholder="voice id" />
             </div></div>
+          <div className="field"><label>Voice gender (agent persona)</label>
+            <select value={form.voice_gender || 'female'} onChange={(e) => set('voice_gender', e.target.value)}>
+              <option value="female">Female</option>
+              <option value="male">Male</option>
+            </select>
+            <div className="hint">Managed mode: selects the female / male voice ID in the tenant's Vapi voice profile for the call's language.</div></div>
           <div className="field"><label>Max call duration (seconds) · silence prompt after (s)</label>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
               <input type="number" value={form.max_duration_s} onChange={(e) => set('max_duration_s', Number(e.target.value))} />

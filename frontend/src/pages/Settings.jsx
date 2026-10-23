@@ -22,6 +22,28 @@ const MODE_SUB = {
   self_hosted: 'Our orchestrator runs the call: one telephony provider (Plivo or Exotel) plus Sarvam for STT / LLM / TTS.',
 }
 
+/* Vapi voice-profile fields (en_ / hi_ / bn_ …) render under a per-language
+   subheading in the edit form; everything else is one unlabelled group. */
+const FIELD_GROUPS = [
+  ['en_', 'Voice profile — English'],
+  ['hi_', 'Voice profile — Hindi'],
+  ['bn_', 'Voice profile — Bengali'],
+]
+function groupFields(fields) {
+  const groups = []
+  let current = null
+  for (const f of fields) {
+    const hit = FIELD_GROUPS.find(([pre]) => f.name.startsWith(pre))
+    const label = hit ? hit[1] : null
+    if (!current || current.label !== label) {
+      current = { label, fields: [] }
+      groups.push(current)
+    }
+    current.fields.push(f)
+  }
+  return groups
+}
+
 export default function Settings() {
   const [providers, setProviders] = useState([])
   const [error, setError] = useState('')
@@ -80,9 +102,11 @@ function ProviderCard({ provider: p, onChanged }) {
   function startEdit() {
     const init = {}
     for (const f of p.fields) {
-      // Pre-fill only values this tenant itself stored; secrets always start
-      // blank. .env values are shown as hints, never copied into the form.
-      init[f.name] = !f.secret && f.source === 'tenant' ? (f.value || '') : ''
+      // Pre-fill values this tenant stored AND shipped defaults (the Vapi
+      // voice profiles — source "default"), so the pre-filled values are
+      // visible and editable. Secrets always start blank; .env values are
+      // shown as hints, never copied into the form.
+      init[f.name] = !f.secret && (f.source === 'tenant' || f.source === 'default') ? (f.value || '') : ''
     }
     setForm(init)
     setEnabled(p.enabled)
@@ -136,7 +160,7 @@ function ProviderCard({ provider: p, onChanged }) {
               {f.is_set
                 ? <span className="masked">{f.secret ? f.masked : f.value}</span>
                 : <span style={{ color: 'var(--slate)' }}>Not set</span>}
-              {f.source && <span className="src-tag">{f.source === 'tenant' ? 'tenant' : '.env'}</span>}
+              {f.source && <span className="src-tag">{f.source === 'tenant' ? 'tenant' : f.source === 'default' ? 'default' : '.env'}</span>}
             </dd>
           </React.Fragment>
         ))}
@@ -165,22 +189,27 @@ function ProviderCard({ provider: p, onChanged }) {
         </div>
       ) : (
         <div className="provider-form">
-          {p.fields.map((f) => (
-            <div className="field" key={f.name}>
-              <label>{f.label}{f.required ? ' *' : ''}</label>
-              <input
-                type={f.secret ? 'password' : 'text'}
-                autoComplete="off"
-                value={form[f.name] ?? ''}
-                onChange={(e) => setForm({ ...form, [f.name]: e.target.value })}
-                placeholder={
-                  f.secret
-                    ? (f.is_set ? `Leave blank to keep ${f.masked || '••••'}` : 'Not set')
-                    : (f.source === 'env' ? `From .env: ${f.value} — type to override` : '')
-                }
-              />
-              {f.secret && <div className="hint">Write-only — the saved value is never shown again.</div>}
-            </div>
+          {groupFields(p.fields).map((g, gi) => (
+            <React.Fragment key={gi}>
+              {g.label && <div className="field-group-title">{g.label}</div>}
+              {g.fields.map((f) => (
+                <div className="field" key={f.name}>
+                  <label>{f.label}{f.required ? ' *' : ''}</label>
+                  <input
+                    type={f.secret ? 'password' : 'text'}
+                    autoComplete="off"
+                    value={form[f.name] ?? ''}
+                    onChange={(e) => setForm({ ...form, [f.name]: e.target.value })}
+                    placeholder={
+                      f.secret
+                        ? (f.is_set ? `Leave blank to keep ${f.masked || '••••'}` : 'Not set')
+                        : (f.source === 'env' ? `From .env: ${f.value} — type to override` : '')
+                    }
+                  />
+                  {f.secret && <div className="hint">Write-only — the saved value is never shown again.</div>}
+                </div>
+              ))}
+            </React.Fragment>
           ))}
           <label className="check-row">
             <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />

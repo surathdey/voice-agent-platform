@@ -92,7 +92,7 @@ export default function Calls() {
             ))}
             {data && data.total === 0 && (
               <tr><td colSpan={10} style={{ color: 'var(--slate)' }}>
-                No calls yet — open an active campaign and choose “Run dispatch (stub)”.
+                No calls yet — open an active campaign and choose “Run dispatch”.
               </td></tr>
             )}
             {!data && !error && (
@@ -102,9 +102,11 @@ export default function Calls() {
         </table>
       </div>
       <p className="footnote">
-        Read-only in this build. In stub mode every call is simulated end-to-end —
-        states, dispositions (from the agent’s own prompt), durations and the result
-        record are real; no provider was called and no cost was incurred.
+        The Transport column shows what actually carried each call — the stub
+        (simulated), Vapi (managed) or Plivo (self-hosted) — read from the
+        result record, never assumed. Live calls appear as DIALING / IN_CALL
+        when placed and land here as terminal §8.2 records when the provider
+        reports the end of the call.
       </p>
     </div>
   )

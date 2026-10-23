@@ -1,5 +1,159 @@
 # BUILD LOG
 
+## Chunk 5 — Phase A: A6 Telephony Spike + Vapi Voice Profiles (2026-10-23)
+
+### Built
+- **Real transports behind the A5 boundary** (`backend/app/transports.py`,
+  registered in `orchestrator.TRANSPORTS`). The transport contract gains
+  one honest state: `run()` returns an outcome dict (finalize now — the
+  stub, or a placement the provider rejected) or **None** (a real call was
+  placed; the attempt stays DIALING and its result lands later through the
+  same `finalize_attempt` path). The dispatch report counts `placed`
+  separately and says results land via webhook / stream.
+- **Mode gating tightened:** a real transport runs only when
+  `TELEPHONY_MODE` **equals** the campaign's mode AND A4 reports the
+  tenant's provider ready. `TELEPHONY_MODE=stub` (default) still forces
+  the stub even with every key configured, and a mode mismatch (managed
+  platform, self-hosted campaign, Plivo ready) also falls back to the
+  stub — both proven by smoke tests that assert the fake provider saw
+  **zero** requests.
+- **Managed transport — Vapi** (`VapiTransport`): builds the start-call
+  payload from the agent's **single prompt verbatim** (assistant system
+  message; Vapi substitutes `{{lead_name}}` / `{{bank_name}}` etc. from
+  `assistantOverrides.variableValues` = the lead's variables incl. the
+  product identifier), the tenant's Vapi defaults (`default_model` is the
+  assistant **LLM** model — "name" or "provider/name"; platform fallback
+  openai/gpt-4o), and an `analysisPlan` whose structured-data schema asks
+  for exactly the disposition bucket set parsed from that same prompt +
+  the agent's captured fields. `serverUrl` points at our webhook with the
+  §8.1 shared secret as `serverUrlSecret`; `metadata` binds the call to
+  session / attempt / tenant. POSTs to `{VAPI_BASE_URL}/call/phone`;
+  success → session DIALING with the Vapi call id, nothing finalized.
+- **Vapi end-of-call webhook** (`POST /api/telephony/vapi/webhook`,
+  `routers/telephony.py`): auth = `x-vapi-secret` header vs
+  `WEBHOOK_SECRET` (fails closed: unset → 503, wrong → 401). Only
+  `end-of-call-report` finalizes; the report is normalised into §8.2 by
+  `transports.map_vapi_report` (endedReason → final_state/end_reason,
+  structuredData → disposition + captured fields, startedAt/endedAt →
+  duration, artifact → recording + transcript, costBreakdown → cost with
+  `mode: "managed"`) and landed via `receive_result` → `finalize_attempt`
+  — duplicate deliveries return `created: false` and change nothing.
+  Binding falls back to the provider call id when metadata is absent.
+- **Self-hosted transport — Plivo skeleton** (`PlivoTransport`): creates
+  the outbound call via Plivo REST (basic auth, form body) with our
+  **answer URL** and **status callback URL** (both session-bound) and
+  recording on. `GET|POST /api/telephony/plivo/answer/{session_id}`
+  returns Plivo XML whose `<Stream bidirectional="true">` opens the
+  media stream to `…/api/telephony/plivo/stream/{session_id}` (session id
+  in the path AND as a stream `<Parameter>`). The **stream endpoint is
+  the A7 seam**: it consumes start/media/stop events, marks IN_CALL on
+  start, speaks nothing, and on close finalizes the attempt with the
+  spike outcome (`[SELF-HOSTED SPIKE] … no speech was generated or
+  heard`, disposition empty — no fake conversation).
+  `POST …/plivo/status/{session_id}` maps Plivo CallStatus (ringing /
+  in-progress → session state; completed / no-answer / busy / cancel /
+  machine → terminal §8.2 outcomes) and verifies **Plivo Signature V2**
+  whenever the signature header is present (§10). Whichever of stream /
+  status lands first finalizes; the other is an idempotent no-op. A
+  tenant whose self-hosted readiness is Exotel-only is honestly FAILED
+  (the A6 spike ships Plivo only).
+- **Vapi voice profiles (owner scope addition)** — the Vapi provider
+  settings gain a structured **Voice profiles** section: per language
+  (English / Hindi / Bengali) `voice_provider`, `tts_model`,
+  `voice_id_female`, `voice_id_male` — plain identifier fields (not
+  secrets), stored like every other Vapi field and editable in
+  Settings → Providers (grouped under per-language subheadings).
+  **The defaults are the owner's existing, verified RPI voice setup** —
+  English: 11labs, eleven_turbo_v2_5, ♀ 90ipbRoKi4CpHXvKVtl0 /
+  ♂ pzxut4zZz4GImZNlqQ3H; Hindi: 11labs, eleven_v3,
+  ♀ 1qEiC6qsybMkmnNdVMbK / ♂ zT03pEAEi0VHKciJODfn; Bengali: 11labs,
+  eleven_v3, ♀ 611e0Wo6wEi3GcpkO5it / ♂ GuSivqtqi1qfWxEuGhqa — shipped as
+  registry defaults (resolution order tenant → .env → registry default)
+  and **tenant-editable**: a tenant override wins everywhere. Registry
+  defaults deliberately do NOT count toward "configured" status — a
+  fresh tenant still honestly reports Vapi as stub until a key exists.
+  `default_model` stays the assistant **LLM** model, distinct from the
+  per-language **TTS** model. The transport selects the profile by the
+  call's resolved language (agent language rule applied to the lead) and
+  the **agent's voice gender** — a new structured agent field
+  `voice_gender` (female | male, default female; migration
+  `004_a6_voice_gender.sql`, editor select in the Voice & model section);
+  languages without a profile fall back to the legacy default voice.
+- **Config seams:** `VAPI_BASE_URL` / `PLIVO_BASE_URL` (provider API
+  bases — how tests point at a fake provider), `PUBLIC_BASE_URL` (builds
+  all provider-facing URLs), `WEBHOOK_SECRET`, `VAPI_PHONE_NUMBER_ID`
+  (tenant Vapi field; sent as `phoneNumberId` when set), per-language
+  profile env overrides — all wired through `.env.example` and
+  docker-compose. Calls views now report the real transport for
+  in-flight sessions (mode read from the session, not assumed stub);
+  UI labels de-stubbed (Dispatch button, Calls page mode/transport
+  indicator + footnote).
+
+### Verification (native, fresh SQLite DBs — same Docker caveat as chunks 1–4)
+- `scripts/smoke_test.py`: **183/183 checks passed** (102 existing + 81
+  new A6). The A6 section boots its own app instances whose provider
+  base URLs point at a local fake provider server (stdlib HTTP, in the
+  test process) — **no real provider was called**. Covered: voice
+  profile defaults pre-filled with source `default` and the owner's
+  exact IDs; a tenant edit overriding the Bengali male ID sticks
+  (source `tenant`); managed dispatch places 2 calls (`placed: 2,
+  finalized: 0`) with payload assertions — prompt verbatim, LLM from
+  tenant default, Bengali lead → Bengali female voice + eleven_v3,
+  Hindi lead → Hindi female voice, variables, transcriber language
+  (bn / hi), analysis schema = prompt buckets + captured fields,
+  serverUrl/secret/metadata binding, Bearer key; sessions sit DIALING
+  under transport `managed`; webhook wrong-secret → 401, non-result
+  message acknowledged unhandled, report → `created: true` with full
+  §8.2 mapping (COMPLETED / RPC_CONFIRMED / identity_confirmed / 47 s /
+  recording / transcript / cost 0.11 USD), duplicate → `created: false`
+  and the stored result untouched, metadata-less report bound by
+  provider call id (customer-did-not-answer → NO_ANSWER); a male agent
+  + Bengali lead → the tenant-edited Bengali **male** voice ID in the
+  payload; Plivo dispatch places 2 calls (answer/status URLs
+  session-bound, `record=true`, basic auth), sessions DIALING under
+  `self_hosted`; answer XML parses with `bidirectional="true"`, the
+  session stream URL and Parameter; a real websocket client drives
+  start/media/stop → the attempt finalizes exactly once with the spike
+  summary and empty disposition; a `no-answer` status callback finalizes
+  the second call, a later `completed` callback cannot rewrite it, and
+  a bogus Plivo signature → 403; honesty gates: stub mode with all keys
+  → stub transport + **zero** fake-provider requests, and the
+  mode-mismatch gate behaves the same with `provider_ready: true`.
+- Frontend: `vite build` clean (Settings grouping, AgentEditor gender
+  select, Calls / CampaignDetail label updates compiled in).
+
+### Known limitations (deliberate, for this chunk)
+- **No live call has been placed.** The spike is proven against a fake
+  provider only. What a live run still needs from the owner: (1) a Plivo
+  account (India entity + KYC) and a Plivo number placed in the tenant's
+  `from_numbers`; (2) a Sarvam API key (A7); (3) `PUBLIC_BASE_URL` set
+  to a publicly reachable HTTPS address for this app (providers cannot
+  call localhost) and `WEBHOOK_SECRET` set to a long random value;
+  (4) for managed mode, a real Vapi API key in the tenant settings (+ a
+  Vapi phone number ID); (5) `TELEPHONY_MODE` flipped to the live mode.
+- The media-stream endpoint is a placeholder by design: it proves
+  place → answer → stream → finalize; the Sarvam conversation brain is
+  A7 (STT) / A8 (LLM + TTS + disposition), which replaces the inside of
+  the stream handler without changing any boundary.
+- Plivo signature verification is enforced when the signature header is
+  present; unsigned callbacks are still accepted in this build (Plivo
+  always signs in production — tightening to required is a hardening
+  step for the India-readiness pass). Status-callback URLs carry no
+  per-session token in this chunk.
+- Vapi's `analysisPlan.structuredDataSchema` shape follows Vapi's
+  long-standing API; if Vapi requires `structuredDataPlan` for a given
+  account version, the mapping point is isolated in
+  `build_vapi_payload` / `map_vapi_report`.
+- The dispatch worker is still synchronous inside the dispatch request:
+  placing a real call is one HTTP round-trip per attempt — fine for the
+  spike; a background worker remains an A10 concern.
+
+### Next step
+**A7 — Sarvam STT integration:** stream Plivo media into Saaras
+(transcription WebSocket), assemble the live transcript on the session,
+and surface partial/final turns — the first half of the conversation
+brain inside the stream endpoint this chunk left as the seam.
+
 ## Chunk 4 — Phase A: A5 Orchestrator Skeleton (2026-10-23)
 
 ### Built

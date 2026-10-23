@@ -102,7 +102,7 @@ export default function CampaignDetail({ campaignId, onBack }) {
         <div style={{ display: 'flex', gap: 14, alignItems: 'center', flexWrap: 'wrap' }}>
           <button className="btn" disabled={busy || campaign.status !== 'active'}
             onClick={runDispatch}>
-            Run dispatch (stub)
+            Run dispatch
           </button>
           {campaign.status !== 'active' && (
             <span style={{ color: 'var(--slate)', fontSize: 13.5 }}>
@@ -122,9 +122,12 @@ export default function CampaignDetail({ campaignId, onBack }) {
         </div>
         {dispatchMsg && <p style={{ marginTop: 10, marginBottom: 0 }}>{dispatchMsg}</p>}
         <p className="footnote" style={{ marginTop: 10 }}>
-          Stub transport: attempts are admitted per the schedule window and daily cap,
-          simulated end-to-end, and land as real §8.2 result records — dispositions come
-          from the agent’s own prompt. No provider is called in this build; see Calls for the list.
+          Attempts are admitted per the schedule window and daily cap. The transport is
+          decided by the platform mode: in stub mode calls are simulated end-to-end and
+          land as §8.2 result records immediately; with a live mode configured
+          (TELEPHONY_MODE + the tenant's provider), calls are placed for real and their
+          results land as the provider reports them. The dispatch message above always
+          says which transport ran — see Calls for the list.
         </p>
       </div>
 

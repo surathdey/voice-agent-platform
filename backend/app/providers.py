@@ -43,16 +43,47 @@ PROVIDERS = {
     "vapi": {
         "mode": "managed", "label": "Vapi — managed platform",
         "description": "Managed orchestration: telephony, STT, LLM and TTS behind one API. "
-                       "Default model + voice are the tenant defaults the managed dispatcher "
-                       "uses at dispatch (agents carry their own model/voice for self-hosted mode).",
+                       "Default model is the assistant (LLM) model; the voice profiles below "
+                       "are the TTS side — one profile per language (provider, TTS model, "
+                       "female + male voice IDs), pre-filled with the owner's verified RPI "
+                       "voice setup and editable per tenant. The transport picks the profile "
+                       "by the call's language and the agent's voice gender.",
         "primary": True, "optional": False,
         "fields": [
             {"name": "api_key", "label": "API key", "secret": True, "required": True,
              "env_attr": "VAPI_API_KEY"},
-            {"name": "default_model", "label": "Default model", "secret": False, "required": False,
+            {"name": "default_model", "label": "Default model (assistant LLM)", "secret": False, "required": False,
              "env_attr": "VAPI_DEFAULT_MODEL"},
-            {"name": "default_voice", "label": "Default voice", "secret": False, "required": False,
+            {"name": "default_voice", "label": "Default voice (fallback)", "secret": False, "required": False,
              "env_attr": "VAPI_DEFAULT_VOICE"},
+            {"name": "phone_number_id", "label": "Phone number ID", "secret": False, "required": False,
+             "env_attr": "VAPI_PHONE_NUMBER_ID"},
+            # ── Voice profiles (A6 scope addition) — identifiers, not
+            # secrets: plain fields, pre-filled from "default" below.
+            {"name": "en_voice_provider", "label": "English · voice provider", "secret": False, "required": False,
+             "env_attr": "VAPI_EN_VOICE_PROVIDER", "default": "11labs"},
+            {"name": "en_tts_model", "label": "English · TTS model", "secret": False, "required": False,
+             "env_attr": "VAPI_EN_TTS_MODEL", "default": "eleven_turbo_v2_5"},
+            {"name": "en_voice_id_female", "label": "English · female voice ID", "secret": False, "required": False,
+             "env_attr": "VAPI_EN_VOICE_ID_FEMALE", "default": "90ipbRoKi4CpHXvKVtl0"},
+            {"name": "en_voice_id_male", "label": "English · male voice ID", "secret": False, "required": False,
+             "env_attr": "VAPI_EN_VOICE_ID_MALE", "default": "pzxut4zZz4GImZNlqQ3H"},
+            {"name": "hi_voice_provider", "label": "Hindi · voice provider", "secret": False, "required": False,
+             "env_attr": "VAPI_HI_VOICE_PROVIDER", "default": "11labs"},
+            {"name": "hi_tts_model", "label": "Hindi · TTS model", "secret": False, "required": False,
+             "env_attr": "VAPI_HI_TTS_MODEL", "default": "eleven_v3"},
+            {"name": "hi_voice_id_female", "label": "Hindi · female voice ID", "secret": False, "required": False,
+             "env_attr": "VAPI_HI_VOICE_ID_FEMALE", "default": "1qEiC6qsybMkmnNdVMbK"},
+            {"name": "hi_voice_id_male", "label": "Hindi · male voice ID", "secret": False, "required": False,
+             "env_attr": "VAPI_HI_VOICE_ID_MALE", "default": "zT03pEAEi0VHKciJODfn"},
+            {"name": "bn_voice_provider", "label": "Bengali · voice provider", "secret": False, "required": False,
+             "env_attr": "VAPI_BN_VOICE_PROVIDER", "default": "11labs"},
+            {"name": "bn_tts_model", "label": "Bengali · TTS model", "secret": False, "required": False,
+             "env_attr": "VAPI_BN_TTS_MODEL", "default": "eleven_v3"},
+            {"name": "bn_voice_id_female", "label": "Bengali · female voice ID", "secret": False, "required": False,
+             "env_attr": "VAPI_BN_VOICE_ID_FEMALE", "default": "611e0Wo6wEi3GcpkO5it"},
+            {"name": "bn_voice_id_male", "label": "Bengali · male voice ID", "secret": False, "required": False,
+             "env_attr": "VAPI_BN_VOICE_ID_MALE", "default": "GuSivqtqi1qfWxEuGhqa"},
         ],
     },
     "twilio": {
@@ -132,8 +163,10 @@ def resolve_fields(db: Session, tenant_id: str, provider: str):
     """Resolve every field of one provider for a tenant.
 
     Returns (values, sources, row): values[name] is the effective value
-    (tenant value, else .env fallback, else ""); sources[name] is
-    "tenant" | "env" | None. INTERNAL — values include raw secrets.
+    (tenant value, else .env fallback, else the registry "default" —
+    used by the Vapi voice profiles, which ship pre-filled — else "");
+    sources[name] is "tenant" | "env" | "default" | None.
+    INTERNAL — values include raw secrets.
     """
     spec = PROVIDERS[provider]
     row = get_row(db, tenant_id, provider)
@@ -145,6 +178,8 @@ def resolve_fields(db: Session, tenant_id: str, provider: str):
             values[f["name"]], sources[f["name"]] = tv, "tenant"
         elif _env_value(f):
             values[f["name"]], sources[f["name"]] = _env_value(f), "env"
+        elif f.get("default"):
+            values[f["name"]], sources[f["name"]] = f["default"], "default"
         else:
             values[f["name"]], sources[f["name"]] = "", None
     return values, sources, row
@@ -227,7 +262,11 @@ def env_provider_status() -> dict:
 def provider_view(db: Session, tenant_id: str, provider: str) -> dict:
     spec = PROVIDERS[provider]
     values, sources, row, missing, configured = _assess(db, tenant_id, provider)
-    any_set = any(values[f["name"]] for f in spec["fields"])
+    # "Set by someone" counts tenant/.env values only — registry defaults
+    # (the pre-filled Vapi voice profiles) must not make a fresh tenant
+    # look half-configured.
+    any_set = any(values[f["name"]] and sources[f["name"]] in ("tenant", "env")
+                  for f in spec["fields"])
 
     if row is not None and not row.enabled:
         status, detail = "not_configured", "Disabled in tenant settings — re-enable to use this provider."

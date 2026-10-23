@@ -9,8 +9,14 @@ working provider — they run in stub mode).
 Chunk 4: A5 (orchestrator skeleton — dispatch service with schedule /
 concurrency admission, deterministic attempt ids, the stub transport, and
 the single idempotent finalize path every mode's §8.2 result lands on;
-calls list + §8.2 result receiver). NO real provider calls yet (A6+):
-every dispatch runs through the stub transport and is labelled as such.
+calls list + §8.2 result receiver).
+Chunk 5: A6 (telephony spike — REAL transports behind the same boundary:
+Vapi start-call + end-of-call webhook in managed mode, Plivo outbound +
+answer XML + placeholder media-stream endpoint in self-hosted mode,
+per-language Vapi voice profiles in the tenant settings. A real
+transport runs only when TELEPHONY_MODE equals the campaign's mode AND
+the tenant's provider is ready; stub remains the default everywhere
+else. The conversation brain — Sarvam STT/LLM/TTS — is A7/A8.)
 """
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,9 +25,9 @@ from . import providers as prov
 from . import seed as seed_module
 from .config import settings
 from .db import SessionLocal, init_db
-from .routers import agents, auth, calls, campaigns, settings as settings_router, tenants
+from .routers import agents, auth, calls, campaigns, settings as settings_router, telephony, tenants
 
-app = FastAPI(title="Voice Agent Platform", version="0.4.0")
+app = FastAPI(title="Voice Agent Platform", version="0.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -65,3 +71,4 @@ app.include_router(agents.router)
 app.include_router(campaigns.router)
 app.include_router(settings_router.router)
 app.include_router(calls.router)
+app.include_router(telephony.router)

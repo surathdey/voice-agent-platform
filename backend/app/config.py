@@ -22,6 +22,37 @@ class Settings:
     VAPI_API_KEY: str = os.getenv("VAPI_API_KEY", "")
     VAPI_DEFAULT_MODEL: str = os.getenv("VAPI_DEFAULT_MODEL", "")
     VAPI_DEFAULT_VOICE: str = os.getenv("VAPI_DEFAULT_VOICE", "")
+    VAPI_PHONE_NUMBER_ID: str = os.getenv("VAPI_PHONE_NUMBER_ID", "")
+    # Vapi voice profiles (A6): per-language TTS overrides of the registry
+    # defaults in app.providers (11labs voice IDs — identifiers, not
+    # secrets). Empty = use the shipped defaults.
+    VAPI_EN_VOICE_PROVIDER: str = os.getenv("VAPI_EN_VOICE_PROVIDER", "")
+    VAPI_EN_TTS_MODEL: str = os.getenv("VAPI_EN_TTS_MODEL", "")
+    VAPI_EN_VOICE_ID_FEMALE: str = os.getenv("VAPI_EN_VOICE_ID_FEMALE", "")
+    VAPI_EN_VOICE_ID_MALE: str = os.getenv("VAPI_EN_VOICE_ID_MALE", "")
+    VAPI_HI_VOICE_PROVIDER: str = os.getenv("VAPI_HI_VOICE_PROVIDER", "")
+    VAPI_HI_VOICE_ID_FEMALE: str = os.getenv("VAPI_HI_VOICE_ID_FEMALE", "")
+    VAPI_HI_TTS_MODEL: str = os.getenv("VAPI_HI_TTS_MODEL", "")
+    VAPI_HI_VOICE_ID_MALE: str = os.getenv("VAPI_HI_VOICE_ID_MALE", "")
+    VAPI_BN_VOICE_PROVIDER: str = os.getenv("VAPI_BN_VOICE_PROVIDER", "")
+    VAPI_BN_TTS_MODEL: str = os.getenv("VAPI_BN_TTS_MODEL", "")
+    VAPI_BN_VOICE_ID_FEMALE: str = os.getenv("VAPI_BN_VOICE_ID_FEMALE", "")
+    VAPI_BN_VOICE_ID_MALE: str = os.getenv("VAPI_BN_VOICE_ID_MALE", "")
+    # Provider API base URLs — overridable for staging / tests (the A6
+    # smoke suite points these at a local fake provider; production uses
+    # the defaults).
+    VAPI_BASE_URL: str = os.getenv("VAPI_BASE_URL", "https://api.vapi.ai")
+    PLIVO_BASE_URL: str = os.getenv("PLIVO_BASE_URL", "https://api.plivo.com")
+    # Public base URL of THIS app as providers see it — used to build the
+    # Vapi serverUrl and the Plivo answer / status callback URLs (A6).
+    # Must be reachable from the provider (a tunnel / public host in a
+    # live deployment); defaults to the local dev address.
+    PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "http://localhost:8000")
+    # Shared secret for provider webhooks (§8.1): Vapi sends it back as
+    # the `x-vapi-secret` header on every server message. Empty = the
+    # webhook route fails closed (503) rather than accepting unauthenticated
+    # result deliveries.
+    WEBHOOK_SECRET: str = os.getenv("WEBHOOK_SECRET", "")
     TWILIO_ACCOUNT_SID: str = os.getenv("TWILIO_ACCOUNT_SID", "")
     TWILIO_AUTH_TOKEN: str = os.getenv("TWILIO_AUTH_TOKEN", "")
     PLIVO_AUTH_ID: str = os.getenv("PLIVO_AUTH_ID", "")

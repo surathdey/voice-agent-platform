@@ -61,6 +61,7 @@ class AgentIn(BaseModel):
     stt_language: str = "hi-IN"
     tts_provider: str = "bulbul"
     tts_voice_id: str = ""
+    voice_gender: str = "female"  # female | male — picks the Vapi voice-profile voice ID (A6)
     language_rule: dict = Field(default_factory=dict)
     captured_fields: List[CapturedField] = []
     max_duration_s: int = 300
@@ -283,6 +284,7 @@ class DispatchOut(BaseModel):
     created: int = 0                     # new attempts admitted by this run
     already_dispatched: int = 0          # leads skipped: attempt already exists
     finalized: int = 0                   # results written by this run
+    placed: int = 0                      # real-transport calls placed (A6) — result lands via webhook / stream
     counts_by_state: dict = Field(default_factory=dict)
     message: str = ""
 

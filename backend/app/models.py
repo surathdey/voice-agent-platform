@@ -85,6 +85,11 @@ class AgentConfig(Base):
     stt_language: Mapped[str] = mapped_column(String(20), default="hi-IN")
     tts_provider: Mapped[str] = mapped_column(String(60), default="bulbul")
     tts_voice_id: Mapped[str] = mapped_column(String(120), default="")
+    # Voice gender of the agent persona (female | male). In managed mode
+    # the Vapi transport uses it to pick the per-language voice profile's
+    # female / male voice ID from the tenant's Vapi settings (A6); in
+    # self-hosted mode the Bulbul voice id conventionally encodes it.
+    voice_gender: Mapped[str] = mapped_column(String(10), default="female")
     # e.g. {"default": "hi-IN", "by_state": {"West Bengal": "bn-IN"}}
     language_rule: Mapped[dict] = mapped_column(JSON, default=dict)
     # e.g. [{"name": "promise_date", "type": "date", "description": "..."}]

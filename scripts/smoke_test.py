@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""Smoke tests for Phase A chunks 1–4 (A1–A5) against a running server.
+"""Smoke tests for Phase A chunks 1–5 (A1–A6) against a running server.
 
 Usage:  python3 scripts/smoke_test.py [base_url]     (default http://localhost:8000)
+        Run with the backend venv python (backend/.venv/bin/python) —
+        the A6 section boots its own app instances with that interpreter
+        and needs its `websockets` package for the stream test.
 Covers: health · login · tenant scoping (A1 acceptance) · agent CRUD ·
 single-prompt versioning + rollback (A2) · campaign CRUD bound to one agent,
 status lifecycle, CSV lead upload with column mapping, product identifiers,
@@ -12,7 +15,12 @@ provider flagging, health per-mode providers (A4) · dispatch on active
 campaigns only, schedule-window + daily-cap admission, stub transport,
 §8.2 result-contract conformance, deterministic prompt-bucket round-robin,
 exactly-one-result (re-dispatch + duplicate result delivery), tenant
-isolation on dispatch/calls/results (A5).
+isolation on dispatch/calls/results (A5) · real transports against a
+local FAKE provider — Vapi start-call payload (single prompt, tenant
+defaults, per-language voice profiles by language + agent voice gender),
+end-of-call webhook → exactly one §8.2 result, duplicate webhook no-op,
+Plivo create-call + answer XML + placeholder stream finalize, status
+callback finalize, stub-mode + mode-mismatch honesty gates (A6).
 
 Run against a FRESH database: like the earlier chunks, the suite seeds its
 own tenants/agents/campaigns/settings and asserts exact fresh-state values.
@@ -538,6 +546,484 @@ call("GET", f"/api/campaigns/{cid5}/calls", token=token2, expect=404)
 call("POST", f"/api/campaigns/{cid5}/dispatch", token=token2, expect=404)
 call("POST", "/api/results", {"session_id": first["session_id"]}, token=token2, expect=404)
 print("  PASS  tenant-wide list + filter work; tenant 2 sees none of QGBS's calls")
+
+print("── A6: real transports — fake providers only, no live calls ──")
+# The A1–A5 sections above run against the stub-mode server on BASE. This
+# section boots its OWN app instances (fresh temp DBs) whose provider
+# base URLs point at a local FAKE provider server: the transports run
+# their real code paths end-to-end, but no real provider is ever called.
+import os
+import subprocess
+import tempfile
+import threading
+import time
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+FAKE = {"requests": [], "vapi_calls": 0}
+
+
+class _FakeProvider(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def _handle(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length else b""
+        FAKE["requests"].append({
+            "method": self.command, "path": self.path,
+            "headers": dict(self.headers), "body": raw.decode("utf-8", "replace"),
+        })
+        if self.path == "/call/phone":
+            FAKE["vapi_calls"] += 1
+            payload, code = {"id": f"call_fake_{FAKE['vapi_calls']}", "status": "queued"}, 200
+        elif "/v1/Account/" in self.path and self.path.endswith("/Call/"):
+            payload, code = {"request_uuid": "req-uuid-fake-1",
+                             "message": "call queued", "api_id": "api-fake-1"}, 202
+        else:
+            payload, code = {}, 200
+        data = json.dumps(payload).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    do_POST = _handle
+    do_GET = _handle
+
+
+_fake_server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeProvider)
+threading.Thread(target=_fake_server.serve_forever, daemon=True).start()
+FAKE_BASE = f"http://127.0.0.1:{_fake_server.server_address[1]}"
+
+_BACKEND6 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "backend")
+_VENV_PY6 = os.path.join(_BACKEND6, ".venv", "bin", "python")
+APP_PY6 = _VENV_PY6 if os.path.exists(_VENV_PY6) else sys.executable
+TMP6 = tempfile.mkdtemp(prefix="a6-smoke-")
+_procs6 = []
+
+
+def check6(label, cond, extra=""):
+    global passed, failed
+    if cond:
+        passed += 1
+        print(f"  PASS  {label}")
+    else:
+        failed += 1
+        print(f"  FAIL  {label}  {extra}")
+
+
+def call6(base, method, path, body=None, token=None, expect=None,
+          headers=None, form=None):
+    """HTTP against an A6 app instance; returns (status, json_or_text).
+    Counting mirrors call(): expect=None means any 2xx is a pass."""
+    global passed, failed
+    req = urllib.request.Request(base + path, method=method)
+    data = None
+    if form is not None:
+        data = urllib.parse.urlencode(form).encode()
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    elif body is not None:
+        data = body if isinstance(body, bytes) else json.dumps(body).encode()
+        req.add_header("Content-Type", "application/json")
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req, data=data, timeout=15) as r:
+            status, payload = r.status, r.read()
+    except urllib.error.HTTPError as e:
+        status, payload = e.code, e.read()
+    text = payload.decode("utf-8", "replace") if payload else ""
+    try:
+        parsed = json.loads(text) if text else None
+    except Exception:
+        parsed = text
+    ok = (expect is None and 200 <= status < 300) or status == expect
+    if ok:
+        passed += 1
+        print(f"  PASS  {method} {path} -> {status}")
+    else:
+        failed += 1
+        print(f"  FAIL  {method} {path} -> {status} (expected {expect or '2xx'})  body={text[:200]}")
+    return status, parsed
+
+
+def upload6(base, path, csv_text, token, mapping):
+    boundary = "----smoke6" + uuid.uuid4().hex
+    parts = [
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"mapping\"\r\n\r\n{json.dumps(mapping)}\r\n".encode(),
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"leads.csv\"\r\n"
+        "Content-Type: text/csv\r\n\r\n".encode() + csv_text.encode() + b"\r\n",
+        f"--{boundary}--\r\n".encode(),
+    ]
+    req = urllib.request.Request(base + path, method="POST", data=b"".join(parts))
+    req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+    req.add_header("Authorization", f"Bearer {token}")
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read())
+
+
+def start_app6(port, tag, env_extra):
+    env = dict(os.environ)
+    env.update({
+        "DATABASE_URL": f"sqlite:///{TMP6}/{tag}.db",
+        "PUBLIC_BASE_URL": f"http://127.0.0.1:{port}",
+        "WEBHOOK_SECRET": "a6-webhook-secret",
+        "VAPI_BASE_URL": FAKE_BASE, "PLIVO_BASE_URL": FAKE_BASE,
+        # Deterministic provider env: blank unless the scenario sets it.
+        "VAPI_API_KEY": "", "VAPI_DEFAULT_MODEL": "", "VAPI_DEFAULT_VOICE": "",
+        "PLIVO_AUTH_ID": "", "PLIVO_AUTH_TOKEN": "", "SARVAM_API_KEY": "",
+    })
+    env.update(env_extra)
+    log = open(f"{TMP6}/{tag}.log", "wb")
+    proc = subprocess.Popen(
+        [APP_PY6, "-m", "uvicorn", "app.main:app", "--port", str(port)],
+        cwd=_BACKEND6, env=env, stdout=log, stderr=log)
+    _procs6.append(proc)
+    base = f"http://127.0.0.1:{port}"
+    for _ in range(80):
+        try:
+            with urllib.request.urlopen(base + "/api/health", timeout=2) as r:
+                if r.status == 200:
+                    return base
+        except Exception:
+            time.sleep(0.5)
+    raise RuntimeError(f"A6 app '{tag}' on {port} did not start — see {TMP6}/{tag}.log")
+
+
+def login6(base):
+    _s, payload = call6(base, "POST", "/api/auth/login",
+                        {"email": "demo@qgbs.example", "password": "demo-password"})
+    return payload["access_token"]
+
+
+A6_MAP = {"callee_name": "name", "phone_number": "phone_number",
+          "bank_name": "bank_name", "state": "state"}
+A6_CSV = (
+    "callee_name,phone_number,bank_name,state\n"
+    "F. Ali,9300000001,Tata Capital,West Bengal\n"
+    "G. Nath,9300000002,Tata Capital,Bihar\n"
+)
+
+
+def campaign6(base, token, agent_id, name, mode, csv_text=A6_CSV):
+    _s, camp = call6(base, "POST", "/api/campaigns", {
+        "agent_id": agent_id, "name": name, "product": "vehicle_loan",
+        "provider_mode": mode,
+        "schedule": {"window_start": "00:00", "window_end": "23:59", "daily_cap": 2000},
+    }, token=token, expect=201)
+    cid = camp["campaign_id"]
+    up = upload6(base, f"/api/campaigns/{cid}/leads/upload", csv_text, token, A6_MAP)
+    assert up["created"] >= 1, up
+    call6(base, "POST", f"/api/campaigns/{cid}/status", {"status": "active"}, token=token)
+    return cid
+
+
+try:
+    # ── managed mode: Vapi transport ──────────────────────────────────
+    baseM = start_app6(18101, "managed", {
+        "TELEPHONY_MODE": "managed", "VAPI_API_KEY": "sk-fake-managed",
+        "VAPI_DEFAULT_MODEL": "gpt-4o-mini",
+    })
+    tokenM = login6(baseM)
+    _, agentsM = call6(baseM, "GET", "/api/agents", token=tokenM)
+    rpiM = agentsM[0]
+    assert rpiM["name"] == "RPI Verification" and rpiM["voice_gender"] == "female", rpiM
+
+    print("── A6: Vapi voice profiles — defaults pre-filled ──")
+    _, vapi_view = call6(baseM, "GET", "/api/settings/providers/vapi", token=tokenM)
+    vf = {f["name"]: f for f in vapi_view["fields"]}
+    check6("voice profiles pre-fill from defaults (Bengali female = owner's verified ID)",
+           vf["bn_voice_id_female"]["value"] == "611e0Wo6wEi3GcpkO5it"
+           and vf["bn_voice_id_female"]["source"] == "default"
+           and vf["bn_tts_model"]["value"] == "eleven_v3"
+           and vf["bn_voice_provider"]["value"] == "11labs", vf.get("bn_voice_id_female"))
+    check6("English + Hindi profile defaults (IDs + TTS models)",
+           vf["en_voice_id_female"]["value"] == "90ipbRoKi4CpHXvKVtl0"
+           and vf["en_voice_id_male"]["value"] == "pzxut4zZz4GImZNlqQ3H"
+           and vf["en_tts_model"]["value"] == "eleven_turbo_v2_5"
+           and vf["hi_voice_id_female"]["value"] == "1qEiC6qsybMkmnNdVMbK"
+           and vf["hi_voice_id_male"]["value"] == "zT03pEAEi0VHKciJODfn"
+           and vf["hi_tts_model"]["value"] == "eleven_v3")
+    check6("tenant env key (not the defaults) is what configures Vapi here",
+           vf["api_key"]["source"] == "env" and vapi_view["configured"] is True,
+           vf.get("api_key"))
+    _, saved_v = call6(baseM, "PUT", "/api/settings/providers/vapi",
+                       {"fields": {"bn_voice_id_male": "tenant-bn-male-override"}}, token=tokenM)
+    svf = {f["name"]: f for f in saved_v["fields"]}
+    check6("voice profile editable per tenant (override sticks, source = tenant)",
+           svf["bn_voice_id_male"]["value"] == "tenant-bn-male-override"
+           and svf["bn_voice_id_male"]["source"] == "tenant", svf.get("bn_voice_id_male"))
+
+    print("── A6: managed dispatch places real Vapi calls (fake provider) ──")
+    cidM = campaign6(baseM, tokenM, rpiM["agent_id"], "A6 — Managed Batch", "managed")
+    _, repM = call6(baseM, "POST", f"/api/campaigns/{cidM}/dispatch", token=tokenM)
+    check6("dispatch routes to the Vapi transport and PLACES calls (no finalize yet)",
+           repM["transport"] == "managed" and repM["stub"] is False
+           and repM["created"] == 2 and repM["placed"] == 2 and repM["finalized"] == 0, repM)
+    reqs = [r for r in FAKE["requests"] if r["path"] == "/call/phone"]
+    check6("fake Vapi received exactly 2 start-calls", len(reqs) == 2, len(reqs))
+    payloads = [json.loads(r["body"]) for r in reqs]
+    check6("start-call carries the tenant's Vapi key",
+           all(r["headers"].get("Authorization") == "Bearer sk-fake-managed" for r in reqs))
+    by_lead = {p["assistantOverrides"]["variableValues"]["lead_name"]: p for p in payloads}
+    wb, hi = by_lead["F. Ali"], by_lead["G. Nath"]
+    check6("payload: the agent's single prompt is the system message, verbatim",
+           wb["assistant"]["model"]["messages"][0]["content"] == rpiM["prompt"])
+    check6("payload: assistant LLM from tenant default model (provider/name split)",
+           wb["assistant"]["model"]["model"] == "gpt-4o-mini"
+           and wb["assistant"]["model"]["provider"] == "openai", wb["assistant"]["model"])
+    check6("payload: Bengali lead → Bengali voice profile (female, 11labs, eleven_v3)",
+           wb["assistant"]["voice"] == {"provider": "11labs",
+                                        "voiceId": "611e0Wo6wEi3GcpkO5it",
+                                        "model": "eleven_v3"}, wb["assistant"]["voice"])
+    check6("payload: Hindi lead → Hindi voice profile (female, 11labs, eleven_v3)",
+           hi["assistant"]["voice"] == {"provider": "11labs",
+                                        "voiceId": "1qEiC6qsybMkmnNdVMbK",
+                                        "model": "eleven_v3"}, hi["assistant"]["voice"])
+    check6("payload: lead variables + language resolution (bn for WB, hi for Bihar)",
+           wb["assistantOverrides"]["variableValues"]["bank_name"] == "Tata Capital"
+           and wb["assistant"]["transcriber"]["language"] == "bn"
+           and hi["assistant"]["transcriber"]["language"] == "hi")
+    schema_props = wb["assistant"]["analysisPlan"]["structuredDataSchema"]["properties"]
+    check6("payload: analysis schema = prompt buckets + captured fields (§8.2 source)",
+           "RPC_CONFIRMED" in schema_props["disposition"]["enum"]
+           and "identity_confirmed" in schema_props, list(schema_props))
+    check6("payload: webhook binding (serverUrl + secret + session metadata)",
+           wb["assistant"]["serverUrl"] == f"{baseM}/api/telephony/vapi/webhook"
+           and wb["assistant"]["serverUrlSecret"] == "a6-webhook-secret"
+           and wb["metadata"]["session_id"].startswith("ses_"), wb["assistant"]["serverUrl"])
+
+    _, callsM = call6(baseM, "GET", f"/api/campaigns/{cidM}/calls", token=tokenM)
+    check6("placed calls sit in DIALING under the managed transport, no results yet",
+           callsM["total"] == 2
+           and all(c["state"] == "DIALING" and c["transport"] == "managed"
+                   and c["final_state"] is None for c in callsM["calls"]), callsM)
+    sess_by_lead = {c["lead_name"]: c for c in callsM["calls"]}
+    check6("payload metadata binds each call to its session",
+           wb["metadata"]["session_id"] == sess_by_lead["F. Ali"]["session_id"]
+           and hi["metadata"]["session_id"] == sess_by_lead["G. Nath"]["session_id"])
+    # The fake assigns call_fake_N in request order — pair ids to sessions
+    # via each request's own metadata (lead dispatch order is not assumed).
+    fake_id_by_session = {}
+    for i, r in enumerate(reqs):
+        sid = json.loads(r["body"])["metadata"]["session_id"]
+        fake_id_by_session[sid] = f"call_fake_{i + 1}"
+
+    print("── A6: Vapi end-of-call webhook → finalize (exactly one result) ──")
+    wb_session = sess_by_lead["F. Ali"]["session_id"]
+    report_body = {"message": {
+        "type": "end-of-call-report",
+        "endedReason": "customer-ended-call",
+        "startedAt": "2026-10-23T10:00:00.000Z", "endedAt": "2026-10-23T10:00:47.000Z",
+        "call": {"id": fake_id_by_session[wb_session],
+                 "metadata": {"session_id": wb_session}},
+        "analysis": {"structuredData": {"disposition": "RPC_CONFIRMED",
+                                        "identity_confirmed": True}},
+        "summary": "Customer confirmed identity.",
+        "artifact": {"recordingUrl": "https:// recordings.example/x.mp3".replace(" ", ""),
+                     "transcript": "AI: Namaste, am I speaking with F. Ali?\nUser: Yes, speaking."},
+        "costBreakdown": {"total": 0.11, "transport": 0.05, "stt": 0.02, "llm": 0.03, "tts": 0.01},
+    }}
+    call6(baseM, "POST", "/api/telephony/vapi/webhook", report_body,
+          headers={"x-vapi-secret": "wrong-secret"}, expect=401)
+    check6("webhook rejects a wrong shared secret (401)", True)
+    _, ack = call6(baseM, "POST", "/api/telephony/vapi/webhook",
+                   {"message": {"type": "status-update",
+                                "call": {"id": fake_id_by_session[wb_session]}}},
+                   headers={"x-vapi-secret": "a6-webhook-secret"})
+    check6("non-result server messages are acknowledged, not finalized",
+           ack["handled"] is False, ack)
+    _, ack = call6(baseM, "POST", "/api/telephony/vapi/webhook", report_body,
+                   headers={"x-vapi-secret": "a6-webhook-secret"})
+    check6("end-of-call report lands through finalize (created=True)",
+           ack["handled"] is True and ack["created"] is True, ack)
+    _, callsM2 = call6(baseM, "GET", f"/api/campaigns/{cidM}/calls", token=tokenM)
+    done = next(c for c in callsM2["calls"] if c["session_id"] == wb_session)
+    check6("§8.2 mapping: state/disposition/captured/duration/recording/cost from the report",
+           done["final_state"] == "COMPLETED" and done["disposition"] == "RPC_CONFIRMED"
+           and done["captured_fields"].get("identity_confirmed") is True
+           and done["duration_s"] == 47 and done["recording_url"].endswith("x.mp3")
+           and done["transport"] == "managed"
+           and done["cost_breakdown"]["total"] == 0.11
+           and done["cost_breakdown"]["mode"] == "managed"
+           and len(done["transcript"]) == 2, done)
+    _, ack2 = call6(baseM, "POST", "/api/telephony/vapi/webhook", report_body,
+                    headers={"x-vapi-secret": "a6-webhook-secret"})
+    _, callsM3 = call6(baseM, "GET", f"/api/campaigns/{cidM}/calls", token=tokenM)
+    done2 = next(c for c in callsM3["calls"] if c["session_id"] == wb_session)
+    check6("duplicate webhook is a no-op — still exactly the stored result",
+           ack2["created"] is False and done2["duration_s"] == 47
+           and done2["disposition"] == "RPC_CONFIRMED", ack2)
+    hi_session = sess_by_lead["G. Nath"]["session_id"]
+    report2 = {"message": {
+        "type": "end-of-call-report", "endedReason": "customer-did-not-answer",
+        "startedAt": "2026-10-23T10:05:00.000Z", "endedAt": "2026-10-23T10:05:30.000Z",
+        "call": {"id": fake_id_by_session[hi_session]},  # no metadata: bind by provider call id
+        "analysis": {"structuredData": {}}, "summary": "", "artifact": {},
+        "costBreakdown": {"total": 0.02},
+    }}
+    _, ack3 = call6(baseM, "POST", "/api/telephony/vapi/webhook", report2,
+                    headers={"x-vapi-secret": "a6-webhook-secret"})
+    _, callsM4 = call6(baseM, "GET", f"/api/campaigns/{cidM}/calls", token=tokenM)
+    hi_done = next(c for c in callsM4["calls"] if c["session_id"] == hi_session)
+    check6("webhook binds by provider call id when metadata is absent; no-answer maps to NO_ANSWER",
+           ack3["created"] is True and hi_done["final_state"] == "NO_ANSWER"
+           and hi_done["end_reason"] == "no_answer", hi_done)
+
+    print("── A6: agent voice gender picks the profile's male voice ──")
+    _, male_agent = call6(baseM, "POST", "/api/agents", {
+        "name": "A6 Male Voice Agent", "voice_gender": "male",
+        "prompt": rpiM["prompt"], "language_rule": rpiM["language_rule"],
+        "captured_fields": rpiM["captured_fields"],
+    }, token=tokenM, expect=201)
+    check6("agent stores voice_gender = male", male_agent["voice_gender"] == "male", male_agent)
+    before = len([r for r in FAKE["requests"] if r["path"] == "/call/phone"])
+    cidG = campaign6(baseM, tokenM, male_agent["agent_id"], "A6 — Male Voice Batch",
+                     "managed",
+                     "callee_name,phone_number,bank_name,state\nH. Pal,9300000003,Tata Capital,West Bengal\n")
+    call6(baseM, "POST", f"/api/campaigns/{cidG}/dispatch", token=tokenM)
+    new_reqs = [r for r in FAKE["requests"] if r["path"] == "/call/phone"][before:]
+    gp = json.loads(new_reqs[0]["body"])
+    check6("male agent + Bengali lead → tenant-edited Bengali MALE voice ID",
+           gp["assistant"]["voice"] == {"provider": "11labs",
+                                        "voiceId": "tenant-bn-male-override",
+                                        "model": "eleven_v3"}, gp["assistant"]["voice"])
+
+    # ── self-hosted mode: Plivo transport skeleton ────────────────────
+    print("── A6: self-hosted dispatch places Plivo calls (fake provider) ──")
+    baseS = start_app6(18102, "selfhosted", {
+        "TELEPHONY_MODE": "self_hosted", "PLIVO_AUTH_ID": "MAFAKEID",
+        "PLIVO_AUTH_TOKEN": "fake-plivo-token", "SARVAM_API_KEY": "sk-fake-sarvam",
+    })
+    tokenS = login6(baseS)
+    _, agentsS = call6(baseS, "GET", "/api/agents", token=tokenS)
+    cidS = campaign6(baseS, tokenS, agentsS[0]["agent_id"], "A6 — Self-hosted Batch",
+                     "self_hosted")
+    _, repS = call6(baseS, "POST", f"/api/campaigns/{cidS}/dispatch", token=tokenS)
+    check6("dispatch routes to the Plivo transport and PLACES calls",
+           repS["transport"] == "self_hosted" and repS["stub"] is False
+           and repS["created"] == 2 and repS["placed"] == 2 and repS["finalized"] == 0, repS)
+    preqs = [r for r in FAKE["requests"] if r["path"].endswith("/Call/")]
+    check6("fake Plivo received exactly 2 create-call requests", len(preqs) == 2, len(preqs))
+    _, callsS = call6(baseS, "GET", f"/api/campaigns/{cidS}/calls", token=tokenS)
+    sessS = {c["to_number"]: c for c in callsS["calls"]}
+    forms = {}
+    for r in preqs:
+        f = {k: v[0] for k, v in urllib.parse.parse_qs(r["body"]).items()}
+        forms[f["to"]] = (f, r["headers"].get("Authorization"))
+    f1, auth1 = forms["9300000001"]
+    s1 = sessS["9300000001"]
+    check6("create-call: answer + status URLs bind the session; recording on; Plivo basic auth",
+           f1["answer_url"] == f"{baseS}/api/telephony/plivo/answer/{s1['session_id']}"
+           and f1["status_callback"].endswith(f"/status/{s1['session_id']}")
+           and f1["record"] == "true"
+           and auth1 == "Basic " + __import__("base64").b64encode(b"MAFAKEID:fake-plivo-token").decode(),
+           f1)
+    check6("placed Plivo sessions sit in DIALING under the self_hosted transport",
+           all(c["state"] == "DIALING" and c["transport"] == "self_hosted"
+               for c in callsS["calls"]), callsS)
+
+    print("── A6: Plivo answer XML opens the bidirectional stream ──")
+    _st, xml_text = call6(baseS, "GET", f"/api/telephony/plivo/answer/{s1['session_id']}")
+    import xml.etree.ElementTree as _ET
+    root = _ET.fromstring(xml_text)
+    stream_el = root.find("Stream")
+    param = stream_el.find("Parameter")
+    ws_url = stream_el.text.strip()
+    check6("answer XML: <Stream bidirectional> with the session-bound wss/ws URL + Parameter",
+           root.tag == "Response" and stream_el is not None
+           and stream_el.attrib.get("bidirectional") == "true"
+           and ws_url == f"ws://127.0.0.1:18102/api/telephony/plivo/stream/{s1['session_id']}"
+           and param is not None and param.get("name") == "session_id"
+           and param.get("value") == s1["session_id"], xml_text[:160])
+    call6(baseS, "GET", "/api/telephony/plivo/answer/ses_missing", expect=404)
+
+    print("── A6: placeholder stream finalizes through the same path (A7 seam) ──")
+    try:
+        from websockets.sync.client import connect as _ws_connect
+    except Exception:
+        _ws_connect = None
+    check6("websockets client available for the stream test", _ws_connect is not None)
+    if _ws_connect is not None:
+        with _ws_connect(ws_url) as ws:
+            ws.send(json.dumps({"event": "start", "start": {
+                "streamId": "str-fake-1", "callId": "call-fake-1",
+                "customParameters": {"session_id": s1["session_id"]}}}))
+            ws.send(json.dumps({"event": "media", "media": {"payload": "AAAA"}}))
+            ws.send(json.dumps({"event": "stop"}))
+        doneS = None
+        for _ in range(20):
+            _s2, callsS2 = call6(baseS, "GET", f"/api/campaigns/{cidS}/calls", token=tokenS)
+            doneS = next(c for c in callsS2["calls"] if c["session_id"] == s1["session_id"])
+            if doneS["final_state"]:
+                break
+            time.sleep(0.25)
+        check6("stream close finalized the attempt exactly once (spike-labelled, no fake conversation)",
+               doneS["final_state"] == "COMPLETED" and doneS["transport"] == "self_hosted"
+               and "SELF-HOSTED SPIKE" in doneS["summary"] and doneS["disposition"] == "",
+               doneS)
+    s2 = sessS["9300000002"]
+    call6(baseS, "POST", f"/api/telephony/plivo/status/{s2['session_id']}",
+          form={"CallStatus": "no-answer", "CallUUID": "uuid-fake-2", "Duration": "0"})
+    _, callsS3 = call6(baseS, "GET", f"/api/campaigns/{cidS}/calls", token=tokenS)
+    doneS2 = next(c for c in callsS3["calls"] if c["session_id"] == s2["session_id"])
+    check6("terminal status callback finalizes a never-streamed call (NO_ANSWER)",
+           doneS2["final_state"] == "NO_ANSWER" and doneS2["end_reason"] == "no_answer", doneS2)
+    call6(baseS, "POST", f"/api/telephony/plivo/status/{s2['session_id']}",
+          form={"CallStatus": "completed", "CallUUID": "uuid-fake-2", "Duration": "31"})
+    _, callsS4 = call6(baseS, "GET", f"/api/campaigns/{cidS}/calls", token=tokenS)
+    doneS2b = next(c for c in callsS4["calls"] if c["session_id"] == s2["session_id"])
+    check6("a second terminal callback cannot rewrite the stored result (idempotent)",
+           doneS2b["final_state"] == "NO_ANSWER" and doneS2b["duration_s"] == 0, doneS2b)
+    call6(baseS, "POST", f"/api/telephony/plivo/status/{s2['session_id']}",
+          form={"CallStatus": "completed"},
+          headers={"X-Plivo-Signature-V2": "bogus-signature"}, expect=403)
+    check6("status callback with a bad Plivo signature is rejected (403)", True)
+
+    # ── honesty gates ─────────────────────────────────────────────────
+    print("── A6: honesty gates — stub mode and mode mismatch never go real ──")
+    fake_before = len(FAKE["requests"])
+    baseG = start_app6(18103, "gate-stub", {
+        "TELEPHONY_MODE": "stub", "VAPI_API_KEY": "sk-fake-managed",
+        "PLIVO_AUTH_ID": "MAFAKEID", "PLIVO_AUTH_TOKEN": "fake-plivo-token",
+        "SARVAM_API_KEY": "sk-fake-sarvam",
+    })
+    tokenG = login6(baseG)
+    _, agentsG = call6(baseG, "GET", "/api/agents", token=tokenG)
+    cidGate = campaign6(baseG, tokenG, agentsG[0]["agent_id"], "A6 — Stub Gate", "managed")
+    _, repGate = call6(baseG, "POST", f"/api/campaigns/{cidGate}/dispatch", token=tokenG)
+    check6("TELEPHONY_MODE=stub forces the stub even with every key configured",
+           repGate["transport"] == "stub" and repGate["stub"] is True
+           and repGate["finalized"] == 2 and repGate["placed"] == 0, repGate)
+    check6("the stub gate made NO provider calls at all",
+           len(FAKE["requests"]) == fake_before, len(FAKE["requests"]) - fake_before)
+
+    baseX = start_app6(18104, "gate-mismatch", {
+        "TELEPHONY_MODE": "managed", "VAPI_API_KEY": "sk-fake-managed",
+        "PLIVO_AUTH_ID": "MAFAKEID", "PLIVO_AUTH_TOKEN": "fake-plivo-token",
+        "SARVAM_API_KEY": "sk-fake-sarvam",
+    })
+    tokenX = login6(baseX)
+    _, agentsX = call6(baseX, "GET", "/api/agents", token=tokenX)
+    cidX = campaign6(baseX, tokenX, agentsX[0]["agent_id"], "A6 — Mode Mismatch",
+                     "self_hosted")
+    _, repX = call6(baseX, "POST", f"/api/campaigns/{cidX}/dispatch", token=tokenX)
+    check6("mode mismatch (managed platform, self-hosted campaign, Plivo ready) still runs the stub",
+           repX["transport"] == "stub" and repX["provider_ready"] is True
+           and repX["finalized"] == 2 and repX["placed"] == 0, repX)
+finally:
+    for _p in _procs6:
+        _p.terminate()
+    for _p in _procs6:
+        try:
+            _p.wait(timeout=5)
+        except Exception:
+            _p.kill()
+    _fake_server.shutdown()
 
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

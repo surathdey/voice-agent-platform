@@ -13,19 +13,26 @@ Design anchors:
   no-op and returns the existing result.
 - Mode routing happens HERE, at the dispatch boundary: the campaign's
   provider_mode is resolved through A4's get_provider_config(). A real
-  transport is used only when the tenant's provider for that mode is
-  configured AND the global TELEPHONY_MODE is not "stub" AND a transport
-  for the mode is registered. A5 registers exactly ONE transport — the
-  stub — so every dispatch in this chunk runs simulated, and says so:
-  results are stamped cost_breakdown.mode = "stub" and sessions carry a
-  stub provider_call_id. Nothing here ever calls a real provider API.
+  transport is used only when the global TELEPHONY_MODE equals the
+  campaign's mode AND the tenant's provider for that mode is ready AND a
+  transport for the mode is registered. With TELEPHONY_MODE=stub (the
+  default) every dispatch runs simulated and says so: results are
+  stamped cost_breakdown.mode = "stub" and sessions carry a stub
+  provider_call_id. Nothing is ever disguised as a real call.
+- A6 registers the real transports (app.transports): Vapi (managed) and
+  Plivo (self_hosted). A real transport's run() PLACES the call and
+  returns None — the attempt stays in flight (DIALING) and its §8.2
+  result lands later through finalize_attempt, delivered by the Vapi
+  end-of-call webhook or the Plivo stream / status callbacks
+  (app.routers.telephony). The stub still completes synchronously
+  through the same finalize path.
 
 The dispatcher admits attempts per the campaign's schedule (calling
 window — evaluated in UTC in this skeleton; market-local windows are an
 A10 refinement — and daily cap) and processes them through a worker loop
-in batches of the tenant's concurrency_limit. In A5 the worker runs
+in batches of the tenant's concurrency_limit. The worker runs
 synchronously inside the dispatch call, behind this service boundary, so
-A6+ can move it to a background loop without changing the API.
+later chunks can move it to a background loop without changing the API.
 """
 import hashlib
 import re
@@ -173,23 +180,35 @@ class StubTransport:
         }
 
 
-# Transports registered per mode. A5 ships the stub only; A6+ registers
-# the real managed / self-hosted transports here and the routing below
-# picks them up unchanged.
+# Transports registered per mode. The stub is the fallback, not a
+# registry entry: resolve_transport() returns it whenever a real
+# transport may not run. A6 registers the real Vapi (managed) and Plivo
+# (self_hosted) transports from app.transports.
 TRANSPORTS: dict[str, object] = {}
+
+
+def _register_real_transports() -> None:
+    from .transports import PlivoTransport, VapiTransport
+
+    TRANSPORTS.setdefault("managed", VapiTransport())
+    TRANSPORTS.setdefault("self_hosted", PlivoTransport())
+
+
+_register_real_transports()
 
 
 def resolve_transport(db: Session, tenant_id: str, mode: str):
     """(transport, transport_name, provider_ready) for one dispatch.
 
-    Real transport only when ALL hold: TELEPHONY_MODE is not the stub
-    fallback, A4 says the tenant's provider for this mode is ready, and a
-    transport for the mode is registered. Otherwise the stub — honestly
-    labelled, never disguised as a real call.
+    Real transport only when ALL hold: TELEPHONY_MODE equals the
+    campaign's mode (stub mode, or a mode mismatch, never silently runs
+    a real provider), A4 says the tenant's provider for this mode is
+    ready, and a transport for the mode is registered. Otherwise the
+    stub — honestly labelled, never disguised as a real call.
     """
     cfg = prov.get_provider_config(tenant_id, mode, db=db)
     ready = bool(cfg["ready"])
-    if settings.TELEPHONY_MODE != "stub" and ready and mode in TRANSPORTS:
+    if settings.TELEPHONY_MODE == mode and ready and mode in TRANSPORTS:
         return TRANSPORTS[mode], mode, True
     return StubTransport(), StubTransport.name, ready
 
@@ -335,6 +354,7 @@ class Dispatcher:
             "created": 0,
             "already_dispatched": 0,
             "finalized": 0,
+            "placed": 0,
             "message": "",
         }
 
@@ -403,7 +423,11 @@ class Dispatcher:
             db.refresh(s)
         report["created"] = len(queued)
 
-        # Worker loop — batches of the tenant's concurrency limit.
+        # Worker loop — batches of the tenant's concurrency limit. A
+        # transport returns an outcome dict (finalize now — the stub, or
+        # a placement the provider rejected) or None (a real call was
+        # placed; its result lands later via webhook / stream through
+        # the same finalize path).
         agent = db.get(AgentConfig, campaign.agent_id)
         limit = max(1, (tenant.concurrency_limit if tenant else 20) or 20)
         run_start = datetime.utcnow()
@@ -411,12 +435,21 @@ class Dispatcher:
         for i in range(0, len(queued), limit):
             for session in queued[i:i + limit]:
                 outcome = transport.run(db, session, agent, campaign, seq, run_start)
-                _result, created = finalize_attempt(db, session, outcome)
-                if created:
-                    report["finalized"] += 1
+                if outcome is None:
+                    report["placed"] += 1
+                else:
+                    _result, created = finalize_attempt(db, session, outcome)
+                    if created:
+                        report["finalized"] += 1
                 seq += 1
 
-        if report["created"]:
+        if report["placed"]:
+            report["message"] = (
+                f"Placed {report['placed']} call(s) via the {transport_name} "
+                "transport — results land as the provider reports them "
+                "(end-of-call webhook / media stream), through the same "
+                "finalize path as every other mode.")
+        elif report["created"]:
             report["message"] = (
                 f"Dispatched {report['created']} attempt(s) via the "
                 f"{transport_name} transport"

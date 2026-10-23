@@ -5,11 +5,13 @@ Voice Agent Platform V2 (Greenfield + QGBS MVP)*. Agents are **data, not
 code**: each agent is one prompt plus structured voice/model/language
 configuration, run in campaigns against lead lists.
 
-**This build = Phase A, chunks 1–4: A1 (tenancy + core data model), A2
-(Agent Config Studio), A3 (Campaigns & Leads), A4 (Provider Settings) and
-A5 (Orchestrator skeleton — dispatch + stub transport + §8.2 results).**
+**This build = Phase A, chunks 1–5: A1 (tenancy + core data model), A2
+(Agent Config Studio), A3 (Campaigns & Leads), A4 (Provider Settings),
+A5 (Orchestrator skeleton — dispatch + stub transport + §8.2 results) and
+A6 (Telephony spike — real Vapi + Plivo transports behind the same
+boundary, per-language Vapi voice profiles).**
 See `BUILD-LOG.md` for what is verified and what comes next
-(A6: the first real telephony transport).
+(A7: Sarvam STT inside the media stream).
 
 ## Run it (Docker — the owner's route)
 
@@ -47,7 +49,7 @@ cd frontend && npm install && npm run dev   # http://localhost:5173, proxies /ap
 - [ ] `GET /api/health` returns `telephony_mode: "stub"`.
 - [ ] Create a second tenant (`POST /api/tenants`), log in as its admin:
       it sees **zero** agents, and QGBS agent URLs return 404
-      (run `python3 scripts/smoke_test.py` — 102 checks automate all of this).
+      (run `backend/.venv/bin/python scripts/smoke_test.py` — 183 checks automate all of this).
 
 **A2 — Agent Config Studio**
 - [ ] Agents library matches the wireframe layout: cards with LLM, STT/TTS,
@@ -105,6 +107,29 @@ cd frontend && npm install && npm run dev   # http://localhost:5173, proxies /ap
 - [ ] Admission honours the schedule: outside the calling window nothing
       is admitted, and the daily cap admits only that many per day.
 
+**A6 — Telephony spike (real transports, voice profiles)**
+- [ ] With `TELEPHONY_MODE=stub` (the default), dispatch never touches a
+      provider — even with every key configured. A real transport runs
+      only when `TELEPHONY_MODE` equals the campaign's mode **and** the
+      tenant's provider for that mode is configured.
+- [ ] **Settings → Providers → Vapi** shows a Voice profiles section
+      (English / Hindi / Bengali: provider, TTS model, female + male
+      voice IDs) pre-filled with the owner's verified RPI voice setup
+      (11labs; English eleven_turbo_v2_5, Hindi + Bengali eleven_v3).
+      Edit one — the dispatch payload for that language uses your value.
+- [ ] In the Agent studio, **Voice gender** (female / male) selects
+      which of the profile's voice IDs a managed call uses; the
+      assistant (LLM) model is the separate Vapi **Default model**.
+- [ ] Managed dispatch (`TELEPHONY_MODE=managed` + a Vapi key) *places*
+      calls — sessions sit in DIALING on the Calls page and land as
+      §8.2 results when Vapi's end-of-call webhook arrives (set
+      `WEBHOOK_SECRET` + a public `PUBLIC_BASE_URL` for a live run).
+- [ ] Self-hosted dispatch (`TELEPHONY_MODE=self_hosted` + Plivo +
+      Sarvam) places Plivo calls whose answer URL opens the media
+      stream; in this build the stream speaks nothing yet (the Sarvam
+      brain is A7/A8) and finalizes with an honestly labelled spike
+      result.
+
 ## Design decisions that override the design doc
 
 1. **Single prompt (owner, 2026-10-23).** The design doc's three-layer prompt
@@ -127,10 +152,13 @@ backend/    FastAPI app (app/models.py = all six design entities + prompt_versio
             views, credential resolution, Test connection;
             app/orchestrator.py = dispatch service, stub transport, the one
             idempotent finalize path for §8.2 results;
-            app/routers/ = auth, tenants, agents, campaigns, settings, calls;
-            migrations/001–003 = DDL of record)
+            app/transports.py = the real transports (A6): Vapi start-call +
+            report mapping, Plivo create-call + answer XML + spike outcomes;
+            app/routers/ = auth, tenants, agents, campaigns, settings, calls,
+            telephony (provider webhook / answer / stream routes);
+            migrations/001–004 = DDL of record)
 frontend/   React (Vite) console — theme tokens in src/theme.css (wireframe design language);
             pages: Agents, AgentEditor, Campaigns, CampaignWizard, CampaignDetail, LeadsUpload, Settings, Calls
-scripts/    smoke_test.py — automated acceptance checks (A1 + A2 + A3 + A4 + A5)
+scripts/    smoke_test.py — automated acceptance checks (A1 + A2 + A3 + A4 + A5 + A6)
 docker-compose.yml   db (PostgreSQL 16) + backend + frontend (nginx)
 ```
