@@ -1328,3 +1328,6 @@ Docker is not installed on the build VM, so the stack was verified
 purpose / audience per the §15 rules), CSV lead upload with column mapping to
 lead + `agent_fields`, schedule/retry/routing rules, and the 5-step campaign
 wizard UI in the same theme tokens.
+
+## Fix — Browser Test stream could not connect in the Docker deployment (2026-10-23)
+Found by the owner's first real Docker test session: every screen worked (login, campaigns, dispatch), but Browser Test showed "The test stream connection failed." Root cause: the WebSocket is opened against the page origin, which in Docker is nginx — and frontend/nginx.conf proxied /api/ without the WebSocket upgrade headers (proxy_http_version 1.1 + Upgrade + Connection "upgrade"), so the handshake never reached FastAPI. Plain REST was unaffected, which is why only this one feature failed. Every prior verification exercised the WS endpoint directly (test client) or not through nginx at all; the served-through-nginx path was untested — the same class of gap as the migration fix earlier today. Fix: the three upgrade headers + proxy_read_timeout 3600s in nginx.conf, and ws:true on the vite dev proxy for parity. Verified here by config inspection + full smoke suite unchanged (the endpoint itself was never broken); the through-nginx path is verified by the owner's re-run after pull.
