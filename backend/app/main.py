@@ -6,8 +6,11 @@ with column mapping, schedule/retry config; dispatch engine is A5/A10).
 Chunk 3: A4 (per-tenant provider settings + secret store, masked reads,
 Test connection per provider; campaigns are flagged when their mode has no
 working provider — they run in stub mode).
-Telephony is NOT wired yet (A5+); the app boots and is testable with
-TELEPHONY_MODE=stub and no provider keys.
+Chunk 4: A5 (orchestrator skeleton — dispatch service with schedule /
+concurrency admission, deterministic attempt ids, the stub transport, and
+the single idempotent finalize path every mode's §8.2 result lands on;
+calls list + §8.2 result receiver). NO real provider calls yet (A6+):
+every dispatch runs through the stub transport and is labelled as such.
 """
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,9 +19,9 @@ from . import providers as prov
 from . import seed as seed_module
 from .config import settings
 from .db import SessionLocal, init_db
-from .routers import agents, auth, campaigns, settings as settings_router, tenants
+from .routers import agents, auth, calls, campaigns, settings as settings_router, tenants
 
-app = FastAPI(title="Voice Agent Platform", version="0.3.0")
+app = FastAPI(title="Voice Agent Platform", version="0.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -61,3 +64,4 @@ app.include_router(tenants.router)
 app.include_router(agents.router)
 app.include_router(campaigns.router)
 app.include_router(settings_router.router)
+app.include_router(calls.router)

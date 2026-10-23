@@ -5,11 +5,12 @@ import Campaigns from './pages/Campaigns'
 import CampaignWizard from './pages/CampaignWizard'
 import CampaignDetail from './pages/CampaignDetail'
 import Settings from './pages/Settings'
+import Calls from './pages/Calls'
 import { api, clearSession, getUser, setSession } from './api'
 
 const NAV = ['Dashboard', 'Campaigns', 'Agents', 'Calls', 'Journey', 'Human Queue', 'Settings']
-const ENABLED = ['Campaigns', 'Agents', 'Settings'] // later chunks enable the rest
-const NAV_VIEW = { Campaigns: 'campaigns', Agents: 'agents', Settings: 'settings' }
+const ENABLED = ['Campaigns', 'Agents', 'Calls', 'Settings'] // later chunks enable the rest
+const NAV_VIEW = { Campaigns: 'campaigns', Agents: 'agents', Calls: 'calls', Settings: 'settings' }
 
 export default function App() {
   const [user, setUser] = useState(getUser())
@@ -19,7 +20,8 @@ export default function App() {
 
   const activeNav = view.name === 'editor' ? 'Agents'
     : ['campaigns', 'wizard', 'campaign'].includes(view.name) ? 'Campaigns'
-    : view.name === 'settings' ? 'Settings' : 'Agents'
+    : view.name === 'settings' ? 'Settings'
+    : view.name === 'calls' ? 'Calls' : 'Agents'
 
   return (
     <div className="shell">
@@ -68,6 +70,7 @@ export default function App() {
           <CampaignDetail campaignId={view.id} onBack={() => setView({ name: 'campaigns' })} />
         )}
         {view.name === 'settings' && <Settings />}
+        {view.name === 'calls' && <Calls />}
       </main>
     </div>
   )

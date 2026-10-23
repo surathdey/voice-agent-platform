@@ -1,5 +1,113 @@
 # BUILD LOG
 
+## Chunk 4 — Phase A: A5 Orchestrator Skeleton (2026-10-23)
+
+### Built
+- **Dispatch service** (`backend/app/orchestrator.py`) — the service
+  boundary the API calls and A6+ extends. For an ACTIVE campaign it walks
+  the campaign's pending leads (`status == "pending"`, under the retry
+  cap) and creates one `CallSession` per attempt, keyed by a
+  **deterministic attempt_id** (`att_<campaign>_<lead>_<n>` — the §8.1
+  idempotency key): re-dispatching the same attempt can never create a
+  second session (the existing lead-status flow already advances leads to
+  `attempted`; a pre-check on the unique `(tenant_id, attempt_id)` covers
+  the rest). Admission honours the campaign schedule: **calling window**
+  (outside → zero admitted, report says why) and **daily cap** (sessions
+  already started today count against it); a worker loop then drains the
+  admitted queue in batches of the tenant's `concurrency_limit`. In A5
+  the worker runs synchronously inside the dispatch call, behind this
+  boundary, so A6+ can move it to a background loop unchanged.
+- **Mode routing at the dispatch boundary** via A4's
+  `get_provider_config(tenant_id, mode)`: a real transport would be used
+  only when the provider is ready AND `TELEPHONY_MODE != stub` AND a
+  transport is registered. A5 registers exactly ONE transport — the
+  **stub** — so every dispatch is simulated and *labelled* simulated:
+  sessions get `provider_call_id = stub_<session>`, results are stamped
+  `cost_breakdown.mode = "stub"`, and the dispatch report carries
+  `transport` / `stub` / `provider_ready` so the UI never disguises a
+  stub run as a real one. **No provider API is called anywhere in A5.**
+- **Stub transport** simulates the full lifecycle (QUEUED → DIALING →
+  IN_CALL → COMPLETED) and produces a §8.2 outcome: the disposition is
+  picked **round-robin across the bucket set parsed from the agent's own
+  single prompt** (its DISPOSITIONS section — the single source of truth;
+  rotation seeds from the campaign's existing result count so runs
+  continue where they left off), duration is a deterministic hash of the
+  attempt_id (25–124 s), captured fields are typed placeholders from the
+  agent's schema (the first bucket = the confirmed outcome gets
+  `true` for booleans), the transcript is a two-turn placeholder with
+  every line marked `[STUB]`, and `cost_breakdown` carries the contract
+  fields with stub zeros, `currency: INR`, `mode: "stub"`,
+  `simulated: true`.
+- **One finalize path for both modes** — `finalize_attempt()` is the only
+  writer of terminal state: it stamps the session (state, end reason,
+  timestamps, transcript, recording), creates the session's ONE
+  `CallResult`, and advances the lead (attempt count, `attempted` /
+  `exhausted`). It is **idempotent**: if a result already exists for the
+  session it returns it untouched — no second result, no session
+  mutation, no extra attempt count (the unique constraint on
+  `call_results.session_id` is the race backstop). Managed and
+  self-hosted transports in A6+ plug into this same function.
+- **§8.2 result receiver** (`POST /api/results`) — the idempotent
+  callback the real orchestrator / normalised managed webhook will
+  deliver to: keyed on `session_id` (attempt_id accepted as fallback),
+  tenant-scoped, duplicate deliveries return the stored result with
+  `created: false`.
+- **API + UI:** `POST /api/campaigns/{id}/dispatch` (400 unless the
+  campaign is active — draft / paused / completed refuse, with the reason
+  in the message); `GET /api/campaigns/{id}/calls` (the campaign's calls
+  + attempt **counts by state**); `GET /api/calls` (tenant-wide, optional
+  `?campaign_id=`). Call views are assembled into the §8.2 shape
+  (`CallOut`: session + result merged — contract fields are present even
+  before a result exists; `transport` distinguishes the stub honestly).
+  Campaign page gains a **Dispatch card** with a “Run dispatch (stub)”
+  action (enabled only while active) and state-count pills; a new
+  read-only **Calls page** (nav enabled) lists sessions tenant-wide with
+  state, disposition, duration, mode, transport and cost.
+
+### Verification (native, fresh SQLite DB — same Docker caveat as chunks 1–3)
+- `scripts/smoke_test.py`: **102/102 checks passed** (68 existing + 34 new
+  A5 checks/assert groups): draft campaign dispatch → 400; active
+  self-hosted campaign with 5 RPI-format leads → 5 created, 5 finalized,
+  counts {COMPLETED: 5}, transport `stub` (with `provider_ready: true` —
+  QGBS's A4 test keys are configured, but `TELEPHONY_MODE=stub` still
+  forces the stub, exactly as routed); every call conforms to the §8.2
+  field set incl. cost-breakdown keys; dispositions are exactly the
+  prompt's first five buckets **in prompt order** (RPC_CONFIRMED …
+  CALLBACK_REQUESTED) with `identity_confirmed` true only for
+  RPC_CONFIRMED; re-dispatch creates nothing; a duplicate §8.2 delivery
+  (different disposition/duration) returns `created: false` and leaves
+  the stored result untouched; unknown session → 404; each lead shows
+  exactly one attempt; paused and completed campaigns refuse dispatch;
+  a window 2h in the future admits zero; `daily_cap: 2` admits exactly
+  2 of 3 leads (third stays pending); tenant-wide list totals 7 with the
+  campaign filter working; tenant 2 sees zero calls and gets 404 on
+  QGBS's dispatch / calls / result delivery.
+- Frontend: `vite build` clean (Calls page + dispatch card compiled in).
+
+### Known limitations (deliberate, for this chunk)
+- The worker loop is synchronous inside the dispatch request — fine for
+  the stub (milliseconds); the async/background worker arrives with the
+  real transports (A6+), behind the same `Dispatcher` boundary.
+- Calling windows are evaluated in **UTC**; the design's times are
+  market-local — localising (tenant market / campaign timezone) is an
+  A10 refinement, and the dispatch message says “(UTC in this build)”.
+- The stub's DIALING state collapses into IN_CALL (only QUEUED, IN_CALL
+  and the terminal state persist observably); real transports will hold
+  each state as provider callbacks arrive.
+- `POST /api/results` currently authenticates with the operator JWT; the
+  §8.1 shared-secret header (`X-Orchestrator-Key`) for service-to-service
+  delivery lands with the real orchestrator in A6.
+- Retries of no-answer/busy outcomes (re-queueing a lead for its next
+  attempt number) belong to the outcome-routing chunk (A10); A5
+  finalizes each attempt exactly once and stops.
+
+### Next step
+**A6 — Telephony spike:** the first real transport behind the dispatch
+boundary — Plivo outbound call + answer/stream wiring in self-hosted
+mode (and/or the Vapi start-call in managed mode), delivering its result
+through the same `finalize_attempt` path; gated on real provider keys
+from A4 settings, stub remains the fallback everywhere else.
+
 ## Chunk 3 — Phase A: A4 Provider Settings (2026-10-23)
 
 ### Built

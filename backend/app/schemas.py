@@ -232,3 +232,80 @@ class ProviderTestOut(BaseModel):
     checked_at: str
     latency_ms: int = 0
     persisted: bool = False
+
+
+# ── Dispatch & calls (A5) ─────────────────────────────────────────────────
+# CallOut is the §8.2 CallResult contract, assembled from the session (its
+# state, timestamps, transcript, recording) + the terminal result (its
+# disposition, captured fields, cost). Fields not yet known (no result
+# yet) serialise as None / defaults — the shape never changes between
+# modes, which is the point of the contract.
+
+class CallOut(BaseModel):
+    session_id: str
+    attempt_id: str
+    campaign_id: str
+    campaign_name: str = ""
+    lead_id: str
+    lead_name: str = ""
+    to_number: str = ""
+    provider_mode: str                   # managed | self_hosted (the campaign's mode)
+    transport: str = "stub"              # the transport that actually ran it (A5: stub)
+    state: str                           # QUEUED | DIALING | IN_CALL | terminal state
+    final_state: Optional[str] = None    # §8.2: COMPLETED | NO_ANSWER | BUSY | FAILED | VOICEMAIL
+    end_reason: str = ""
+    disposition: str = ""
+    confidence: float = 0.0
+    summary: str = ""
+    captured_fields: dict = Field(default_factory=dict)
+    duration_s: int = 0
+    recording_url: str = ""
+    transcript: List[dict] = []
+    cost_breakdown: dict = Field(default_factory=dict)
+    started_at: Optional[str] = None
+    answered_at: Optional[str] = None
+    ended_at: Optional[str] = None
+
+
+class CallListOut(BaseModel):
+    total: int
+    counts_by_state: dict = Field(default_factory=dict)
+    calls: List[CallOut]
+
+
+class DispatchOut(BaseModel):
+    campaign_id: str
+    transport: str                       # stub in A5
+    stub: bool
+    provider_mode: str
+    provider_ready: bool                 # A4: is a real provider configured?
+    outside_window: bool = False
+    created: int = 0                     # new attempts admitted by this run
+    already_dispatched: int = 0          # leads skipped: attempt already exists
+    finalized: int = 0                   # results written by this run
+    counts_by_state: dict = Field(default_factory=dict)
+    message: str = ""
+
+
+class ResultIn(BaseModel):
+    """The §8.2 result payload, delivered to the idempotent receiver."""
+    session_id: str = ""
+    attempt_id: str = ""
+    provider_mode: str = ""
+    final_state: str = "COMPLETED"
+    end_reason: str = ""
+    disposition: str = ""
+    confidence: float = 0.0
+    summary: str = ""
+    captured_fields: dict = Field(default_factory=dict)
+    duration_s: int = 0
+    recording_url: str = ""
+    transcript: List[dict] = []
+    cost_breakdown: dict = Field(default_factory=dict)
+
+
+class ResultOut(BaseModel):
+    session_id: str
+    attempt_id: str = ""
+    created: bool                        # False = duplicate delivery, stored result returned
+    call: CallOut

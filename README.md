@@ -5,10 +5,11 @@ Voice Agent Platform V2 (Greenfield + QGBS MVP)*. Agents are **data, not
 code**: each agent is one prompt plus structured voice/model/language
 configuration, run in campaigns against lead lists.
 
-**This build = Phase A, chunks 1–3: A1 (tenancy + core data model), A2
-(Agent Config Studio), A3 (Campaigns & Leads) and A4 (Provider Settings).**
+**This build = Phase A, chunks 1–4: A1 (tenancy + core data model), A2
+(Agent Config Studio), A3 (Campaigns & Leads), A4 (Provider Settings) and
+A5 (Orchestrator skeleton — dispatch + stub transport + §8.2 results).**
 See `BUILD-LOG.md` for what is verified and what comes next
-(A5: orchestrator skeleton).
+(A6: the first real telephony transport).
 
 ## Run it (Docker — the owner's route)
 
@@ -46,7 +47,7 @@ cd frontend && npm install && npm run dev   # http://localhost:5173, proxies /ap
 - [ ] `GET /api/health` returns `telephony_mode: "stub"`.
 - [ ] Create a second tenant (`POST /api/tenants`), log in as its admin:
       it sees **zero** agents, and QGBS agent URLs return 404
-      (run `python3 scripts/smoke_test.py` — 68 checks automate all of this).
+      (run `python3 scripts/smoke_test.py` — 102 checks automate all of this).
 
 **A2 — Agent Config Studio**
 - [ ] Agents library matches the wireframe layout: cards with LLM, STT/TTS,
@@ -88,6 +89,22 @@ cd frontend && npm install && npm run dev   # http://localhost:5173, proxies /ap
       page carries the stub-mode flag naming what's missing; configuring
       the providers (Plivo + Sarvam, or Vapi) clears it.
 
+**A5 — Dispatch & Calls (orchestrator skeleton, stub transport)**
+- [ ] On an **active** campaign with leads, “Run dispatch (stub)” admits
+      one attempt per pending lead and reports how many were created and
+      finalized; on a draft / paused / completed campaign it refuses.
+- [ ] The campaign page shows attempt counts by state; the **Calls** page
+      lists every session with state, disposition, duration, mode and a
+      gold **stub** transport marker — nothing pretends a real call ran.
+- [ ] Dispositions come from the **agent's own prompt** (its DISPOSITIONS
+      section), round-robin in prompt order — edit the prompt's buckets
+      and the next dispatch follows the new set.
+- [ ] Running dispatch again creates nothing new; each lead shows exactly
+      one attempt. A duplicate result delivery (`POST /api/results`) is a
+      no-op — exactly one result per session, always.
+- [ ] Admission honours the schedule: outside the calling window nothing
+      is admitted, and the daily cap admits only that many per day.
+
 ## Design decisions that override the design doc
 
 1. **Single prompt (owner, 2026-10-23).** The design doc's three-layer prompt
@@ -108,10 +125,12 @@ cd frontend && npm install && npm run dev   # http://localhost:5173, proxies /ap
 backend/    FastAPI app (app/models.py = all six design entities + prompt_versions
             + provider_settings; app/providers.py = provider registry, masked
             views, credential resolution, Test connection;
-            app/routers/ = auth, tenants, agents, campaigns, settings;
+            app/orchestrator.py = dispatch service, stub transport, the one
+            idempotent finalize path for §8.2 results;
+            app/routers/ = auth, tenants, agents, campaigns, settings, calls;
             migrations/001–003 = DDL of record)
 frontend/   React (Vite) console — theme tokens in src/theme.css (wireframe design language);
-            pages: Agents, AgentEditor, Campaigns, CampaignWizard, CampaignDetail, LeadsUpload, Settings
-scripts/    smoke_test.py — automated acceptance checks (A1 + A2 + A3 + A4)
+            pages: Agents, AgentEditor, Campaigns, CampaignWizard, CampaignDetail, LeadsUpload, Settings, Calls
+scripts/    smoke_test.py — automated acceptance checks (A1 + A2 + A3 + A4 + A5)
 docker-compose.yml   db (PostgreSQL 16) + backend + frontend (nginx)
 ```

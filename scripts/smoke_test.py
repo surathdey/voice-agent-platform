@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke tests for Phase A chunks 1–3 (A1, A2, A3, A4) against a running server.
+"""Smoke tests for Phase A chunks 1–4 (A1–A5) against a running server.
 
 Usage:  python3 scripts/smoke_test.py [base_url]     (default http://localhost:8000)
 Covers: health · login · tenant scoping (A1 acceptance) · agent CRUD ·
@@ -8,7 +8,11 @@ status lifecycle, CSV lead upload with column mapping, product identifiers,
 tenant isolation on campaigns/leads, no from-number in the campaign schema
 (A3) · per-tenant provider settings, secret masking (sentinel keys never
 appear in any response), Test connection stub/failed honesty, campaign
-provider flagging, health per-mode providers (A4).
+provider flagging, health per-mode providers (A4) · dispatch on active
+campaigns only, schedule-window + daily-cap admission, stub transport,
+§8.2 result-contract conformance, deterministic prompt-bucket round-robin,
+exactly-one-result (re-dispatch + duplicate result delivery), tenant
+isolation on dispatch/calls/results (A5).
 
 Run against a FRESH database: like the earlier chunks, the suite seeds its
 own tenants/agents/campaigns/settings and asserts exact fresh-state values.
@@ -388,6 +392,152 @@ assert health2["providers"]["managed"] == {"vapi": False, "twilio": False}, heal
 assert health2["providers"]["self_hosted"] == {"plivo": False, "exotel": False, "sarvam": False}, health2
 assert VAPI_SENTINEL not in json.dumps(health2) and SARVAM_SENTINEL not in json.dumps(health2)
 print("  PASS  health: per-mode booleans from the .env fallback only — no tenant values")
+
+print("── A5: dispatch — active campaign, stub transport ──")
+from datetime import datetime, timedelta  # local: window arithmetic below
+
+A5_CSV = (
+    "callee_name,phone_number,bank_name,state\n"
+    "F. Ali,9200000001,Tata Capital,West Bengal\n"
+    "G. Nath,9200000002,Tata Capital,Bihar\n"
+    "H. Pal,9200000003,HDFC Bank,Odisha\n"
+    "I. Sen,9200000004,Tata Capital,Assam\n"
+    "J. Dey,9200000005,Tata Capital,West Bengal\n"
+)
+A5_MAP = {"callee_name": "name", "phone_number": "phone_number",
+          "bank_name": "bank_name", "state": "state"}
+_, camp5 = call("POST", "/api/campaigns", {
+    "agent_id": rpi["agent_id"], "name": "A5 — Dispatch Batch",
+    "product": "vehicle_loan", "provider_mode": "self_hosted",
+    "schedule": {"window_start": "00:00", "window_end": "23:59", "daily_cap": 2000},
+}, token=token, expect=201)
+cid5 = camp5["campaign_id"]
+call_upload(f"/api/campaigns/{cid5}/leads/upload", A5_CSV, token=token,
+            fields={"mapping": json.dumps(A5_MAP)})
+call("POST", f"/api/campaigns/{cid5}/dispatch", token=token, expect=400)   # draft must not dispatch
+call("POST", f"/api/campaigns/{cid5}/status", {"status": "active"}, token=token)
+_, rep = call("POST", f"/api/campaigns/{cid5}/dispatch", token=token)
+# QGBS has (fake) Plivo+Sarvam keys from the A4 section, so the provider is
+# "ready" — but TELEPHONY_MODE=stub still forces the stub transport, and
+# the report says so. A real transport ships in A6, never silently here.
+assert rep["transport"] == "stub" and rep["stub"] is True, rep
+assert rep["provider_ready"] is True, rep
+assert rep["created"] == 5 and rep["finalized"] == 5, rep
+assert rep["counts_by_state"] == {"COMPLETED": 5}, rep
+assert rep["outside_window"] is False, rep
+print("  PASS  dispatch: 5 attempts admitted, all finalized via the stub transport")
+
+print("── A5: §8.2 result contract conformance ──────")
+_, cl = call("GET", f"/api/campaigns/{cid5}/calls", token=token)
+assert cl["total"] == 5 and cl["counts_by_state"] == {"COMPLETED": 5}, cl
+CONTRACT = {"session_id", "attempt_id", "provider_mode", "final_state",
+            "end_reason", "disposition", "confidence", "summary",
+            "captured_fields", "duration_s", "recording_url", "transcript",
+            "cost_breakdown"}
+RPI_BUCKETS = ["RPC_CONFIRMED", "CPC_CONFIRMED", "FINAL_DENIAL",
+               "FINAL_DENIAL_CLOSING", "CALLBACK_REQUESTED", "HOSTILE",
+               "DECEASED_CASE", "DNC_ESCALATION"]
+got_dispositions = []
+for c in cl["calls"]:
+    assert CONTRACT <= set(c), f"call missing §8.2 fields: {CONTRACT - set(c)}"
+    assert c["final_state"] == "COMPLETED" and c["transport"] == "stub", c
+    assert c["disposition"] in RPI_BUCKETS, c  # from the agent prompt's own set
+    assert c["duration_s"] > 0, c
+    cb = c["cost_breakdown"]
+    assert {"telephony", "stt", "llm", "tts", "total", "currency"} <= set(cb), cb
+    assert cb["total"] == 0 and cb["mode"] == "stub" and cb["simulated"] is True, cb
+    assert c["transcript"] and all({"speaker", "text", "offset_s"} <= set(t)
+                                   for t in c["transcript"]), c
+    assert "[STUB]" in c["summary"], c
+    assert isinstance(c["captured_fields"].get("identity_confirmed"), bool), c
+    got_dispositions.append(c["disposition"])
+# Round-robin across the prompt's bucket set, in prompt order.
+assert got_dispositions == RPI_BUCKETS[:5], got_dispositions
+by_disp = {c["disposition"]: c for c in cl["calls"]}
+assert by_disp["RPC_CONFIRMED"]["captured_fields"]["identity_confirmed"] is True
+assert by_disp["CPC_CONFIRMED"]["captured_fields"]["identity_confirmed"] is False
+attempt_ids = {c["attempt_id"] for c in cl["calls"]}
+assert len(attempt_ids) == 5, attempt_ids  # one §8.1 idempotency key per attempt
+print("  PASS  every call conforms to §8.2; dispositions round-robin the prompt's buckets in order")
+
+print("── A5: exactly one result per attempt ────────")
+_, rep2 = call("POST", f"/api/campaigns/{cid5}/dispatch", token=token)
+assert rep2["created"] == 0 and rep2["finalized"] == 0, rep2  # leads already attempted
+_, cl2 = call("GET", f"/api/campaigns/{cid5}/calls", token=token)
+assert cl2["total"] == 5, cl2  # a duplicate POST creates no second session
+first = cl["calls"][0]
+_, dupres = call("POST", "/api/results", {
+    "session_id": first["session_id"], "attempt_id": first["attempt_id"],
+    "final_state": "COMPLETED", "disposition": "HOSTILE", "duration_s": 999,
+}, token=token)
+assert dupres["created"] is False, dupres  # duplicate delivery is a no-op
+assert dupres["call"]["disposition"] == first["disposition"], dupres  # stored result untouched
+assert dupres["call"]["duration_s"] == first["duration_s"], dupres
+call("POST", "/api/results", {"session_id": "ses_missing"}, token=token, expect=404)
+print("  PASS  re-dispatch and duplicate result delivery never create a second result")
+_, leads5 = call("GET", f"/api/campaigns/{cid5}/leads", token=token)
+assert all(l["attempt_count"] == 1 and l["status"] == "attempted" for l in leads5["leads"]), leads5
+print("  PASS  each lead shows exactly one attempt after dispatch")
+
+print("── A5: paused / completed campaigns do not dispatch ──")
+_, campP = call("POST", "/api/campaigns", {
+    "agent_id": rpi["agent_id"], "name": "A5 — Paused Batch", "provider_mode": "self_hosted",
+}, token=token, expect=201)
+call_upload(f"/api/campaigns/{campP['campaign_id']}/leads/upload", A5_CSV, token=token,
+            fields={"mapping": json.dumps(A5_MAP)})
+call("POST", f"/api/campaigns/{campP['campaign_id']}/status", {"status": "active"}, token=token)
+call("POST", f"/api/campaigns/{campP['campaign_id']}/status", {"status": "paused"}, token=token)
+call("POST", f"/api/campaigns/{campP['campaign_id']}/dispatch", token=token, expect=400)
+call("POST", f"/api/campaigns/{campP['campaign_id']}/status", {"status": "completed"}, token=token)
+call("POST", f"/api/campaigns/{campP['campaign_id']}/dispatch", token=token, expect=400)
+print("  PASS  paused and completed campaigns refuse dispatch")
+
+print("── A5: schedule window + daily cap admission ──")
+_now = datetime.utcnow()
+_win = {"window_start": (_now + timedelta(hours=2)).strftime("%H:%M"),
+        "window_end": (_now + timedelta(hours=3)).strftime("%H:%M"),
+        "daily_cap": 2000}
+_, campW = call("POST", "/api/campaigns", {
+    "agent_id": rpi["agent_id"], "name": "A5 — Outside Window",
+    "provider_mode": "self_hosted", "schedule": _win,
+}, token=token, expect=201)
+call_upload(f"/api/campaigns/{campW['campaign_id']}/leads/upload", A5_CSV, token=token,
+            fields={"mapping": json.dumps(A5_MAP)})
+call("POST", f"/api/campaigns/{campW['campaign_id']}/status", {"status": "active"}, token=token)
+_, repW = call("POST", f"/api/campaigns/{campW['campaign_id']}/dispatch", token=token)
+assert repW["outside_window"] is True and repW["created"] == 0, repW
+_, clW = call("GET", f"/api/campaigns/{campW['campaign_id']}/calls", token=token)
+assert clW["total"] == 0, clW
+print("  PASS  outside the calling window, no attempt is admitted")
+_, campC = call("POST", "/api/campaigns", {
+    "agent_id": rpi["agent_id"], "name": "A5 — Daily Cap 2",
+    "provider_mode": "self_hosted",
+    "schedule": {"window_start": "00:00", "window_end": "23:59", "daily_cap": 2},
+}, token=token, expect=201)
+call_upload(f"/api/campaigns/{campC['campaign_id']}/leads/upload",
+            "callee_name,phone_number,bank_name,state\n"
+            "K. A,9200000011,Tata Capital,Bihar\nL. B,9200000012,Tata Capital,Bihar\n"
+            "M. C,9200000013,Tata Capital,Bihar\n",
+            token=token, fields={"mapping": json.dumps(A5_MAP)})
+call("POST", f"/api/campaigns/{campC['campaign_id']}/status", {"status": "active"}, token=token)
+_, repC = call("POST", f"/api/campaigns/{campC['campaign_id']}/dispatch", token=token)
+assert repC["created"] == 2 and repC["finalized"] == 2, repC
+_, leadsC = call("GET", f"/api/campaigns/{campC['campaign_id']}/leads", token=token)
+assert sum(1 for l in leadsC["leads"] if l["status"] == "attempted") == 2, leadsC
+assert sum(1 for l in leadsC["leads"] if l["status"] == "pending") == 1, leadsC
+print("  PASS  daily cap admits exactly 2 of 3 leads; the third stays pending")
+
+print("── A5: calls list + tenant isolation ───────────")
+_, allc = call("GET", "/api/calls", token=token)
+assert allc["total"] == 7, allc  # 5 (dispatch batch) + 2 (capped batch)
+_, filt = call("GET", f"/api/calls?campaign_id={cid5}", token=token)
+assert filt["total"] == 5 and all(c["campaign_id"] == cid5 for c in filt["calls"]), filt
+_, allc2 = call("GET", "/api/calls", token=token2)
+assert allc2["total"] == 0, allc2  # tenant 2 has dispatched nothing
+call("GET", f"/api/campaigns/{cid5}/calls", token=token2, expect=404)
+call("POST", f"/api/campaigns/{cid5}/dispatch", token=token2, expect=404)
+call("POST", "/api/results", {"session_id": first["session_id"]}, token=token2, expect=404)
+print("  PASS  tenant-wide list + filter work; tenant 2 sees none of QGBS's calls")
 
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

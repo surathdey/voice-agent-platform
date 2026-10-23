@@ -4,14 +4,18 @@ import LeadsUpload from './LeadsUpload'
 
 /* Campaign page — opened from the Campaigns list. Shows the campaign's
    business settings, its schedule/retry configuration, and ITS leads only.
-   (Live calling outcomes, cost and the results spreadsheet arrive with the
-   dispatch/results chunk — A10.) */
+   A5 adds dispatch: an active campaign can run the dispatcher (stub
+   transport in this build — simulated calls, real result records) and
+   shows attempt counts by state. The results spreadsheet export and the
+   rich running-campaign dashboard arrive with A10. */
 const STATUS_PILL = { draft: 'navy', active: 'teal', paused: 'gold', completed: 'slate' }
 const STATUS_LABEL = { draft: 'Draft', active: 'Running', paused: 'Paused', completed: 'Completed' }
 
 export default function CampaignDetail({ campaignId, onBack }) {
   const [campaign, setCampaign] = useState(null)
   const [leads, setLeads] = useState(null)
+  const [calls, setCalls] = useState(null)
+  const [dispatchMsg, setDispatchMsg] = useState('')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
   const [showUpload, setShowUpload] = useState(false)
@@ -22,9 +26,20 @@ export default function CampaignDetail({ campaignId, onBack }) {
       setCampaign(c)
       const l = await api(`/api/campaigns/${campaignId}/leads`)
       setLeads(l)
+      const cl = await api(`/api/campaigns/${campaignId}/calls`)
+      setCalls(cl)
     } catch (e) { setError(e.message) }
   }
   useEffect(() => { load() }, [campaignId])
+
+  async function runDispatch() {
+    setBusy(true); setError(''); setDispatchMsg('')
+    try {
+      const r = await api(`/api/campaigns/${campaignId}/dispatch`, { method: 'POST' })
+      setDispatchMsg(r.message || `Dispatched ${r.created} attempt(s).`)
+      await load()
+    } catch (e) { setError(e.message) } finally { setBusy(false) }
+  }
 
   async function setStatus(s) {
     setBusy(true); setError('')
@@ -80,6 +95,37 @@ export default function CampaignDetail({ campaignId, onBack }) {
 
       <div style={{ display: 'flex', gap: 12, marginBottom: 18 }}>
         <button className="btn secondary" onClick={onBack}>← All campaigns</button>
+      </div>
+
+      <div className="card" style={{ marginBottom: 20 }}>
+        <h3 className="section-title">Dispatch</h3>
+        <div style={{ display: 'flex', gap: 14, alignItems: 'center', flexWrap: 'wrap' }}>
+          <button className="btn" disabled={busy || campaign.status !== 'active'}
+            onClick={runDispatch}>
+            Run dispatch (stub)
+          </button>
+          {campaign.status !== 'active' && (
+            <span style={{ color: 'var(--slate)', fontSize: 13.5 }}>
+              Dispatch runs on an active campaign — launch it first.
+            </span>
+          )}
+          {calls && calls.total > 0 && (
+            <span style={{ display: 'inline-flex', gap: 8, flexWrap: 'wrap' }}>
+              {Object.entries(calls.counts_by_state || {}).map(([state, n]) => (
+                <span key={state} className="pill slate">{state} · {n}</span>
+              ))}
+            </span>
+          )}
+          {calls && calls.total === 0 && campaign.status === 'active' && (
+            <span style={{ color: 'var(--slate)', fontSize: 13.5 }}>No attempts yet.</span>
+          )}
+        </div>
+        {dispatchMsg && <p style={{ marginTop: 10, marginBottom: 0 }}>{dispatchMsg}</p>}
+        <p className="footnote" style={{ marginTop: 10 }}>
+          Stub transport: attempts are admitted per the schedule window and daily cap,
+          simulated end-to-end, and land as real §8.2 result records — dispositions come
+          from the agent’s own prompt. No provider is called in this build; see Calls for the list.
+        </p>
       </div>
 
       <div className="two-col" style={{ marginBottom: 20 }}>
