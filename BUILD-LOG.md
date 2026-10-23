@@ -1,5 +1,139 @@
 # BUILD LOG
 
+## Chunk 10 — Phase A: A11 Browser Test Harness (2026-10-23)
+
+### Built
+- **A "Browser test" page + a browser transport for the existing
+  engine.** An operator picks any agent (tenant-scoped), optionally a
+  campaign of that agent for context (its product + lead list) and
+  either one of the campaign's saved leads or hand-typed fictitious
+  test values, presses **Start test call**, allows the microphone, and
+  holds a two-way voice conversation: the agent speaks first from its
+  single prompt's FLOW, replies stream back as audio, the live
+  transcript appears line by line (partials marked *(live…)*,
+  interrupted turns marked), and the call ends by the model's
+  `end_call`, the operator's **End test call** button, or the agent's
+  existing guards (`max_turns` / `max_duration` / silence →
+  `no_input`) — A8/A9 behaviour, unchanged, because the harness runs
+  the **same** `ConversationEngine` + Saaras STT session as the Plivo
+  stream (`backend/app/routers/browser_test.py`). No conversation
+  logic was forked: the handler mirrors the Plivo stream handler's
+  lifecycle (live view → engine → legs → classify → `finalize_attempt`)
+  with a transport seam of three callables (send audio / clear audio /
+  close stream).
+- **The test is a snapshot, never an attempt.**
+  `POST /api/browser-tests` creates a `CallSession` with
+  `campaign_id = NULL`, `lead_id = NULL`, `channel = "browser-test"`
+  and a `test_lead` JSON snapshot (migration
+  `009_a11_browser_test.sql`; the two FK columns are now nullable).
+  A picked lead is read once, snapshotted, and **never written back**:
+  `finalize_attempt`'s lead-routing block (attempt counting, status,
+  retry re-queue) is skipped entirely for the browser-test channel, so
+  a test cannot consume attempts or schedule retries. The campaign
+  supplies product/variables read-only. Results land in the same §8.2
+  surface with the marker everywhere it matters: Calls shows a gold
+  **Browser test** pill in place of a campaign, the summary is
+  prefixed `[BROWSER TEST]`, and the dashboard counts the call like
+  any other. The wire protocol: `WS /api/telephony/browser/stream/{id}`
+  authenticated by the operator's JWT as a query parameter (browsers
+  cannot set WebSocket headers; the token is the same short-lived
+  operator token, and the session must belong to that operator's
+  tenant — bad token closes 4401, cross-tenant 4404, non-startable
+  4409).
+- **Codec, honestly.** Browsers cannot produce μ-law, so the page
+  captures microphone audio with Web Audio (AudioWorklet, with a
+  ScriptProcessor fallback), **downsamples to PCM16 @16 kHz** by
+  pair-averaging (the simplest robust path — no Opus decode anywhere),
+  and sends binary PCM; the server (`backend/app/audio_codec.py`,
+  hand-rolled G.711 μ-law — Python 3.13 removed `audioop`) converts to
+  the exact 160-byte μ-law frames the STT session and the engine
+  already eat, so the agent hears what a phone callee's audio becomes.
+  Replies return as binary **PCM16 @8 kHz** messages, scheduled into
+  Web Audio by the page. The smoke test asserts the conversion at the
+  STT boundary itself: constant-value PCM chunks arrive at the mock
+  Saaras as constant 160-byte μ-law payloads whose byte differs with
+  the input sample value.
+- **Barge-in rides the engine's interrupt, one flush event.** When an
+  STT partial cuts a reply (A9's path, untouched), the handler's
+  clear-audio callable sends a single `{"event": "interrupt"}` and the
+  page stops the sounding buffer source and drops its playback queue.
+  Difference from Plivo, stated plainly: Plivo's `clearAudio` asks the
+  provider to flush audio already sent (best-effort — hence A9's
+  real-time pacing); in the browser the *unsent* tail never leaves the
+  server (same pump-stop) and the *sent* tail lives in the page's own
+  queue, so the cut there is exact rather than best-effort. Playback
+  pacing on the wire is identical (20 ms per frame), so "spoken"
+  means the same thing in the transcript.
+- **Honest refusals.** With no Sarvam configured for the tenant, the
+  stream sends a `not_configured` error event and finalizes the
+  session as a FAILED `[BROWSER TEST]` result (end reason
+  `not_configured`) — visible in Calls, never a silent hang. A session
+  whose stream never connects simply stays QUEUED.
+
+### Verification
+- `scripts/smoke_test.py`: **478 passed, 0 failed** (one repeat run
+  showed 472 passed / 2 failed — an A8 timing check that passed in the
+  other three runs, the suite's known poll/timing variance, plus the
+  A11 classifier-routing miss fixed below; the final run is fully
+  green). The new A11 section (48 counted checks) drives the harness
+  protocol with a sync WebSocket client against mock Sarvam HTTP +
+  a recording mock Saaras: session create (marker, snapshot, stream
+  path) with zero campaign state touched; cross-tenant create → 404;
+  stream closes 4401 (bad token) / 4404 (other tenant); `ready` names
+  the resolved language (bn-IN from the lead's state); the agent
+  speaks first (audio bytes exactly 2× the μ-law total, transcript
+  event follows); two operator turns are answered in order and the
+  model's `end_call` ends the test with the `ended` event carrying
+  disposition ANSWERED + captured `favourite_colour`; the mock Saaras
+  saw exactly one bn-IN connection and the μ-law conversion is
+  asserted byte-for-byte in shape; the result is in Calls + dashboard
+  with campaign results/attempts at zero and the picked lead still
+  `pending`, attempt_count 0; an operator-End (socket close)
+  finalizes exactly once as `stream_closed`; barge-in — a partial
+  mid-opening produces the `interrupt` event with zero audio after it
+  for that reply, the live partial rides a `partial` event, the
+  interrupting line is answered, and the recorded opening turn is the
+  spoken prefix flagged `interrupted`; no-config → `not_configured`
+  event + FAILED result + no STT connection attempted. Frontend:
+  `vite build` clean.
+- **Two defects found by the harness tests, both in test-side
+  assumptions, fixed in the section:** (1) the A8/A9 mock AI servers
+  are shut down by their own sections — and a shut-down
+  `HTTPServer` leaves its socket listening, so calls to the old URL
+  connect and then hang to a 60 s timeout; A11 therefore boots its
+  own twin mock serving both scripts. (2) Port 18112 already belongs
+  to A10's retry instance (all instances live until the global
+  finally); the barge instance moved to 18114.
+
+### Known limitations (deliberate, for this chunk)
+- The harness needs a Sarvam configuration (tenant settings or env)
+  to run a conversation — it exercises the self-hosted loop; there is
+  no managed-mode (Vapi) browser test, by design: Vapi has no
+  browser-audio seam in this platform.
+- Codec path is PCM16 @16 kHz → μ-law @8 kHz with pair-averaged
+  downsampling (a box filter, not a polyphase resampler): entirely
+  adequate for judging the agent, and exactly the STT input a phone
+  call produces, but the page's microphone chain (browser echo
+  cancellation, device sample rates) means a browser test is a
+  judgement aid, not a telephony-fidelity measurement. Speakers
+  without headphones can feed the agent's own voice back to it; the
+  page says so.
+- The WebSocket carries the operator JWT as a query parameter (the
+  only browser-viable channel); it is the standard short-lived
+  operator token, and the stream re-checks tenant ownership at
+  connect. A dedicated short-lived stream token is a hardening step.
+- Still **not proven against live providers** — no keys yet (owner
+  step, unchanged). Everything above is mock/fake-verified, including
+  the Saaras wire shape; the first live Sarvam spike remains the
+  codec-negotiation check noted in A7.
+
+### Next step
+**A12 — edge cases, load & cost:** failure-path hardening across the
+dispatch/stream surface, a concurrency/load pass over the
+orchestrator, and real per-call cost figures in `cost_breakdown`
+(the A5 contract has carried the shape since the skeleton; A12 puts
+numbers in it).
+
 ## Chunk 9 — Phase A: A10 Dispatch at Scale, Results Surface & Dashboard, Managed-Mode Parity (2026-10-23)
 
 ### Built

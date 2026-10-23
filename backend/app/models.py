@@ -206,10 +206,25 @@ class CallSession(Base):
 
     session_id: Mapped[str] = mapped_column(String(40), primary_key=True, default=lambda: new_id("ses"))
     tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.tenant_id"), nullable=False, index=True)
-    campaign_id: Mapped[str] = mapped_column(ForeignKey("campaigns.campaign_id"), nullable=False)
-    lead_id: Mapped[str] = mapped_column(ForeignKey("leads.lead_id"), nullable=False)
+    # Nullable from A11: a browser-test session is not a campaign attempt
+    # — it carries no campaign and no lead (the test context lives in
+    # test_lead below), so campaign/lead are NULL for harness calls.
+    campaign_id: Mapped[str | None] = mapped_column(ForeignKey("campaigns.campaign_id"), nullable=True)
+    lead_id: Mapped[str | None] = mapped_column(ForeignKey("leads.lead_id"), nullable=True)
     attempt_id: Mapped[str] = mapped_column(String(60), nullable=False)  # idempotency key from app layer
     provider_mode: Mapped[str] = mapped_column(String(20), default="managed")
+    # How this session was originated (A11): "" = a dispatched campaign
+    # attempt; "browser-test" = the in-console test harness. The marker
+    # rides the §8.2 surface (CallOut.channel) so a test call is never
+    # mistaken for a campaign attempt anywhere it appears.
+    channel: Mapped[str] = mapped_column(String(30), default="")
+    # Browser-test lead snapshot (A11): the fictitious / picked lead the
+    # operator tested against — {agent_id, name, phone_number, bank_name,
+    # state, agent_fields, product, source_campaign_id, source_lead_id,
+    # source_campaign_name}. A snapshot (not a lead row) by design: a test
+    # never creates, consumes or re-queues a campaign lead. Empty for
+    # dispatched attempts.
+    test_lead: Mapped[dict] = mapped_column(JSON, default=dict)
     provider_call_id: Mapped[str] = mapped_column(String(120), default="")
     state: Mapped[str] = mapped_column(String(30), default="QUEUED")
     from_number: Mapped[str] = mapped_column(String(30), default="")

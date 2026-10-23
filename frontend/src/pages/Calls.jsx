@@ -163,7 +163,9 @@ export default function Calls() {
               <tr onClick={() => setOpenId(openId === c.session_id ? '' : c.session_id)}
                   style={{ cursor: 'pointer' }}>
                 <td style={{ whiteSpace: 'nowrap', fontSize: 13 }}>{fmtTime(c.started_at)}</td>
-                <td>{c.campaign_name || '—'}</td>
+                <td>{c.channel === 'browser-test'
+                  ? <span className="pill gold">Browser test</span>
+                  : (c.campaign_name || '—')}</td>
                 <td>{c.lead_name || '—'}</td>
                 <td style={{ fontFamily: 'var(--mono)', fontSize: 13 }}>{c.to_number || '—'}</td>
                 <td><span className={`pill ${STATE_PILL[c.state] || 'slate'}`}>{c.final_state || c.state}</span></td>
@@ -228,7 +230,9 @@ export default function Calls() {
         (simulated), Vapi (managed) or Plivo (self-hosted) — read from the
         result record, never assumed. Live calls appear as DIALING / IN_CALL
         when placed and land here as terminal §8.2 records when the provider
-        reports the end of the call.
+        reports the end of the call. Browser test calls (A11) sit in the same
+        list with a gold “Browser test” marker in place of a campaign — the
+        same record shape, never a campaign attempt.
       </p>
     </div>
   )

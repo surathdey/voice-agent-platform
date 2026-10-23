@@ -7,11 +7,12 @@ import CampaignDetail from './pages/CampaignDetail'
 import Settings from './pages/Settings'
 import Calls from './pages/Calls'
 import Dashboard from './pages/Dashboard'
+import BrowserTest from './pages/BrowserTest'
 import { api, clearSession, getUser, setSession } from './api'
 
-const NAV = ['Dashboard', 'Campaigns', 'Agents', 'Calls', 'Journey', 'Human Queue', 'Settings']
-const ENABLED = ['Dashboard', 'Campaigns', 'Agents', 'Calls', 'Settings'] // later chunks enable the rest
-const NAV_VIEW = { Dashboard: 'dashboard', Campaigns: 'campaigns', Agents: 'agents', Calls: 'calls', Settings: 'settings' }
+const NAV = ['Dashboard', 'Campaigns', 'Agents', 'Calls', 'Browser Test', 'Journey', 'Human Queue', 'Settings']
+const ENABLED = ['Dashboard', 'Campaigns', 'Agents', 'Calls', 'Browser Test', 'Settings'] // later chunks enable the rest
+const NAV_VIEW = { Dashboard: 'dashboard', Campaigns: 'campaigns', Agents: 'agents', Calls: 'calls', 'Browser Test': 'browsertest', Settings: 'settings' }
 
 export default function App() {
   const [user, setUser] = useState(getUser())
@@ -23,6 +24,7 @@ export default function App() {
     : ['campaigns', 'wizard', 'campaign'].includes(view.name) ? 'Campaigns'
     : view.name === 'settings' ? 'Settings'
     : view.name === 'calls' ? 'Calls'
+    : view.name === 'browsertest' ? 'Browser Test'
     : view.name === 'dashboard' ? 'Dashboard' : 'Agents'
 
   return (
@@ -79,6 +81,7 @@ export default function App() {
         )}
         {view.name === 'settings' && <Settings />}
         {view.name === 'calls' && <Calls />}
+        {view.name === 'browsertest' && <BrowserTest />}
       </main>
     </div>
   )

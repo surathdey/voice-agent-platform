@@ -34,7 +34,7 @@ from . import providers as prov
 from . import seed as seed_module
 from .config import settings
 from .db import SessionLocal, init_db
-from .routers import agents, auth, calls, campaigns, settings as settings_router, telephony, tenants
+from .routers import agents, auth, browser_test, calls, campaigns, settings as settings_router, telephony, tenants
 
 app = FastAPI(title="Voice Agent Platform", version="0.6.0")
 
@@ -81,3 +81,4 @@ app.include_router(campaigns.router)
 app.include_router(settings_router.router)
 app.include_router(calls.router)
 app.include_router(telephony.router)
+app.include_router(browser_test.router)

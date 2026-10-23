@@ -5,7 +5,7 @@ Voice Agent Platform V2 (Greenfield + QGBS MVP)*. Agents are **data, not
 code**: each agent is one prompt plus structured voice/model/language
 configuration, run in campaigns against lead lists.
 
-**This build = Phase A, chunks 1–9: A1 (tenancy + core data model), A2
+**This build = Phase A, chunks 1–10: A1 (tenancy + core data model), A2
 (Agent Config Studio), A3 (Campaigns & Leads), A4 (Provider Settings),
 A5 (Orchestrator skeleton — dispatch + stub transport + §8.2 results),
 A6 (Telephony spike — real Vapi + Plivo transports behind the same
@@ -15,13 +15,18 @@ Saaras finals → Sarvam LLM → Bulbul TTS, with post-call classification
 against the agent prompt's own disposition definitions), A9
 (barge-in + silence handling inside the loop — callee speech cuts
 the agent's audio, silence earns a prompt, then an honest
-`no_input` close) and A10 (dispatch at scale — schedule, calling
+`no_input` close), A10 (dispatch at scale — schedule, calling
 windows, days and daily caps evaluated in the tenant's MARKET-LOCAL
 time, retry/re-queue of no-answer/busy/failed attempts as new
 attempts, per-campaign results summary + tenant Dashboard, and
-managed-mode parity with the self-hosted result surface).**
+managed-mode parity with the self-hosted result surface) and A11
+(browser test harness — talk to any agent from the console over a
+WebSocket transport running the same engine: pick an agent, optionally
+a campaign lead as a snapshot, and hold a real voice conversation;
+the result lands in Calls marked "browser-test" and never consumes a
+campaign attempt).**
 See `BUILD-LOG.md` for what is verified and what comes next
-(A11: browser test harness; A12: edge cases, load, real per-call cost).
+(A12: edge cases, load, real per-call cost).
 
 ## Run it (Docker — the owner's route)
 
@@ -246,6 +251,33 @@ cd frontend && npm install && npm run dev   # http://localhost:5173, proxies /ap
       lands flagged **Needs review**, same as a self-hosted call the
       classifier could not place.
 
+**A11 — Browser test harness (talk to an agent, no phone)**
+- [ ] Sidebar → **Browser Test**: pick an agent, press **Start test
+      call**, allow the microphone — the agent speaks first from its
+      prompt's FLOW and you hold a two-way voice conversation in the
+      browser (headphones recommended: through speakers the agent can
+      hear itself). Needs a Sarvam configuration (Settings or env) —
+      with none, the page says so and the attempt lands in Calls as a
+      FAILED result, never a silent hang.
+- [ ] The live transcript appears line by line as you talk: your
+      in-flight words show marked *(live…)*; talk over the agent
+      mid-reply and its audio stops at once — the cut turn is marked
+      *(interrupted — only the words actually spoken)*.
+- [ ] End the test three ways and check Calls each time: let the
+      agent reach its closing (its `end_call`), press **End test
+      call**, or stay silent until its silence guard closes the call
+      (`no_input`). Every ending produces exactly one result.
+- [ ] Pick a campaign + one of its saved leads for the test: the
+      agent addresses that lead (name, bank, language from its
+      state) — then check the campaign page: the lead's attempt
+      count is unchanged, it is still *pending*, and the campaign's
+      Results show zero attempts. A test is a snapshot, never an
+      attempt, and never creates a retry.
+- [ ] The finished test sits in **Calls** with a gold **Browser
+      test** marker instead of a campaign, the `[BROWSER TEST]`
+      summary prefix, a disposition classified against the agent's
+      own prompt, and it counts on the Dashboard like any call.
+
 ## Design decisions that override the design doc
 
 1. **Single prompt (owner, 2026-10-23).** The design doc's three-layer prompt
@@ -281,14 +313,21 @@ backend/    FastAPI app (app/models.py = all six design entities + prompt_versio
             tool), sentence chunker, Bulbul TTS client, the per-call turn
             engine (barge-in interrupts, silence prompts, no_input
             close), and the post-call classifier;
+            app/audio_codec.py = hand-rolled G.711 μ-law codec + the
+            PCM16 16 kHz → μ-law 8 kHz downsample the browser harness
+            feeds the STT session with (A11);
             app/routers/ = auth, tenants, agents, campaigns, settings, calls
             (incl. campaign results summary + tenant dashboard, A10),
-            telephony (provider webhook / answer / stream routes);
-            migrations/001–008 = DDL of record)
+            telephony (provider webhook / answer / stream routes),
+            browser_test (A11: test-session create + the browser media
+            stream — the same engine/STT/finalize path, snapshot leads,
+            channel "browser-test");
+            migrations/001–009 = DDL of record)
 frontend/   React (Vite) console — theme tokens in src/theme.css (wireframe design language);
             pages: Dashboard, Agents, AgentEditor, Campaigns, CampaignWizard,
             CampaignDetail (dispatch + Results card), LeadsUpload, Settings,
-            Calls (result filters)
-scripts/    smoke_test.py — automated acceptance checks (A1 + A2 + A3 + A4 + A5 + A6 + A7 + A8 + A9 + A10)
+            Calls (result filters), BrowserTest (A11 harness: mic capture
+            via AudioWorklet, Web Audio playback, live transcript)
+scripts/    smoke_test.py — automated acceptance checks (A1 + A2 + A3 + A4 + A5 + A6 + A7 + A8 + A9 + A10 + A11)
 docker-compose.yml   db (PostgreSQL 16) + backend + frontend (nginx)
 ```

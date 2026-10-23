@@ -252,11 +252,19 @@ class ProviderTestOut(BaseModel):
 class CallOut(BaseModel):
     session_id: str
     attempt_id: str
-    campaign_id: str
+    # Nullable from A11: a browser-test session is not a campaign attempt
+    # and references neither a campaign nor a lead (see channel below).
+    campaign_id: Optional[str] = None
     campaign_name: str = ""
-    lead_id: str
+    lead_id: Optional[str] = None
     lead_name: str = ""
     to_number: str = ""
+    provider_mode: str                   # managed | self_hosted (the campaign's mode)
+    # How the session was originated (A11): "" = a dispatched campaign
+    # attempt; "browser-test" = the in-console test harness. A test call
+    # carries the same §8.2 shape as any other call and is marked here,
+    # never disguised as a campaign attempt.
+    channel: str = ""
     provider_mode: str                   # managed | self_hosted (the campaign's mode)
     transport: str = "stub"              # the transport that actually ran it (A5: stub)
     state: str                           # QUEUED | DIALING | IN_CALL | terminal state
@@ -377,3 +385,42 @@ class DashboardOut(BaseModel):
     results_total: int = 0
     dispositions: dict = Field(default_factory=dict)     # tenant-wide totals across campaigns
     review_queue_count: int = 0          # results flagged review_required, all campaigns
+
+
+# ── Browser test harness (A11) ────────────────────────────────────────────
+# An operator talks to an agent from the browser — no phone, no telephony
+# provider — to hear and judge it before any live call. Creating a test
+# makes a CallSession with channel "browser-test", campaign_id / lead_id
+# NULL, and the test-lead SNAPSHOT on the session (never a lead row: a
+# test consumes no campaign lead's attempts and triggers no retry).
+
+class BrowserTestLeadIn(BaseModel):
+    """Hand-typed test-lead values (fictitious). Used when no saved lead
+    is picked; any field may be left blank."""
+    name: str = ""
+    phone_number: str = ""
+    bank_name: str = ""
+    state: str = ""
+    product_identifier: str = ""
+
+
+class BrowserTestIn(BaseModel):
+    agent_id: str
+    # Optional context: a campaign of that agent (supplies the product +
+    # lead list), and optionally one of its saved leads to test against.
+    campaign_id: Optional[str] = None
+    lead_id: Optional[str] = None       # requires campaign_id
+    lead: Optional[BrowserTestLeadIn] = None   # hand-typed values
+
+
+class BrowserTestOut(BaseModel):
+    session_id: str
+    channel: str = "browser-test"
+    state: str = "QUEUED"
+    agent_id: str
+    agent_name: str = ""
+    lead_name: str = ""
+    to_number: str = ""
+    # The harness media endpoint for this session (token passed as a
+    # query parameter — browsers cannot set WebSocket headers).
+    stream_path: str = ""

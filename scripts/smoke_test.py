@@ -2473,6 +2473,491 @@ try:
     check6("A10: calls filter finds the flagged managed call",
            _fR["total"] == 1 and _fR["calls"][0]["session_id"] == _sessRD["session_id"], _fR["total"])
 
+    print("── A11: browser test harness — same engine over a browser transport, fakes only ──")
+    # The harness runs the SAME Saaras session + ConversationEngine as the
+    # Plivo stream, over a WebSocket the browser speaks: PCM16 @16 kHz in
+    # (binary), PCM16 @8 kHz out (binary), JSON events for ready /
+    # transcript / partial / interrupt / ended. A dedicated mock Saaras
+    # RECORDS the audio payloads it receives, so the server's
+    # PCM16→μ-law conversion is asserted at the STT boundary itself.
+    # The LLM/TTS/classifier HTTP mock is A11's OWN (below): the A8/A9
+    # sections shut their mock servers down when done — and a shut-down
+    # HTTPServer leaves its socket listening, so calls to the old URL
+    # connect and then hang until timeout. This twin serves both scripts
+    # used below, routed like the originals: the A8 survey (by last user
+    # line) and the A9 barge script (system names the BARGE TEST AGENT).
+    # No real provider, no real browser: a sync WebSocket client speaks
+    # the harness protocol exactly as the page does.
+    import base64 as _b64_11
+    import struct as _struct_11
+    from websockets.sync.client import connect as _ws_connect11
+
+
+    def _mock_audio11(text):
+        if text.startswith(("First,", "Second,", "Third,")):
+            return _mock_audio9(text)   # the long barge-in opening (rep 60)
+        return _mock_audio8(text)
+
+
+    class _MockSarvamAI11(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def _send(self, code, data, ctype="application/json"):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _json(self, code, obj):
+            self._send(code, json.dumps(obj).encode())
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b""
+            try:
+                body = json.loads(raw) if raw else {}
+            except Exception:
+                body = {}
+            if self.path == "/chat/completions":
+                self._chat(body)
+            elif self.path == "/text-to-speech":
+                text = (body.get("inputs") or [""])[0]
+                self._json(200, {"audios": [
+                    _b64_11.b64encode(_mock_audio11(text)).decode()]})
+            else:
+                self._json(404, {})
+
+        def _chat(self, body):
+            msgs = body.get("messages") or []
+            system = msgs[0].get("content", "") if msgs else ""
+            users = [m.get("content", "") for m in msgs if m.get("role") == "user"]
+            if "POST-CALL CLASSIFIER" in system:
+                # The classifier call carries the agent prompt in its USER
+                # message (classify_call's shape) — route on the whole body.
+                if "BARGE TEST AGENT" in (system + "\n" + "\n".join(users)):
+                    content = {"disposition": "SPOKEN", "captured_fields": {},
+                               "confidence": 0.91,
+                               "summary": "Mock classifier (A11): the callee spoke."}
+                else:
+                    content = {"disposition": "ANSWERED",
+                               "captured_fields": {"favourite_colour": "blue"},
+                               "confidence": 0.93,
+                               "summary": "Mock classifier (A11): survey answered."}
+                self._json(200, {"choices": [{"message": {
+                    "role": "assistant", "content": json.dumps(content)}}]})
+                return
+            last = users[-1] if users else ""
+            end_call = False
+            if "BARGE TEST AGENT" in system:
+                if last == _LI_9:
+                    pieces = [_RB_9]
+                elif "been silent" in last:
+                    pieces = [_NUDGE_9]
+                elif "not responded" in last:
+                    pieces = [_CLOSE_9]
+                    end_call = True
+                else:  # kickoff — the long three-sentence opening
+                    pieces = ["First, let me explain the reason ",
+                              "for this call in some detail. ",
+                              "Second, there are several options ",
+                              "we should walk through together. ",
+                              "Third, I will confirm the next steps ",
+                              "before we finish."]
+            elif last == _L2_8:
+                pieces = ["Thank you for your answers. ", "Have a good day."]
+                end_call = True
+            elif last == _L1_8:
+                pieces = ["Blue is a lovely ", "colour. And do you prefer it ",
+                          "for clothes or for cars?"]
+            else:  # survey kickoff
+                pieces = ["Hello, this is a short survey ",
+                          "call. What is your favourite colour?"]
+            lines = ["data: " + json.dumps(
+                {"choices": [{"delta": {"content": p}}]}) + "\n\n" for p in pieces]
+            if end_call:
+                lines.append("data: " + json.dumps({"choices": [{"delta": {"tool_calls": [
+                    {"index": 0, "id": "call_end_11", "type": "function",
+                     "function": {"name": "end_call", "arguments": ""}}]}}]}) + "\n\n")
+            lines.append("data: [DONE]\n\n")
+            self._send(200, "".join(lines).encode(), "text/event-stream")
+
+
+    _ai11_server = ThreadingHTTPServer(("127.0.0.1", 0), _MockSarvamAI11)
+    threading.Thread(target=_ai11_server.serve_forever, daemon=True).start()
+    MOCK_AI11_URL = f"http://127.0.0.1:{_ai11_server.server_address[1]}"
+
+    MOCK_STT11 = {"mode": "survey", "connections": []}
+
+
+    def _mock_saaras11(ws):
+        req = ws.request
+        info = {"path": req.path if req else "", "frames": 0, "payloads": []}
+        MOCK_STT11["connections"].append(info)
+        try:
+            for raw in ws:
+                try:
+                    msg = json.loads(raw)
+                except Exception:
+                    continue
+                if "audio" not in msg:
+                    continue
+                info["frames"] += 1
+                try:
+                    info["payloads"].append(_b64_11.b64decode(msg["audio"]["data"]))
+                except Exception:
+                    pass
+                mode, n = MOCK_STT11["mode"], info["frames"]
+                if mode == "survey" and n == 1:
+                    ws.send(json.dumps({"type": "data", "data": {
+                        "transcript": _L1_8, "is_final": True}}))
+                elif mode == "survey" and n == 2:
+                    ws.send(json.dumps({"type": "data", "data": {
+                        "transcript": _L2_8, "is_final": True}}))
+                elif mode == "barge" and n == 1:
+                    ws.send(json.dumps({"type": "data", "data": {
+                        "transcript": "Wait, I have", "is_final": False}}))
+                elif mode == "barge" and n == 2:
+                    ws.send(json.dumps({"type": "data", "data": {
+                        "transcript": _LI_9, "is_final": True}}))
+        except Exception:
+            pass  # client went away mid-stream — the mock just stops
+
+
+    _stt11_server = _ws_serve7(_mock_saaras11, "127.0.0.1", 0)
+    threading.Thread(target=_stt11_server.serve_forever, daemon=True).start()
+    MOCK_STT11_URL = f"ws://127.0.0.1:{_stt11_server.socket.getsockname()[1]}"
+
+
+    def _pcm11(value, samples=320):
+        """One 20 ms inbound chunk: constant-value PCM16 @16 kHz."""
+        return _struct_11.pack(f"<{samples}h", *([value] * samples))
+
+
+    class _BtClient:
+        """The harness protocol, client side: binary audio accumulates,
+        JSON events accumulate, and `stream` keeps the receive ORDER of
+        the two — the order is what proves an interruption cut."""
+
+        def __init__(self, ws):
+            self.ws = ws
+            self.audio = bytearray()
+            self.events = []
+            self.stream = []
+
+        def _feed(self, raw):
+            if isinstance(raw, (bytes, bytearray)):
+                self.audio += raw
+                self.stream.append(("audio", len(raw)))
+            else:
+                try:
+                    ev = json.loads(raw)
+                except Exception:
+                    return
+                self.events.append(ev)
+                self.stream.append(("json", ev))
+
+        def until(self, pred, timeout=25):
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if pred():
+                    return True
+                try:
+                    raw = self.ws.recv(timeout=max(0.05, deadline - time.monotonic()))
+                except TimeoutError:
+                    break
+                except Exception:
+                    self.stream.append(("closed", None))
+                    break
+                self._feed(raw)
+            return pred()
+
+        def for_seconds(self, seconds):
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline:
+                try:
+                    raw = self.ws.recv(timeout=max(0.05, deadline - time.monotonic()))
+                except TimeoutError:
+                    break
+                except Exception:
+                    self.stream.append(("closed", None))
+                    break
+                self._feed(raw)
+
+        def turns(self):
+            return [e["turn"] for e in self.events if e.get("event") == "transcript"]
+
+        def has_event(self, name, **match):
+            return any(e.get("event") == name
+                       and all(e.get(k) == v for k, v in match.items())
+                       for e in self.events)
+
+
+    def _bt_open(base, sid, token):
+        url = (base.replace("http://", "ws://")
+               + f"/api/telephony/browser/stream/{sid}?token={token}")
+        return _BtClient(_ws_connect11(url))
+
+
+    def _bt_close_code(base, sid, token):
+        url = (base.replace("http://", "ws://")
+               + f"/api/telephony/browser/stream/{sid}?token={token}")
+        try:
+            ws = _ws_connect11(url)
+        except Exception as e:
+            return getattr(getattr(e, "rcvd", None), "code", None)
+        try:
+            ws.recv(timeout=5)
+        except Exception as e:
+            return getattr(getattr(e, "rcvd", None), "code", None)
+        return None
+
+
+    def _bt_poll(base, token, sid, pred, tries=60, nap=0.25):
+        last = None
+        for _ in range(tries):
+            _s, cl = call6(base, "GET", "/api/calls", token=token)
+            last = next((c for c in cl["calls"] if c["session_id"] == sid), None)
+            if last is not None and pred(last):
+                return last
+            time.sleep(nap)
+        return last
+
+
+    # ── main scenario: saved lead, full survey conversation ───────────
+    baseB = start_app6(18111, "browser-live", {
+        "TELEPHONY_MODE": "self_hosted", "PLIVO_AUTH_ID": "MAFAKEID",
+        "PLIVO_AUTH_TOKEN": "fake-plivo-token", "SARVAM_API_KEY": "sk-fake-sarvam",
+        "SARVAM_WS_URL": MOCK_STT11_URL, "SARVAM_BASE_URL": MOCK_AI11_URL,
+    })
+    tokenB = login6(baseB)
+    _, survey = call6(baseB, "POST", "/api/agents", {
+        "name": "A11 Scripted Survey Agent",
+        "purpose": "Browser-harness twin of the A8 scripted agent",
+        "prompt": _SCRIPTED_PROMPT_8,
+        "llm_model": "sarvam-105b",
+        "tts_voice_id": "bulbul-bn-female-1",
+        "language_rule": {"default": "hi-IN", "by_state": {"West Bengal": "bn-IN"}},
+        "captured_fields": [{"name": "favourite_colour", "type": "string",
+                             "description": "The callee's favourite colour"}],
+    }, token=tokenB, expect=201)
+    cidB = campaign6(baseB, tokenB, survey["agent_id"], "A11 — Context Batch",
+                     "self_hosted",
+                     "callee_name,phone_number,bank_name,state\n"
+                     "P. Sen,9500000001,Tata Capital,West Bengal\n")
+    _, leadsB = call6(baseB, "GET", f"/api/campaigns/{cidB}/leads", token=tokenB)
+    leadB = leadsB["leads"][0]
+
+    _, bt = call6(baseB, "POST", "/api/browser-tests", {
+        "agent_id": survey["agent_id"], "campaign_id": cidB,
+        "lead_id": leadB["lead_id"],
+    }, token=tokenB, expect=201)
+    sidB = bt["session_id"]
+    check6("A11: browser test created — channel marker, snapshot lead, stream path",
+           bt["channel"] == "browser-test" and bt["state"] == "QUEUED"
+           and bt["lead_name"] == "P. Sen" and bt["to_number"] == "9500000001"
+           and bt["stream_path"].endswith(sidB), bt)
+    _, campsB2 = call6(baseB, "GET", f"/api/campaigns/{cidB}/calls", token=tokenB)
+    _, leadsB2 = call6(baseB, "GET", f"/api/campaigns/{cidB}/leads", token=tokenB)
+    check6("A11: creating a test touches NO campaign state (no session, lead unattempted)",
+           campsB2["total"] == 0 and leadsB2["leads"][0]["attempt_count"] == 0
+           and leadsB2["leads"][0]["status"] == "pending",
+           (campsB2["total"], leadsB2["leads"][0]))
+
+    print("── A11: tenant isolation on create + stream ──")
+    _, t2B = call6(baseB, "POST", "/api/tenants", {"name": "OtherBrowser", "market": "IN"})
+    _, loginB2 = call6(baseB, "POST", "/api/auth/login",
+                       {"email": t2B["admin_email"], "password": t2B["admin_password"]})
+    tokenB2 = loginB2["access_token"]
+    call6(baseB, "POST", "/api/browser-tests", {"agent_id": survey["agent_id"]},
+          token=tokenB2, expect=404)
+    call6(baseB, "POST", "/api/browser-tests",
+          {"agent_id": survey["agent_id"], "campaign_id": cidB}, token=tokenB2, expect=404)
+    check6("A11: stream refuses a bad token (4401) and another tenant's token (4404)",
+           _bt_close_code(baseB, sidB, "not-a-token") == 4401
+           and _bt_close_code(baseB, sidB, tokenB2) == 4404)
+
+    MOCK_STT11["mode"] = "survey"
+    stt11_conns0 = len(MOCK_STT11["connections"])
+    bt_ws = _bt_open(baseB, sidB, tokenB)
+    _full_mulaw = _audio_len8(_R1_8) + _audio_len8(_R2_8) + _audio_len8(_R3_8)
+    ok_ready = bt_ws.until(lambda: bt_ws.has_event("ready", language="bn-IN"), timeout=15)
+    check6("A11: stream opens — ready event names the resolved language (bn-IN)",
+           ok_ready, bt_ws.events[:2])
+    ok_open = bt_ws.until(
+        lambda: len(bt_ws.audio) >= 2 * _audio_len8(_R1_8)
+        and any(t["text"] == _R1_8 for t in bt_ws.turns()), timeout=25)
+    check6("A11: the agent speaks FIRST — opening audio (PCM, 2× the μ-law bytes) + transcript event",
+           ok_open and bt_ws.turns()[0]["speaker"] == "agent",
+           (len(bt_ws.audio), bt_ws.turns()[:1]))
+    bt_ws.ws.send(_pcm11(1000))   # one 20 ms mic chunk → mock Saaras final L1
+    ok_r2 = bt_ws.until(
+        lambda: len(bt_ws.audio) >= 2 * (_audio_len8(_R1_8) + _audio_len8(_R2_8))
+        and any(t["text"] == _R2_8 for t in bt_ws.turns()), timeout=25)
+    check6("A11: operator turn 1 (STT final) is answered — reply audio + interleaved turns",
+           ok_r2 and [t["text"] for t in bt_ws.turns()] == [_R1_8, _L1_8, _R2_8],
+           bt_ws.turns())
+    bt_ws.ws.send(_pcm11(8000))   # second chunk → final L2 → closing + end_call
+    ok_end = bt_ws.until(
+        lambda: bt_ws.has_event("ended", end_reason="agent_end_call",
+                                disposition="ANSWERED"), timeout=25)
+    check6("A11: closing spoken, the model's end_call ends the test — ended event carries the result",
+           ok_end and len(bt_ws.audio) == 2 * _full_mulaw
+           and [t["text"] for t in bt_ws.turns()] == [_R1_8, _L1_8, _R2_8, _L2_8, _R3_8],
+           (len(bt_ws.audio), 2 * _full_mulaw, bt_ws.events[-2:]))
+    try:
+        bt_ws.ws.close()
+    except Exception:
+        pass
+    conns11 = MOCK_STT11["connections"][stt11_conns0:]
+    check6("A11: Saaras saw ONE connection (bn-IN) and the PCM16→μ-law conversion is real",
+           len(conns11) == 1 and "language-code=bn-IN" in conns11[0]["path"]
+           and len(conns11[0]["payloads"]) == 2
+           and all(len(p) == 160 for p in conns11[0]["payloads"])
+           and len(set(conns11[0]["payloads"][0])) == 1
+           and len(set(conns11[0]["payloads"][1])) == 1
+           and conns11[0]["payloads"][0] != conns11[0]["payloads"][1],
+           conns11)
+    doneB = _bt_poll(baseB, tokenB, sidB, lambda c: c["final_state"] is not None)
+    check6("A11: the result lands in the SAME §8.2 surface — marked, classified, unattached",
+           doneB is not None and doneB["channel"] == "browser-test"
+           and doneB["campaign_id"] is None and doneB["lead_id"] is None
+           and doneB["lead_name"] == "P. Sen"
+           and doneB["final_state"] == "COMPLETED"
+           and doneB["end_reason"] == "agent_end_call"
+           and doneB["disposition"] == "ANSWERED"
+           and doneB["captured_fields"].get("favourite_colour") == "blue"
+           and doneB["transport"] == "self_hosted"
+           and doneB["summary"].startswith("[BROWSER TEST]")
+           and [t["speaker"] for t in doneB["transcript"]] ==
+               ["agent", "customer", "agent", "customer", "agent"],
+           doneB and {k: doneB[k] for k in ("channel", "final_state", "disposition")})
+    _, allB = call6(baseB, "GET", "/api/calls", token=tokenB)
+    _, dashB = call6(baseB, "GET", "/api/dashboard", token=tokenB)
+    _, leadsB3 = call6(baseB, "GET", f"/api/campaigns/{cidB}/leads", token=tokenB)
+    _, campsB3 = call6(baseB, "GET", f"/api/campaigns/{cidB}/calls", token=tokenB)
+    _, resB = call6(baseB, "GET", f"/api/campaigns/{cidB}/results", token=tokenB)
+    check6("A11: exactly one result; dashboard counts it; the campaign NEVER sees the test",
+           allB["total"] == 1 and dashB["calls_total"] == 1
+           and dashB["results_total"] == 1
+           and dashB["dispositions"].get("ANSWERED") == 1
+           and campsB3["total"] == 0 and resB["attempts_made"] == 0
+           and leadsB3["leads"][0]["attempt_count"] == 0
+           and leadsB3["leads"][0]["status"] == "pending",
+           (allB["total"], dashB["calls_total"], leadsB3["leads"][0]))
+
+    # ── operator ends the test: close without a word ──────────────────
+    _, bt2 = call6(baseB, "POST", "/api/browser-tests", {
+        "agent_id": survey["agent_id"],
+        "lead": {"name": "Manual Tester", "phone_number": "9000000098",
+                 "bank_name": "HDFC Bank", "state": "Bihar"},
+    }, token=tokenB, expect=201)
+    ws2 = _bt_open(baseB, bt2["session_id"], tokenB)
+    ws2.until(lambda: len(ws2.audio) > 0, timeout=20)
+    try:
+        ws2.ws.close()
+    except Exception:
+        pass
+    doneB2 = _bt_poll(baseB, tokenB, bt2["session_id"],
+                      lambda c: c["final_state"] is not None)
+    check6("A11: operator End (socket close) finalizes exactly once, stream_closed",
+           doneB2 is not None and doneB2["channel"] == "browser-test"
+           and doneB2["final_state"] == "COMPLETED"
+           and doneB2["end_reason"] == "stream_closed"
+           and doneB2["lead_name"] == "Manual Tester",
+           doneB2 and doneB2["end_reason"])
+    _, allB2 = call6(baseB, "GET", "/api/calls", token=tokenB)
+    check6("A11: two tests, two results — no duplicates from either path",
+           allB2["total"] == 2, allB2["total"])
+
+    # ── barge-in: the partial cuts the reply, the page gets `interrupt` ──
+    print("── A11: barge-in — STT partial cuts the reply; the harness flush event fires ──")
+    baseB9 = start_app6(18114, "browser-barge", {
+        "TELEPHONY_MODE": "self_hosted", "PLIVO_AUTH_ID": "MAFAKEID",
+        "PLIVO_AUTH_TOKEN": "fake-plivo-token", "SARVAM_API_KEY": "sk-fake-sarvam",
+        "SARVAM_WS_URL": MOCK_STT11_URL, "SARVAM_BASE_URL": MOCK_AI11_URL,
+    })
+    tokenB9 = login6(baseB9)
+    _, barge_agent = call6(baseB9, "POST", "/api/agents", {
+        "name": "A11 Barge Agent", "prompt": _PROMPT_B_9,
+        "tts_voice_id": "bulbul-hi-female-1",
+        "language_rule": {"default": "hi-IN"},
+        "captured_fields": [],
+    }, token=tokenB9, expect=201)
+    _, bt9 = call6(baseB9, "POST", "/api/browser-tests", {
+        "agent_id": barge_agent["agent_id"],
+        "lead": {"name": "Barge Tester", "state": "Bihar"},
+    }, token=tokenB9, expect=201)
+    MOCK_STT11["mode"] = "barge"
+    ws9 = _bt_open(baseB9, bt9["session_id"], tokenB9)
+    ws9.until(lambda: len(ws9.audio) > 0, timeout=20)
+    ws9.ws.send(_pcm11(1200))     # → mock partial lands mid-opening
+    ok_cut = ws9.until(lambda: ws9.has_event("interrupt"), timeout=15)
+    mark = next((i for i, (k, _v) in enumerate(ws9.stream) if k == "json"
+                 and _v.get("event") == "interrupt"), None)
+    audio_at_cut = sum(n for k, n in ws9.stream[:mark] if k == "audio") if mark is not None else -1
+    ws9.for_seconds(1.2)          # anything still pumped after the cut lands here
+    audio_after = sum(n for k, n in ws9.stream[mark + 1:] if k == "audio") if mark is not None else -1
+    check6("A11 BARGE: partial → engine interrupt → harness `interrupt` event, audio cut mid-reply",
+           ok_cut and mark is not None
+           and 0 < audio_at_cut < 2 * _FULL_B_AUDIO_9
+           and audio_after == 0,
+           (audio_at_cut, 2 * _FULL_B_AUDIO_9, audio_after))
+    check6("A11 BARGE: the live partial rode the harness events (the page's live line)",
+           any(e.get("event") == "partial" and e.get("text") == "Wait, I have"
+               for e in ws9.events), ws9.events)
+    ws9.ws.send(_pcm11(1200))     # → mock final: the interrupting line itself
+    ok_reply = ws9.until(
+        lambda: any(t["text"] == _RB_9 for t in ws9.turns())
+        and len(ws9.audio) > audio_at_cut, timeout=20)
+    check6("A11 BARGE: the interrupting line is answered as the next turn (audio resumes)",
+           ok_reply, ws9.turns())
+    try:
+        ws9.ws.close()
+    except Exception:
+        pass
+    doneB9 = _bt_poll(baseB9, tokenB9, bt9["session_id"],
+                      lambda c: c["final_state"] is not None)
+    check6("A11 BARGE: the recorded opening turn is the spoken prefix, flagged interrupted",
+           doneB9 is not None and doneB9["channel"] == "browser-test"
+           and doneB9["disposition"] == "SPOKEN"
+           and doneB9["transcript"] and doneB9["transcript"][0].get("interrupted") is True
+           and len(doneB9["transcript"][0]["text"]) < len(_OPEN_B_9),
+           doneB9 and doneB9["transcript"] and doneB9["transcript"][0])
+    MOCK_STT11["mode"] = "survey"
+
+    # ── no Sarvam config: the harness refuses honestly ────────────────
+    print("── A11: no Sarvam config — error event + an honest FAILED result ──")
+    baseN = start_app6(18113, "browser-noconfig", {
+        "TELEPHONY_MODE": "self_hosted", "PLIVO_AUTH_ID": "MAFAKEID",
+        "PLIVO_AUTH_TOKEN": "fake-plivo-token",
+        "SARVAM_WS_URL": MOCK_STT11_URL, "SARVAM_BASE_URL": MOCK_AI11_URL,
+    })
+    tokenN = login6(baseN)
+    _, agentsN = call6(baseN, "GET", "/api/agents", token=tokenN)
+    _, btN = call6(baseN, "POST", "/api/browser-tests", {
+        "agent_id": agentsN[0]["agent_id"], "lead": {"name": "No Config"},
+    }, token=tokenN, expect=201)
+    connsN0 = len(MOCK_STT11["connections"])
+    wsN = _bt_open(baseN, btN["session_id"], tokenN)
+    got_err = wsN.until(lambda: wsN.has_event("error", reason="not_configured"), timeout=10)
+    try:
+        wsN.ws.close()
+    except Exception:
+        pass
+    doneN = _bt_poll(baseN, tokenN, btN["session_id"],
+                     lambda c: c["final_state"] is not None)
+    check6("A11: no Sarvam → not_configured event, FAILED result, no STT connection attempted",
+           got_err and doneN is not None and doneN["final_state"] == "FAILED"
+           and doneN["end_reason"] == "not_configured"
+           and doneN["summary"].startswith("[BROWSER TEST]")
+           and "not configured" in doneN["summary"]
+           and len(MOCK_STT11["connections"]) == connsN0,
+           doneN and doneN["summary"][:70])
+    _ai11_server.shutdown()
+    _stt11_server.shutdown()
+
 finally:
     for _p in _procs6:
         _p.terminate()

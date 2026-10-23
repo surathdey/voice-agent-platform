@@ -324,7 +324,13 @@ def finalize_attempt(db: Session, session: CallSession, outcome: dict):
     )
     db.add(result)
 
-    lead = db.get(Lead, session.lead_id)
+    # A11: a browser-test session is NOT a campaign attempt. It carries
+    # no lead (lead_id is NULL) — and even if a reference were ever
+    # recorded, finalizing a test must never consume the lead's attempts
+    # or re-queue it: the lead block below is skipped on the channel.
+    lead = db.get(Lead, session.lead_id) if session.lead_id else None
+    if lead is not None and (session.channel or "") == "browser-test":
+        lead = None
     if lead is not None:
         lead.attempt_count = (lead.attempt_count or 0) + 1
         campaign = db.get(Campaign, session.campaign_id)

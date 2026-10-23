@@ -83,8 +83,11 @@ def _call_out(db: Session, s: CallSession) -> CallOut:
         .filter(CallResult.session_id == s.session_id)
         .first()
     )
-    campaign = db.get(Campaign, s.campaign_id)
-    lead = db.get(Lead, s.lead_id)
+    campaign = db.get(Campaign, s.campaign_id) if s.campaign_id else None
+    lead = db.get(Lead, s.lead_id) if s.lead_id else None
+    # A11: a browser-test session references no campaign/lead rows — its
+    # display name/number come from the test-lead snapshot instead.
+    snapshot = s.test_lead or {}
     cost = (result.cost_breakdown or {}) if result else {}
     return CallOut(
         session_id=s.session_id,
@@ -92,9 +95,10 @@ def _call_out(db: Session, s: CallSession) -> CallOut:
         campaign_id=s.campaign_id,
         campaign_name=campaign.name if campaign else "",
         lead_id=s.lead_id,
-        lead_name=lead.name if lead else "",
+        lead_name=(lead.name if lead else snapshot.get("name", "")),
         to_number=s.to_number or (lead.phone_number if lead else ""),
         provider_mode=s.provider_mode,
+        channel=s.channel or "",
         # The transport that actually ran the call: stamped into the
         # result's cost_breakdown at finalize. Before a result exists,
         # a session carrying a real provider call id belongs to its
