@@ -51,7 +51,11 @@ PROVIDERS = {
                        "by the call's language and the agent's voice gender. The transcriber "
                        "profiles are the STT side (Deepgram via Vapi) — one provider + model "
                        "per language, likewise pre-filled and editable; Bengali ships nova-3 "
-                       "because Vapi's nova-2 language enum has no Bengali.",
+                       "because Vapi's nova-2 language enum has no Bengali. The Server "
+                       "credential ID references a credential in your Vapi account (its "
+                       "token = this platform's WEBHOOK_SECRET): when set, call payloads "
+                       "authenticate Vapi's server messages with that credential instead "
+                       "of your organization's default one.",
         "primary": True, "optional": False,
         "fields": [
             {"name": "api_key", "label": "API key", "secret": True, "required": True,
@@ -62,6 +66,14 @@ PROVIDERS = {
              "env_attr": "VAPI_DEFAULT_VOICE"},
             {"name": "phone_number_id", "label": "Phone number ID", "secret": False, "required": False,
              "env_attr": "VAPI_PHONE_NUMBER_ID"},
+            # ── Webhook auth (server credential) — an ID, not a
+            # secret: the credential itself lives in the tenant's Vapi
+            # account; its token equals the platform's WEBHOOK_SECRET.
+            # When set, payloads reference it (assistant.server
+            # .credentialId) so Vapi signs server messages with OUR
+            # credential instead of the organization's default one.
+            {"name": "server_credential_id", "label": "Server credential ID (webhook auth)", "secret": False, "required": False,
+             "env_attr": "VAPI_SERVER_CREDENTIAL_ID"},
             # ── Voice profiles (A6 scope addition) — identifiers, not
             # secrets: plain fields, pre-filled from "default" below.
             {"name": "en_voice_provider", "label": "English · voice provider", "secret": False, "required": False,

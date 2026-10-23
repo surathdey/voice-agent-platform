@@ -23,6 +23,14 @@ class Settings:
     VAPI_DEFAULT_MODEL: str = os.getenv("VAPI_DEFAULT_MODEL", "")
     VAPI_DEFAULT_VOICE: str = os.getenv("VAPI_DEFAULT_VOICE", "")
     VAPI_PHONE_NUMBER_ID: str = os.getenv("VAPI_PHONE_NUMBER_ID", "")
+    # Vapi server credential ID (webhook auth): the ID of a credential
+    # in the tenant's Vapi account whose token equals WEBHOOK_SECRET.
+    # When set, create-call payloads reference it on the assistant's
+    # server object (credentialId) so Vapi signs server messages with
+    # OUR credential — without it, Vapi falls back to the ORGANIZATION's
+    # default server credential and our webhook rejects every genuine
+    # message (live-proven 2026-10-23). An ID, not a secret.
+    VAPI_SERVER_CREDENTIAL_ID: str = os.getenv("VAPI_SERVER_CREDENTIAL_ID", "")
     # Vapi voice profiles (A6): per-language TTS overrides of the registry
     # defaults in app.providers (11labs voice IDs — identifiers, not
     # secrets). Empty = use the shipped defaults.

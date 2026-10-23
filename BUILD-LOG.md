@@ -1,5 +1,65 @@
 # BUILD LOG
 
+## Fix — Vapi webhook auth: reference our own server credential by ID (2026-10-23, post-A12)
+
+### The defect, plainly
+Follow-up to the `server` object fix below. The next live test still
+401'd every real Vapi server message — but this time the auth-failure
+fingerprint added in that fix showed exactly what Vapi sends:
+`x-vapi-secret` present on every message, **64 characters**, its
+sha8 not our WEBHOOK_SECRET's. The owner's Vapi dashboard named the
+mechanism: on his phone number — *"Credential fallback active — No
+credential is explicitly assigned to this phone number. Your
+organization's default server credential will be used
+automatically."* Vapi's current server-auth model is
+credential-based: real server messages are signed with the
+**organization's default server credential** token, not with our
+inline `server.secret` and not with the legacy `serverUrlSecret`.
+Our webhook was right to reject them — they were signed with a
+foreign secret.
+
+Per Vapi's docs (server-url/server-authentication), the remedy is
+to reference **our own** credential on the server object —
+`{"server": {"url": ..., "credentialId": ...}}` replaces inline
+auth. The owner creates that credential in the Vapi dashboard
+(Bearer type, header X-Vapi-Secret, no Bearer prefix, token = the
+platform's WEBHOOK_SECRET value) and pastes its ID into Settings.
+
+### Built
+- **New tenant field** on the Vapi provider, following the A6
+  pattern exactly (config env override → provider field spec →
+  Settings renders it generically): `server_credential_id`, label
+  "Server credential ID (webhook auth)", **non-secret** (it is an
+  ID; the credential and its token live in the tenant's Vapi
+  account), empty default. Env override `VAPI_SERVER_CREDENTIAL_ID`
+  in `backend/app/config.py`, documented in `.env.example`, passed
+  through `docker-compose.yml` like the other VAPI_* vars. The
+  Vapi card's description in Settings now explains the field.
+- **`backend/app/transports.py` — `build_vapi_payload`**,
+  `assistant.server` precedence: a resolved credential ID (tenant
+  field → .env) → `{"url": <webhook URL>, "credentialId": <id>}`
+  with **no** inline secret in the server object; else
+  WEBHOOK_SECRET set → the previous `{"url": ..., "secret": ...}`;
+  else no server object (unchanged). The legacy top-level
+  serverUrl/serverUrlSecret are exactly as they were.
+
+### Verification
+- `scripts/smoke_test.py`, A6 section (new sub-section "Vapi
+  server credential ID — credential-based webhook auth"): the
+  field pre-fills empty (no registry default, `secret` False); a
+  tenant override sticks with source = tenant; with the ID set to
+  a dummy `cred_test_123`, the fake-captured create-call payload's
+  `assistant.server` equals `{"url": <webhook URL>,
+  "credentialId": "cred_test_123"}` and carries no "secret" key;
+  after clearing the field, a fresh dispatch's payload is back to
+  the inline-secret shape — and the pre-existing secret-mode
+  payload assertion still passes.
+- Full suite: **627 passed / 0 failed**. NOT yet live-verified:
+  the owner's next live dispatch — with the credential created in
+  Vapi and its ID saved in Settings — is the deciding test. If any
+  real message still 401s, the fingerprint line remains the
+  evidence of what Vapi actually sent.
+
 ## Fix — Vapi webhook 401s: the `server` object + auth-failure fingerprint (2026-10-23, post-A12)
 
 ### The defect, plainly

@@ -247,10 +247,13 @@ def build_vapi_payload(session: CallSession, agent: AgentConfig,
     plus the agent's captured fields (§8.2 normalisation source), and
     the server binding the end-of-call report returns to: the legacy
     serverUrl/serverUrlSecret pair (the URL is honoured for routing —
-    live-proven) plus the assistant's `server` object carrying the same
-    URL and the §8.1 shared secret, which per Vapi's current docs is
-    the secret Vapi actually transmits as the X-Vapi-Secret header on
-    server messages (the legacy field's secret is stored/echoed only).
+    live-proven) plus the assistant's `server` object carrying the
+    same URL and the webhook authentication. Precedence on that
+    object: the tenant's server credential ID when one is configured
+    (Vapi's current credential-based auth — the credential's token is
+    what Vapi transmits as the X-Vapi-Secret header); otherwise the
+    §8.1 shared secret inline (the legacy serverUrlSecret field's
+    secret is stored/echoed only, never transmitted).
     """
     from .orchestrator import disposition_buckets  # deferred: import cycle
 
@@ -298,11 +301,28 @@ def build_vapi_payload(session: CallSession, agent: AgentConfig,
         },
         "maxDurationSeconds": agent.max_duration_s or 300,
     }
-    if settings.WEBHOOK_SECRET:
-        # The §8.1 secret on the `server` object — per Vapi's current
-        # docs (server-url/server-authentication) this inline secret
-        # is what Vapi sends as the X-Vapi-Secret header on server
-        # messages; the legacy serverUrlSecret above is stored/echoed
+    credential_id = (vapi_fields.get("server_credential_id") or "").strip()
+    if credential_id:
+        # Credential-based server auth — Vapi's current model (docs:
+        # server-url/server-authentication): the `server` object
+        # references a credential in the tenant's Vapi account whose
+        # token equals our WEBHOOK_SECRET, and that token is what
+        # Vapi sends as the X-Vapi-Secret header on server messages.
+        # Referencing OUR credential matters: without an explicit one,
+        # Vapi's "credential fallback" signs with the ORGANIZATION's
+        # DEFAULT server credential — a foreign token our webhook
+        # rightly rejects (live-proven 2026-10-23: the auth-failure
+        # fingerprint showed a 64-char x-vapi-secret, sha8 ≠ ours,
+        # while the dashboard warned the fallback was active). Per
+        # the docs, credentialId REPLACES inline auth — no secret key
+        # is sent alongside it.
+        assistant["server"] = {"url": webhook_url,
+                               "credentialId": credential_id}
+    elif settings.WEBHOOK_SECRET:
+        # Inline-secret fallback (no credential ID configured): the
+        # §8.1 secret on the `server` object — per Vapi's docs this
+        # inline secret is likewise transmitted as the X-Vapi-Secret
+        # header; the legacy serverUrlSecret above is stored/echoed
         # but not transmitted (live-proven 2026-10-23: every real
         # server message 401'd while an identical manual probe with
         # the header passed). Skipped entirely when no secret is

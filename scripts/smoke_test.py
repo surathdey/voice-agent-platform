@@ -710,6 +710,7 @@ def start_app6(port, tag, env_extra):
         "VAPI_BASE_URL": FAKE_BASE, "PLIVO_BASE_URL": FAKE_BASE,
         # Deterministic provider env: blank unless the scenario sets it.
         "VAPI_API_KEY": "", "VAPI_DEFAULT_MODEL": "", "VAPI_DEFAULT_VOICE": "",
+        "VAPI_SERVER_CREDENTIAL_ID": "",
         "PLIVO_AUTH_ID": "", "PLIVO_AUTH_TOKEN": "", "SARVAM_API_KEY": "",
     })
     env.update(env_extra)
@@ -1043,6 +1044,57 @@ try:
            gp["assistant"]["voice"] == {"provider": "11labs",
                                         "voiceId": "tenant-bn-male-override",
                                         "model": "eleven_v3"}, gp["assistant"]["voice"])
+
+    print("── A6 fix: Vapi server credential ID — credential-based webhook auth ──")
+    _, vapi_view2 = call6(baseM, "GET", "/api/settings/providers/vapi", token=tokenM)
+    vf2 = {f["name"]: f for f in vapi_view2["fields"]}
+    check6("server credential ID pre-fills empty (no registry default, not a secret)",
+           vf2["server_credential_id"]["value"] is None
+           and vf2["server_credential_id"]["source"] is None
+           and vf2["server_credential_id"]["is_set"] is False
+           and vf2["server_credential_id"]["secret"] is False,
+           vf2.get("server_credential_id"))
+    _, saved_cred = call6(baseM, "PUT", "/api/settings/providers/vapi",
+                          {"fields": {"server_credential_id": "cred_test_123"}}, token=tokenM)
+    scf = {f["name"]: f for f in saved_cred["fields"]}
+    check6("server credential ID editable per tenant (override sticks, source = tenant)",
+           scf["server_credential_id"]["value"] == "cred_test_123"
+           and scf["server_credential_id"]["source"] == "tenant",
+           scf.get("server_credential_id"))
+    before_cred = len([r for r in FAKE["requests"] if r["path"] == "/call/phone"])
+    cidC = campaign6(baseM, tokenM, rpiM["agent_id"], "A6 — Server Credential Batch",
+                     "managed",
+                     "callee_name,phone_number,bank_name,state\n"
+                     "K. Sen,9300000008,Tata Capital,West Bengal\n")
+    call6(baseM, "POST", f"/api/campaigns/{cidC}/dispatch", token=tokenM)
+    cred_reqs = [r for r in FAKE["requests"] if r["path"] == "/call/phone"][before_cred:]
+    cp = json.loads(cred_reqs[0]["body"])
+    check6("payload: credential ID set → assistant.server references it, NO inline secret",
+           cp["assistant"].get("server") == {"url": f"{baseM}/api/telephony/vapi/webhook",
+                                              "credentialId": "cred_test_123"}
+           and "secret" not in cp["assistant"].get("server", {}),
+           cp["assistant"].get("server"))
+    # Clear it again: the inline-secret fallback below (and every later
+    # section) must run exactly as before this field existed.
+    _, cleared_cred = call6(baseM, "PUT", "/api/settings/providers/vapi",
+                            {"fields": {"server_credential_id": ""}}, token=tokenM)
+    ccf = {f["name"]: f for f in cleared_cred["fields"]}
+    check6("clearing the credential ID restores the empty default",
+           ccf["server_credential_id"]["value"] is None
+           and ccf["server_credential_id"]["source"] is None,
+           ccf.get("server_credential_id"))
+    before_cred2 = len([r for r in FAKE["requests"] if r["path"] == "/call/phone"])
+    cidC2 = campaign6(baseM, tokenM, rpiM["agent_id"], "A6 — Inline Secret Fallback Batch",
+                      "managed",
+                      "callee_name,phone_number,bank_name,state\n"
+                      "L. Das,9300000009,Tata Capital,West Bengal\n")
+    call6(baseM, "POST", f"/api/campaigns/{cidC2}/dispatch", token=tokenM)
+    cred_reqs2 = [r for r in FAKE["requests"] if r["path"] == "/call/phone"][before_cred2:]
+    cp2 = json.loads(cred_reqs2[0]["body"])
+    check6("payload: credential ID cleared → assistant.server back to the inline secret",
+           cp2["assistant"].get("server") == {"url": f"{baseM}/api/telephony/vapi/webhook",
+                                               "secret": "a6-webhook-secret"},
+           cp2["assistant"].get("server"))
 
     # ── self-hosted mode: Plivo transport skeleton ────────────────────
     print("── A6: self-hosted dispatch places Plivo calls (fake provider) ──")

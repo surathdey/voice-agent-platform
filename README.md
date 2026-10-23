@@ -167,6 +167,15 @@ cd frontend && npm install && npm run dev   # http://localhost:5173, proxies /ap
       placement (HTTP 400, live-proven 2026-10-23). When a placement is
       rejected, the call record keeps the provider's own error message,
       not just the HTTP status.
+- [x] The same card carries a **Server credential ID** (webhook auth).
+      Vapi signs its server messages with a credential: a call that
+      references none is signed by the *organization's default*
+      credential instead, and this platform's webhook would reject
+      every genuine message (live-proven 2026-10-23). Create a
+      credential in your Vapi account whose token equals your
+      `WEBHOOK_SECRET`, paste its ID here, and call payloads reference
+      it (`assistant.server.credentialId`); with the field empty,
+      payloads fall back to carrying the inline server secret.
 - [x] In the Agent studio, **Voice gender** (female / male) selects
       which of the profile's voice IDs a managed call uses; the
       assistant (LLM) model is the separate Vapi **Default model**.
