@@ -245,8 +245,12 @@ def build_vapi_payload(session: CallSession, agent: AgentConfig,
     system message, an analysis plan whose structured-data schema asks
     for exactly the disposition bucket set parsed from that same prompt
     plus the agent's captured fields (§8.2 normalisation source), and
-    the serverUrl the end-of-call report returns to, authenticated by
-    the §8.1 shared secret (serverUrlSecret → x-vapi-secret header).
+    the server binding the end-of-call report returns to: the legacy
+    serverUrl/serverUrlSecret pair (the URL is honoured for routing —
+    live-proven) plus the assistant's `server` object carrying the same
+    URL and the §8.1 shared secret, which per Vapi's current docs is
+    the secret Vapi actually transmits as the X-Vapi-Secret header on
+    server messages (the legacy field's secret is stored/echoed only).
     """
     from .orchestrator import disposition_buckets  # deferred: import cycle
 
@@ -272,6 +276,7 @@ def build_vapi_payload(session: CallSession, agent: AgentConfig,
                 "description": f.get("description", "") or "",
             }
 
+    webhook_url = f"{public_base()}/api/telephony/vapi/webhook"
     assistant = {
         "model": {
             "provider": model_provider,
@@ -281,7 +286,7 @@ def build_vapi_payload(session: CallSession, agent: AgentConfig,
         "voice": vapi_voice(vapi_fields, agent, language),
         "transcriber": _vapi_transcriber(vapi_fields, language),
         "firstMessageMode": "assistant-speaks-first",
-        "serverUrl": f"{public_base()}/api/telephony/vapi/webhook",
+        "serverUrl": webhook_url,
         "serverUrlSecret": settings.WEBHOOK_SECRET,
         "analysisPlan": {
             "summaryPlan": {"enabled": True},
@@ -293,6 +298,17 @@ def build_vapi_payload(session: CallSession, agent: AgentConfig,
         },
         "maxDurationSeconds": agent.max_duration_s or 300,
     }
+    if settings.WEBHOOK_SECRET:
+        # The §8.1 secret on the `server` object — per Vapi's current
+        # docs (server-url/server-authentication) this inline secret
+        # is what Vapi sends as the X-Vapi-Secret header on server
+        # messages; the legacy serverUrlSecret above is stored/echoed
+        # but not transmitted (live-proven 2026-10-23: every real
+        # server message 401'd while an identical manual probe with
+        # the header passed). Skipped entirely when no secret is
+        # configured, so stub/local payloads are unchanged.
+        assistant["server"] = {"url": webhook_url,
+                               "secret": settings.WEBHOOK_SECRET}
     payload: dict = {
         "assistant": assistant,
         "assistantOverrides": {

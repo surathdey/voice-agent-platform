@@ -1,5 +1,61 @@
 # BUILD LOG
 
+## Fix — Vapi webhook 401s: the `server` object + auth-failure fingerprint (2026-10-23, post-A12)
+
+### The defect, plainly
+Live test, 2026-10-23: every real Vapi server message to
+`POST /api/telephony/vapi/webhook` came back **401**, so no managed
+call ever finalized — while a manual curl carrying
+`x-vapi-secret: <the configured WEBHOOK_SECRET>` with a status-update
+body returned **200** (`handled: false`, correctly ignored). The
+handler, the secret and the tunnel were each proven good; what Vapi
+actually sends on real messages was invisible from our side.
+
+Per Vapi's current docs (server-url/server-authentication; Hookdeck's
+Vapi skill), server-message authentication is opt-in and the secret
+Vapi transmits as the `X-Vapi-Secret` header lives on the assistant's
+inline **`server` object** — `{"server": {"url": ..., "secret": ...}}`.
+Our payload set only the legacy `serverUrl` / `serverUrlSecret`
+fields on the assistant: the URL is honoured for routing (the
+messages did arrive), and the secret is stored and echoed back by
+Vapi — but never transmitted as a header. Hence a correctly
+configured webhook rejecting every genuine message.
+
+### Built
+- **`backend/app/transports.py` — `build_vapi_payload`** now also
+  sets `assistant.server = {"url": <the same webhook URL>, "secret":
+  settings.WEBHOOK_SECRET}`, only when a secret is configured
+  (skipped entirely when WEBHOOK_SECRET is empty, so stub/local
+  payloads are unchanged). The legacy serverUrl/serverUrlSecret stay
+  exactly as they were — routing from them is live-proven, and the
+  duplication is the same URL.
+- **`backend/app/routers/telephony.py` — auth-failure fingerprint.**
+  On the 401 path only (responses unchanged; the body is read once
+  up front so its size is known — Starlette caches it and the
+  post-auth JSON parse is untouched), the handler logs one WARNING
+  line: sorted lowercased header NAMES, and for `x-vapi-secret` /
+  `authorization` only presence, length and the first 8 hex of the
+  value's sha256, plus the expected secret's sha8, content type and
+  body size. No header value, in whole or in part, ever reaches the
+  log. This stays as the verifier: if real messages still 401 after
+  the `server` object, one live request's fingerprint shows exactly
+  what Vapi sent.
+
+### Verification
+- `scripts/smoke_test.py`, A6 section: new payload check —
+  `assistant.server` equals {webhook URL, the configured test
+  secret}; new regression checks — the wrong-secret POST still 401s
+  and leaves exactly one fingerprint line carrying sha8(wrong
+  secret) and expected sha8(configured secret), `present=True
+  len=12`, and neither raw secret string; the correct-secret
+  status-update still returns 200 handled=false and logs no
+  fingerprint.
+- Full suite: **611 passed / 0 failed** (two runs: 610 and 611 —
+  the total wobbles by a check or two between runs, as before;
+  0 failed is stable). NOT yet live-verified: the next live Vapi
+  test decides whether real messages now arrive with the header —
+  and if any still 401, the fingerprint line is the evidence.
+
 ## Fix — Migration runner: the upgrade path (2026-10-23, post-A12)
 
 ### The defect, plainly

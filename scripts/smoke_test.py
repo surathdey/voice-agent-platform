@@ -878,6 +878,10 @@ try:
            wb["assistant"]["serverUrl"] == f"{baseM}/api/telephony/vapi/webhook"
            and wb["assistant"]["serverUrlSecret"] == "a6-webhook-secret"
            and wb["metadata"]["session_id"].startswith("ses_"), wb["assistant"]["serverUrl"])
+    check6("payload: assistant server object carries the webhook URL + secret (the secret Vapi transmits)",
+           wb["assistant"].get("server") == {"url": f"{baseM}/api/telephony/vapi/webhook",
+                                             "secret": "a6-webhook-secret"},
+           wb["assistant"].get("server"))
 
     _, callsM = call6(baseM, "GET", f"/api/campaigns/{cidM}/calls", token=tokenM)
     check6("placed calls sit in DIALING under the managed transport, no results yet",
@@ -910,15 +914,47 @@ try:
                      "transcript": "AI: Namaste, am I speaking with F. Ali?\nUser: Yes, speaking."},
         "costBreakdown": {"total": 0.11, "transport": 0.05, "stt": 0.02, "llm": 0.03, "tts": 0.01},
     }}
+    def _fp_lines6():
+        """Auth-failure fingerprint lines in the managed app's log."""
+        try:
+            with open(f"{TMP6}/managed.log", encoding="utf-8",
+                      errors="replace") as fh:
+                return [ln for ln in fh if "vapi webhook auth failed" in ln]
+        except OSError:
+            return []
+
     call6(baseM, "POST", "/api/telephony/vapi/webhook", report_body,
           headers={"x-vapi-secret": "wrong-secret"}, expect=401)
     check6("webhook rejects a wrong shared secret (401)", True)
+    # The 401 must leave exactly one header-fingerprint line in the app
+    # log: sha256 prefixes of both secrets, the header's presence and
+    # length — and NEVER a raw secret value (either secret string
+    # appearing in the line fails this check).
+    import hashlib as _hashlib6
+    _fp = []
+    for _ in range(20):
+        _fp = _fp_lines6()
+        if _fp:
+            break
+        time.sleep(0.25)
+    check6("webhook auth failure logs a header fingerprint (sha8s + lengths, no raw secrets)",
+           len(_fp) == 1
+           and "sha8=" + _hashlib6.sha256(b"wrong-secret").hexdigest()[:8] in _fp[0]
+           and "expected sha8=" + _hashlib6.sha256(b"a6-webhook-secret").hexdigest()[:8] in _fp[0]
+           and "x-vapi-secret: present=True len=12" in _fp[0]
+           and "authorization: present=False" in _fp[0]
+           and "content_type=application/json" in _fp[0]
+           and "wrong-secret" not in _fp[0]
+           and "a6-webhook-secret" not in _fp[0],
+           _fp)
     _, ack = call6(baseM, "POST", "/api/telephony/vapi/webhook",
                    {"message": {"type": "status-update",
                                 "call": {"id": fake_id_by_session[wb_session]}}},
                    headers={"x-vapi-secret": "a6-webhook-secret"})
     check6("non-result server messages are acknowledged, not finalized",
            ack["handled"] is False, ack)
+    check6("successful webhook auth logs no fingerprint",
+           len(_fp_lines6()) == 1, _fp_lines6())
     _, ack = call6(baseM, "POST", "/api/telephony/vapi/webhook", report_body,
                    headers={"x-vapi-secret": "a6-webhook-secret"})
     check6("end-of-call report lands through finalize (created=True)",

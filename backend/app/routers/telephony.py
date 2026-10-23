@@ -4,7 +4,10 @@ are called by the providers, so each route carries its own auth:
 - POST /api/telephony/vapi/webhook — Vapi server messages. Auth: the
   §8.1 shared secret, sent by Vapi as the `x-vapi-secret` header (the
   serverUrlSecret set on the assistant at dispatch). Fails closed: no
-  WEBHOOK_SECRET configured → 503; wrong secret → 401. Only
+  WEBHOOK_SECRET configured → 503; wrong secret → 401. An auth failure
+  also logs a header fingerprint at WARNING — header names, value
+  lengths and sha256 prefixes only, never values — so what a provider
+  actually sent can be identified from the log. Only
   `end-of-call-report` messages finalize; every other message type is
   acknowledged. The report is normalised into §8.2 and landed through
   orchestrator.receive_result → finalize_attempt — idempotent, so a
@@ -51,8 +54,10 @@ are called by the providers, so each route carries its own auth:
 """
 import asyncio
 import base64
+import hashlib
 import hmac
 import json
+import logging
 import time
 from datetime import datetime
 
@@ -67,6 +72,14 @@ from ..models import AgentConfig, CallSession, Campaign, Lead
 
 router = APIRouter(tags=["telephony"])
 
+log = logging.getLogger(__name__)
+
+
+def _sha8(value: str) -> str:
+    """First 8 hex of the value's sha256 — enough to tell two secrets
+    apart in a log line, never enough to recover one."""
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+
 
 def _session_or_404(db: Session, session_id: str) -> CallSession:
     s = db.get(CallSession, session_id)
@@ -79,6 +92,10 @@ def _session_or_404(db: Session, session_id: str) -> CallSession:
 
 @router.post("/api/telephony/vapi/webhook")
 async def vapi_webhook(request: Request):
+    # Read the body once, up front: the auth-failure fingerprint below
+    # needs its size, and Starlette caches the bytes so the JSON parse
+    # after auth sees exactly the same body as before.
+    raw = await request.body()
     secret = settings.WEBHOOK_SECRET
     if not secret:
         return JSONResponse(
@@ -87,9 +104,24 @@ async def vapi_webhook(request: Request):
                      "error": "WEBHOOK_SECRET is not configured — the webhook fails closed."})
     provided = request.headers.get("x-vapi-secret", "")
     if not hmac.compare_digest(provided, secret):
+        # Fingerprint, never values: which headers arrived, how long
+        # the secret-shaped ones are, and sha256 prefixes that tell
+        # "same secret" from "different secret" at a glance.
+        auth = request.headers.get("authorization", "")
+        log.warning(
+            "vapi webhook auth failed: headers=%s "
+            "x-vapi-secret: present=%s len=%d sha8=%s "
+            "authorization: present=%s scheme=%s "
+            "expected sha8=%s content_type=%s body_bytes=%d",
+            sorted(k.lower() for k in request.headers.keys()),
+            bool(provided), len(provided), _sha8(provided),
+            bool(auth), (auth.split(None, 1)[0] if auth else "-"),
+            _sha8(secret),
+            request.headers.get("content-type", "-"),
+            len(raw))
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Bad webhook secret")
     try:
-        body = await request.json()
+        body = json.loads(raw)
     except Exception:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Body must be JSON")
     message = body.get("message") or body
