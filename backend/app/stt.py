@@ -200,7 +200,7 @@ class SaarasSttSession:
     """
 
     def __init__(self, session_id: str, api_key: str, language: str,
-                 view: dict, on_final=None):
+                 view: dict, on_final=None, on_partial=None):
         self.session_id = session_id
         self.language = language
         self.view = view
@@ -209,6 +209,11 @@ class SaarasSttSession:
         # loop). Called with the turn dict, on the event loop, guarded —
         # a consumer bug must never break the STT session.
         self.on_final = on_final
+        # A9: the engine also registers for PARTIALS — a non-empty
+        # partial is the "callee just started speaking" signal that
+        # drives barge-in (cut the agent's audio) and resets the
+        # silence clock. Called with the partial text, same guards.
+        self.on_partial = on_partial
         self._api_key = api_key
         base = (settings.SARVAM_WS_URL or "wss://api.sarvam.ai").rstrip("/")
         self._url = (f"{base}/speech-to-text/ws"
@@ -281,6 +286,11 @@ class SaarasSttSession:
                     pass  # a consumer must never break the STT session
         else:
             self.view["partial"] = text
+            if self.on_partial is not None:
+                try:
+                    self.on_partial(text)
+                except Exception:
+                    pass  # a consumer must never break the STT session
 
     async def feed(self, mulaw: bytes) -> None:
         """Forward one decoded Plivo media frame. While the session is

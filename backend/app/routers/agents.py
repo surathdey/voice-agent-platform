@@ -50,6 +50,7 @@ def _out(db: Session, a: AgentConfig) -> AgentOut:
         language_rule=a.language_rule or {}, captured_fields=a.captured_fields or [],
         max_duration_s=a.max_duration_s, max_turns=a.max_turns,
         silence_prompt_after_s=a.silence_prompt_after_s,
+        silence_max_prompts=getattr(a, "silence_max_prompts", 1) or 1,
         prompt_version=_latest_version(db, a.agent_id),
     )
 
@@ -71,6 +72,7 @@ def _apply(a: AgentConfig, body: AgentIn) -> None:
     a.max_duration_s = body.max_duration_s
     a.max_turns = body.max_turns
     a.silence_prompt_after_s = body.silence_prompt_after_s
+    a.silence_max_prompts = body.silence_max_prompts
 
 
 def _get_scoped(db: Session, user: User, agent_id: str) -> AgentConfig:

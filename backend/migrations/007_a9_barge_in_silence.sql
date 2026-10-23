@@ -1,0 +1,18 @@
+-- 007_a9_barge_in_silence.sql — Phase A chunk 8 (A9: barge-in + silence
+-- handling in the self-hosted conversation loop).
+-- Barge-in itself needs no schema: an interrupted agent turn is a
+-- transcript turn carrying "interrupted": true, and transcript turns
+-- already live in the session/result JSON.
+--   agent_configs.silence_max_prompts  how many unanswered silence
+--                             prompts (design §5.2) the engine speaks
+--                             before it closes the call politely with
+--                             the prompt's closing and end_reason
+--                             no_input. Default 1 = the design's
+--                             behaviour: prompt once after
+--                             silence_prompt_after_s of customer
+--                             silence, close on the second silence.
+-- The application also creates fresh tables in this shape on boot
+-- (db.init_db from the models); this file is the DDL of record for
+-- upgrading a database created by 001–006.
+
+ALTER TABLE agent_configs ADD COLUMN silence_max_prompts INTEGER NOT NULL DEFAULT 1;

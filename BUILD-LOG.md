@@ -1,5 +1,132 @@
 # BUILD LOG
 
+## Chunk 8 — Phase A: A9 Barge-In + Silence Handling in the Self-Hosted Loop (2026-10-23)
+
+### Built
+- **Barge-in (design §5.2 — a first-class event, never an error).** The
+  A7 STT session gains an `on_partial` callback (same guarded contract
+  as `on_final`): every non-empty partial is a "the callee is
+  speaking" signal into the conversation engine. While a reply is
+  being spoken, the signal sets the engine's interrupt: the token
+  consumer races token delivery against the interrupt, the LLM stream
+  task is cancelled, unsent sentences are **never synthesised**, and
+  the in-flight sentence's frame pump stops at the next frame
+  boundary. The agent turn is recorded with **only the words actually
+  spoken** (fully delivered sentences + the in-flight sentence when at
+  least one of its frames went out) and flagged `interrupted` — in
+  the transcript, in the live view, and in the LLM history, so the
+  model never "remembers" saying words the callee never heard. A
+  model's `end_call` inside an interrupted turn is discarded — an
+  interrupted closing is not a closing. The interrupting utterance
+  then drives the next turn as normal input.
+- **clearAudio semantics (documented in the stream handler).** Two
+  cuts, honestly separated: stopping our own frame pump is the
+  **authoritative** cut (no further `playAudio` is ever sent for the
+  reply — asserted in stream order by the tests), and the handler
+  additionally sends Plivo's `clearAudio` event carrying the stream
+  id Plivo supplied, a best-effort flush of audio the provider has
+  buffered but not yet played. Audio already played cannot be
+  recalled; nothing claims otherwise.
+- **Real-time playback pacing (new, and load-bearing).** The stream
+  handler now paces outbound frames to the 8 kHz clock (20 ms per
+  160-byte μ-law frame; first frame of a burst immediate; an idle gap
+  restarts the clock). A8 forwarded whole sentences as fast as the
+  socket took them, which made "sent" meaningless next to "heard"
+  and left barge-in nothing to cut; with pacing the engine's speaking
+  window is the callee's hearing window, in production and in tests
+  alike.
+- **Silence handling (§5.2).** The engine's input wait carries a
+  deadline from the agent's `silence_prompt_after_s` (default 8 s),
+  measured from the later of the wait start and the last speech
+  activity — a callee mid-utterance (partials landing) re-arms the
+  wait and is never nudged. On expiry the engine takes a **nudge
+  turn**: an LLM turn with a bracketed engine note ("the callee has
+  been silent…") as context — the spoken wording stays the model's
+  own from the agent's prompt, nothing is hard-coded. How many
+  nudges are allowed is the new agent field **`silence_max_prompts`**
+  (migration `007_a9_barge_in_silence.sql`, Agent Studio field;
+  default **1** = the design's behaviour: one prompt, a second
+  silence closes). Any callee answer resets the counter. When the
+  prompts are exhausted the engine takes a closing turn (same
+  engine-note mechanism); if the callee answers even that, the call
+  continues, but when the closing stands the call ends with
+  end_reason **`no_input`** — assigned by the engine, deliberately
+  overriding any `agent_end_call` the model set in that turn,
+  because silence is the cause of the end.
+- **Guards interplay.** Barge-in and silence live inside the A8 turn
+  machinery, so `max_turns` / `max_duration_s` keep their exact
+  meanings; silence turns consume turns like any other, and a guard
+  that fires during a silence closing keeps its own end reason. The
+  post-call classifier sees the coherent transcript (interruption
+  markers included) and the finalize summary notes the interruption
+  count and any `no_input` ending.
+- **UI.** Agent Studio limits are now duration · max turns · silence
+  prompt after (s) · silence prompts before close, with the A9
+  behaviour spelled out in the hint. The Calls transcript renders an
+  interrupted agent turn with a gold marker: "(interrupted — only
+  the words actually spoken)".
+
+### Verification
+- `scripts/smoke_test.py`: **337 passed, 0 failed** (repeat run
+  336/0 — the one-count difference is a pre-existing poll-gated A5
+  check; every A9 check passed in both runs). All 311 pre-existing
+  checks intact, including the A8 scripted call unchanged. The new
+  A9 section runs against the same local mocks (mock Sarvam HTTP +
+  mock Saaras; no real provider called):
+  - **Barge-in scenario:** the mock Saaras emits a partial on the
+    first inbound media frame, mid-opening. Asserted: `clearAudio`
+    arrives carrying Plivo's stream id and **no `playAudio` follows
+    it** in stream order; total audio is a strict cut of the full
+    reply; TTS requests are a strict prefix of the reply's sentences
+    (unsent sentences abandoned); the interrupting line is answered
+    next; the transcript is exactly [agent (spoken prefix,
+    `interrupted`), customer, agent reply]; the LLM history for the
+    interrupting turn carries the spoken prefix, never the full
+    reply; finalize = SPOKEN, no review, summary notes the
+    interruption.
+  - **Silence scenario** (agent configured 1 s / 1 prompt): opening
+    spoken in full → nudge after the window (asserted as an LLM turn
+    carrying the silence context) → callee answers, gets a reply →
+    fresh silence earns a **fresh** nudge (counter reset) → final
+    silence: closing spoken, stream closed by the server, finalize
+    end_reason `no_input`; transcript exactly [opening, nudge,
+    answer, reply, nudge, closing].
+  - Frontend: `vite build` clean.
+- **Defect found and fixed during verification:** the first wiring
+  passed the engine's zero-argument `note_speech_activity` where
+  the STT session calls `on_partial(text)`; the resulting TypeError
+  was swallowed by the STT session's (correct) "a consumer must
+  never break the session" guard, so partials landed in the live
+  view but never reached the engine. The engine method now accepts
+  the partial text, mirroring `on_final`'s contract. Both legs were
+  additionally proven in isolation (STT probe + paced engine probe)
+  before the integrated run went green.
+
+### Known limitations (deliberate, for this chunk)
+- The barge-in trigger is the STT partial signal (design-sanctioned:
+  it is the speech signal we have). Raw inbound-media energy
+  detection is not implemented — a callee making non-speech noise
+  will not cut the agent, and a partial that arrives in the same
+  instant a reply ends is treated as the next turn's input, which
+  is the correct outcome anyway.
+- `clearAudio` is best-effort by construction: Plivo offers no
+  acknowledgement for it, and the platform does not pretend the
+  provider's buffer state is knowable. The authoritative guarantee
+  is on our side of the socket (no further frames).
+- Silence timing is wall-clock from the agent's configured seconds;
+  per-campaign overrides do not exist (silence is agent behaviour,
+  like max turns).
+- Still **not proven against the live Sarvam/Plivo APIs** — no keys
+  yet (owner step, unchanged). Everything above is mock-verified.
+
+### Next step
+**A10 — Campaign dispatch at scale, results surface & dashboard,
+managed-mode parity:** scheduled dispatch of a campaign's leads
+through the A5 orchestrator in both modes, the end-of-campaign
+output (per-agent spreadsheet shape), campaign progress/results
+views, and the managed (Vapi) path reaching the same §8.2 result
+surface as the self-hosted loop.
+
 ## Chunk 7 — Phase A: A8 Full Conversation Loop — STT → LLM → TTS in the Self-Hosted Stream (2026-10-23)
 
 ### Built

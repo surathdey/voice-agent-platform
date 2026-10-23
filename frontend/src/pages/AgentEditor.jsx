@@ -8,6 +8,7 @@ const EMPTY = {
   tts_provider: 'bulbul', tts_voice_id: '', voice_gender: 'female',
   language_rule: { default: 'hi-IN', by_state: {} },
   captured_fields: [], max_duration_s: 300, max_turns: 50, silence_prompt_after_s: 8,
+  silence_max_prompts: 1,
 }
 
 const FIELD_TYPES = ['string', 'date', 'number', 'boolean']
@@ -144,13 +145,14 @@ export default function AgentEditor({ agentId, onBack }) {
               <option value="male">Male</option>
             </select>
             <div className="hint">Managed mode: selects the female / male voice ID in the tenant's Vapi voice profile for the call's language.</div></div>
-          <div className="field"><label>Max call duration (s) · max turns · silence prompt after (s)</label>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8 }}>
+          <div className="field"><label>Max call duration (s) · max turns · silence prompt after (s) · silence prompts before close</label>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 8 }}>
               <input type="number" value={form.max_duration_s} onChange={(e) => set('max_duration_s', Number(e.target.value))} />
               <input type="number" value={form.max_turns ?? 50} onChange={(e) => set('max_turns', Number(e.target.value))} />
               <input type="number" value={form.silence_prompt_after_s} onChange={(e) => set('silence_prompt_after_s', Number(e.target.value))} />
+              <input type="number" value={form.silence_max_prompts ?? 1} onChange={(e) => set('silence_max_prompts', Number(e.target.value))} />
             </div>
-            <div className="hint">Max turns / duration are the self-hosted conversation loop's guards (A8) — a call that hits either ends honestly with that end reason.</div></div>
+            <div className="hint">Max turns / duration are the self-hosted conversation loop's guards (A8) — a call that hits either ends honestly with that end reason. Silence (A9): after the silence window the agent prompts the customer; when the prompts run out it closes politely with the prompt's closing (end reason no_input). If the customer speaks mid-reply, the agent's audio is cut instantly (barge-in) and the reply is recorded with only the words actually spoken.</div></div>
         </div>
 
         <div className="section-title"><span className="marker">3</span> Language rule (structured)</div>

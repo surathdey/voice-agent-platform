@@ -5,16 +5,20 @@ Voice Agent Platform V2 (Greenfield + QGBS MVP)*. Agents are **data, not
 code**: each agent is one prompt plus structured voice/model/language
 configuration, run in campaigns against lead lists.
 
-**This build = Phase A, chunks 1–7: A1 (tenancy + core data model), A2
+**This build = Phase A, chunks 1–8: A1 (tenancy + core data model), A2
 (Agent Config Studio), A3 (Campaigns & Leads), A4 (Provider Settings),
 A5 (Orchestrator skeleton — dispatch + stub transport + §8.2 results),
 A6 (Telephony spike — real Vapi + Plivo transports behind the same
 boundary, per-language Vapi voice profiles), A7 (STT live — Sarvam
-Saaras inside the media stream) and A8 (the full conversation loop —
+Saaras inside the media stream), A8 (the full conversation loop —
 Saaras finals → Sarvam LLM → Bulbul TTS, with post-call classification
-against the agent prompt's own disposition definitions).**
+against the agent prompt's own disposition definitions) and A9
+(barge-in + silence handling inside the loop — callee speech cuts
+the agent's audio, silence earns a prompt, then an honest
+`no_input` close).**
 See `BUILD-LOG.md` for what is verified and what comes next
-(A9: barge-in / silence handling inside the loop).
+(A10: campaign dispatch at scale, results/dashboard, managed-mode
+parity).
 
 ## Run it (Docker — the owner's route)
 
@@ -182,6 +186,26 @@ cd frontend && npm install && npm run dev   # http://localhost:5173, proxies /ap
       unparseable) is never stored: disposition stays empty and the
       result is flagged for review with the reason in the summary.
 
+**A9 — Barge-in + silence (inside the self-hosted loop)**
+- [ ] Talk over the agent mid-reply (any speech the STT hears): the
+      audio stops at once, a `clearAudio` flush is sent to the stream,
+      and the agent answers what you actually said. Expand the call:
+      the cut turn is marked *(interrupted — only the words actually
+      spoken)* and the transcript holds only the words that were
+      really spoken before the cut.
+- [ ] Say nothing after the agent's turn: after **Silence prompt
+      after (s)** (Agent studio; default 8) the agent prompts you —
+      wording comes from its own prompt via the LLM, nothing is
+      hard-coded. Answer, and the conversation continues; the prompt
+      counter resets.
+- [ ] Stay silent through **Silence prompts before close** prompts
+      (default 1): the agent speaks its closing and the call ends
+      with end reason `no_input` on the Calls page.
+- [ ] Outbound audio is paced to real time (20 ms per frame), so
+      what the platform counts as "spoken" is what the callee has
+      actually heard — that is what makes the interruption record
+      honest.
+
 ## Design decisions that override the design doc
 
 1. **Single prompt (owner, 2026-10-23).** The design doc's three-layer prompt
@@ -208,15 +232,16 @@ backend/    FastAPI app (app/models.py = all six design entities + prompt_versio
             report mapping, Plivo create-call + answer XML + spike outcomes;
             app/stt.py = the STT leg (A7): Saaras streaming client, live
             transcript view, per-session STT persistence;
-            app/conversation.py = the conversation brain (A8): Sarvam
+            app/conversation.py = the conversation brain (A8/A9): Sarvam
             chat-completions client (prompt as system prompt, end_call
             tool), sentence chunker, Bulbul TTS client, the per-call turn
-            engine, and the post-call classifier;
+            engine (barge-in interrupts, silence prompts, no_input
+            close), and the post-call classifier;
             app/routers/ = auth, tenants, agents, campaigns, settings, calls,
             telephony (provider webhook / answer / stream routes);
             migrations/001–006 = DDL of record)
 frontend/   React (Vite) console — theme tokens in src/theme.css (wireframe design language);
             pages: Agents, AgentEditor, Campaigns, CampaignWizard, CampaignDetail, LeadsUpload, Settings, Calls
-scripts/    smoke_test.py — automated acceptance checks (A1 + A2 + A3 + A4 + A5 + A6 + A7 + A8)
+scripts/    smoke_test.py — automated acceptance checks (A1 + A2 + A3 + A4 + A5 + A6 + A7 + A8 + A9)
 docker-compose.yml   db (PostgreSQL 16) + backend + frontend (nginx)
 ```

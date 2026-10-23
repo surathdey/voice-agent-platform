@@ -99,6 +99,12 @@ class AgentConfig(Base):
     # honestly (end_reason max_turns) once this many agent turns have run.
     max_turns: Mapped[int] = mapped_column(Integer, default=50)
     silence_prompt_after_s: Mapped[int] = mapped_column(Integer, default=8)
+    # Silence prompts before the polite close (A9, design §5.2): after
+    # this many unanswered silence prompts the engine speaks the
+    # prompt's closing and ends the call (end_reason no_input).
+    # Default 1 = the design's behaviour: one prompt, a second silence
+    # closes the call.
+    silence_max_prompts: Mapped[int] = mapped_column(Integer, default=1)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke tests for Phase A chunks 1–6 (A1–A7) against a running server.
+"""Smoke tests for Phase A chunks 1–8 (A1–A9) against a running server.
 
 Usage:  python3 scripts/smoke_test.py [base_url]     (default http://localhost:8000)
         Run with the backend venv python (backend/.venv/bin/python) —
@@ -1789,6 +1789,379 @@ try:
 
     _ai_server.shutdown()
     _stt8_server.shutdown()
+
+    print("── A9: barge-in + silence — partials cut the agent, silence nudges then closes ──")
+    # Same mock pattern as A8, two A9 twists: the mock Saaras can emit
+    # PARTIALS (the barge-in trigger) and stays mute on demand (the
+    # silence scenarios), and the mock Bulbul returns ENLARGED audio
+    # for the barge opening's sentences (~25 frames each; paced at
+    # 20 ms/frame by the stream handler, each sentence plays ~0.5 s)
+    # so the interruption deterministically lands mid-reply. The
+    # silence agent runs silence_prompt_after_s=1 /
+    # silence_max_prompts=1, so the whole nudge → answer → nudge →
+    # polite-close arc plays in seconds.
+    import base64 as _b64_9
+    from websockets.sync.client import connect as _ws_connect9
+
+    _LI_9 = "Wait, I have a question."
+    _LANS_9 = "Yes, I am here."
+    _B1_9 = "First, let me explain the reason for this call in some detail."
+    _B2_9 = "Second, there are several options we should walk through together."
+    _B3_9 = "Third, I will confirm the next steps before we finish."
+    _OPEN_B_9 = _B1_9 + " " + _B2_9 + " " + _B3_9
+    _RB_9 = "Of course, please go ahead and ask your question."
+    _OPEN_9 = "Hello, I am calling about your loan account. Am I speaking with the account holder?"
+    _OPEN_SENT_9 = ["Hello, I am calling about your loan account.",
+                    "Am I speaking with the account holder?"]
+    _NUDGE_9 = "Hello, are you still there?"
+    _RANS_9 = "Thank you for confirming. Let me pull up your account details."
+    _CLOSE_9 = "Since I cannot hear you, I will close this call now. Goodbye."
+
+
+    def _mock_audio9(text):
+        rep = 60 if text.startswith(("First,", "Second,", "Third,")) else 3
+        return ("<tts:" + text + ">").encode() * rep
+
+
+    _FULL_B_AUDIO_9 = sum(len(_mock_audio9(s)) for s in (_B1_9, _B2_9, _B3_9))
+
+    MOCK_AI9 = {"chat": [], "classify": [], "tts": []}
+
+
+    class _MockSarvamAI9(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def _send(self, code, data, ctype="application/json"):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _json(self, code, obj):
+            self._send(code, json.dumps(obj).encode())
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b""
+            try:
+                body = json.loads(raw) if raw else {}
+            except Exception:
+                body = {}
+            if self.path == "/chat/completions":
+                self._chat(body)
+            elif self.path == "/text-to-speech":
+                MOCK_AI9["tts"].append(body)
+                text = (body.get("inputs") or [""])[0]
+                self._json(200, {"audios": [_b64_9.b64encode(_mock_audio9(text)).decode()]})
+            else:
+                self._json(404, {})
+
+        def _chat(self, body):
+            msgs = body.get("messages") or []
+            system = msgs[0].get("content", "") if msgs else ""
+            if "POST-CALL CLASSIFIER" in system:
+                MOCK_AI9["classify"].append(body)
+                self._json(200, {"choices": [{"message": {"role": "assistant",
+                    "content": json.dumps({
+                        "disposition": "SPOKEN", "captured_fields": {},
+                        "confidence": 0.91,
+                        "summary": "Mock classifier (A9): the callee spoke."})}}]})
+                return
+            MOCK_AI9["chat"].append(body)
+            users = [m.get("content", "") for m in msgs if m.get("role") == "user"]
+            last = users[-1] if users else ""
+            end_call = False
+            if "been silent" in last:
+                pieces = [_NUDGE_9]
+            elif "not responded" in last:
+                pieces = [_CLOSE_9]
+                end_call = True
+            elif last == _LI_9:
+                pieces = [_RB_9]
+            elif last == _LANS_9:
+                pieces = [_RANS_9]
+            elif "BARGE TEST AGENT" in system:
+                pieces = ["First, let me explain the reason ",
+                          "for this call in some detail. ",
+                          "Second, there are several options ",
+                          "we should walk through together. ",
+                          "Third, I will confirm the next steps ",
+                          "before we finish."]
+            else:
+                pieces = ["Hello, I am calling about your loan account. ",
+                          "Am I speaking with the account holder?"]
+            lines = []
+            for p in pieces:
+                lines.append("data: " + json.dumps(
+                    {"choices": [{"delta": {"content": p}}]}) + "\n\n")
+            if end_call:
+                lines.append("data: " + json.dumps({"choices": [{"delta": {"tool_calls": [
+                    {"index": 0, "id": "call_end_9", "type": "function",
+                     "function": {"name": "end_call", "arguments": ""}}]}}]}) + "\n\n")
+            lines.append("data: [DONE]\n\n")
+            self._send(200, "".join(lines).encode(), "text/event-stream")
+
+
+    _ai9_server = ThreadingHTTPServer(("127.0.0.1", 0), _MockSarvamAI9)
+    threading.Thread(target=_ai9_server.serve_forever, daemon=True).start()
+    MOCK_AI9_URL = f"http://127.0.0.1:{_ai9_server.server_address[1]}"
+
+    MOCK_STT9 = {"mode": "barge", "connections": []}
+
+
+    def _mock_saaras9(ws):
+        req = ws.request
+        info = {"path": req.path if req else "", "frames": 0}
+        MOCK_STT9["connections"].append(info)
+        try:
+            for raw in ws:
+                try:
+                    msg = json.loads(raw)
+                except Exception:
+                    continue
+                if "audio" not in msg:
+                    continue
+                info["frames"] += 1
+                mode = MOCK_STT9["mode"]
+                if mode == "barge" and info["frames"] == 1:
+                    ws.send(json.dumps({"type": "data", "data": {
+                        "transcript": "Wait, I have", "is_final": False}}))
+                elif mode == "barge" and info["frames"] == 2:
+                    ws.send(json.dumps({"type": "data", "data": {
+                        "transcript": _LI_9, "is_final": True}}))
+                elif mode == "talk" and info["frames"] == 1:
+                    ws.send(json.dumps({"type": "data", "data": {
+                        "transcript": _LANS_9, "is_final": True}}))
+        except Exception:
+            pass  # client went away mid-stream — the mock just stops
+
+
+    _stt9_server = _ws_serve7(_mock_saaras9, "127.0.0.1", 0)
+    threading.Thread(target=_stt9_server.serve_forever, daemon=True).start()
+    MOCK_STT9_URL = f"ws://127.0.0.1:{_stt9_server.socket.getsockname()[1]}"
+
+    _PROMPT_B_9 = """ROLE
+    You are the BARGE TEST AGENT, a scripted platform test agent.
+
+    FLOW
+    1. Explain the call in three parts, then take the customer's question.
+
+    DISPOSITIONS - classify the finished call into exactly ONE disposition:
+    - SPOKEN: the callee spoke during the call.
+    - NO_CONTACT: nobody spoke.
+
+    CLOSINGS
+    Always close politely and briefly.
+    """
+
+    _PROMPT_S_9 = """ROLE
+    You are the SILENCE TEST AGENT, a scripted platform test agent.
+
+    FLOW
+    1. Greet the customer and ask whether they are the account holder.
+    2. When they answer, thank them and confirm the details are being opened.
+
+    DISPOSITIONS - classify the finished call into exactly ONE disposition:
+    - SPOKEN: the callee spoke during the call.
+    - NO_CONTACT: nobody spoke.
+
+    CLOSINGS
+    Close politely and briefly.
+    """
+
+
+    def _collect9(ws, sink, events, seconds):
+        """Read the stream for `seconds`, accumulating playAudio bytes
+        into sink and EVERY event (in order) into events — the order
+        is what proves no audio follows a clearAudio."""
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            try:
+                raw = ws.recv(timeout=max(0.05, deadline - time.monotonic()))
+            except TimeoutError:
+                break
+            except Exception:
+                events.append({"event": "__closed__"})
+                break
+            try:
+                ev = json.loads(raw)
+            except Exception:
+                continue
+            events.append(ev)
+            if ev.get("event") == "playAudio":
+                sink.extend(_b64_9.b64decode((ev.get("media") or {}).get("payload") or ""))
+
+
+    def _until9(ws, sink, events, pred, timeout=12):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not pred():
+            _collect9(ws, sink, events, 0.4)
+        return pred()
+
+
+    baseA9 = start_app6(18110, "a9-live", {
+        "TELEPHONY_MODE": "self_hosted", "PLIVO_AUTH_ID": "MAFAKEID",
+        "PLIVO_AUTH_TOKEN": "fake-plivo-token", "SARVAM_API_KEY": "sk-fake-sarvam",
+        "SARVAM_WS_URL": MOCK_STT9_URL, "SARVAM_BASE_URL": MOCK_AI9_URL,
+    })
+    tokenA9 = login6(baseA9)
+
+    # ── config surface: the silence knobs exist with design defaults ──
+    _, agB9 = call6(baseA9, "POST", "/api/agents", {
+        "name": "A9 Barge Agent", "prompt": _PROMPT_B_9,
+        "tts_voice_id": "bulbul-bn-female-1",
+        "language_rule": {"default": "hi-IN", "by_state": {"West Bengal": "bn-IN"}},
+        "captured_fields": [{"name": "account_holder", "type": "boolean",
+                             "description": "Whether the callee is the account holder"}],
+    }, token=tokenA9, expect=201)
+    check6("A9: silence config defaults — prompt after 8s, 1 prompt before the close (§5.2)",
+           agB9["silence_prompt_after_s"] == 8 and agB9["silence_max_prompts"] == 1,
+           {k: agB9.get(k) for k in ("silence_prompt_after_s", "silence_max_prompts")})
+    _, agS9 = call6(baseA9, "POST", "/api/agents", {
+        "name": "A9 Silence Agent", "prompt": _PROMPT_S_9,
+        "tts_voice_id": "bulbul-bn-female-1",
+        "silence_prompt_after_s": 1, "silence_max_prompts": 1,
+        "language_rule": {"default": "hi-IN", "by_state": {"West Bengal": "bn-IN"}},
+        "captured_fields": [{"name": "account_holder", "type": "boolean",
+                             "description": "Whether the callee is the account holder"}],
+    }, token=tokenA9, expect=201)
+    check6("A9: silence knobs are agent-configurable (1s / 1 prompt for the test agent)",
+           agS9["silence_prompt_after_s"] == 1 and agS9["silence_max_prompts"] == 1,
+           {k: agS9.get(k) for k in ("silence_prompt_after_s", "silence_max_prompts")})
+
+    # ── barge-in: partial mid-reply cuts the audio ────────────────────
+    cidB9 = campaign6(baseA9, tokenA9, agB9["agent_id"], "A9 — Barge Batch",
+                      "self_hosted",
+                      "callee_name,phone_number,bank_name,state\n"
+                      "V. Rao,9500000031,Tata Capital,West Bengal\n")
+    call6(baseA9, "POST", f"/api/campaigns/{cidB9}/dispatch", token=tokenA9)
+    _, callsB9 = call6(baseA9, "GET", f"/api/campaigns/{cidB9}/calls", token=tokenA9)
+    sB9 = callsB9["calls"][0]
+    MOCK_STT9["mode"] = "barge"
+    chat_b0, tts_b0 = len(MOCK_AI9["chat"]), len(MOCK_AI9["tts"])
+    audioB9, eventsB9 = bytearray(), []
+    wsB9 = _stream_open8(baseA9, tokenA9, sB9["session_id"])
+    okB = _until9(wsB9, audioB9, eventsB9, lambda: len(audioB9) >= 160, 10)
+    check6("A9: the barge opening starts playing (audio flowing before the interruption)",
+           okB and len(audioB9) >= 160, len(audioB9))
+    _media8(wsB9)  # media frame 1 → mock Saaras emits the partial "Wait, I have"
+    okB = _until9(wsB9, audioB9, eventsB9,
+                  lambda: any(e.get("event") == "clearAudio" for e in eventsB9), 10)
+    check6("A9: BARGE-IN — the partial cuts the reply and the transport is told to flush (clearAudio)",
+           okB, [e.get("event") for e in eventsB9][-6:])
+    _collect9(wsB9, audioB9, eventsB9, 1.0)  # settle: anything already queued drains
+    idx_clear = next((i for i, e in enumerate(eventsB9)
+                      if e.get("event") == "clearAudio"), -1)
+    check6("A9: clearAudio carries the stream id Plivo supplied, and NO playAudio follows it",
+           idx_clear >= 0
+           and eventsB9[idx_clear].get("stream_id") == "str-a8"
+           and all(e.get("event") != "playAudio" for e in eventsB9[idx_clear:]),
+           eventsB9[idx_clear] if idx_clear >= 0 else None)
+    check6("A9: the opening was cut short — some audio heard, never the whole reply",
+           0 < len(audioB9) < _FULL_B_AUDIO_9, (len(audioB9), _FULL_B_AUDIO_9))
+    ttsB = [t["inputs"][0] for t in MOCK_AI9["tts"][tts_b0:]]
+    check6("A9: unsent sentences were abandoned — TTS requests are a strict prefix of the reply",
+           len(ttsB) >= 1 and ttsB == [_B1_9, _B2_9, _B3_9][:len(ttsB)], ttsB)
+    audio_at_cut = len(audioB9)
+    _media8(wsB9)  # media frame 2 → the interrupting line lands as a final
+    okB = _until9(wsB9, audioB9, eventsB9,
+                  lambda: len(audioB9) >= audio_at_cut + len(_mock_audio9(_RB_9)), 10)
+    check6("A9: the interrupting line becomes the next turn — its reply is spoken",
+           okB, (len(audioB9), audio_at_cut))
+    _stream_stop8(wsB9)
+    doneB9 = poll8(baseA9, tokenA9, cidB9, sB9["session_id"],
+                   lambda c: c["final_state"] is not None)
+    tB9 = (doneB9 or {}).get("transcript") or []
+    spokenB = tB9[0]["text"] if tB9 else ""
+    check6("A9: the interrupted turn is recorded with ONLY the words actually spoken",
+           doneB9 is not None and len(tB9) == 3
+           and tB9[0]["speaker"] == "agent" and tB9[0].get("interrupted") is True
+           and spokenB != "" and _OPEN_B_9.startswith(spokenB)
+           and tB9[1]["speaker"] == "customer" and tB9[1]["text"] == _LI_9
+           and tB9[2]["speaker"] == "agent" and tB9[2]["text"] == _RB_9,
+           tB9)
+    check6("A9: the classifier sees the coherent interrupted transcript — SPOKEN, no review",
+           doneB9 is not None and doneB9["disposition"] == "SPOKEN"
+           and doneB9["review_required"] is False
+           and "interrupted the agent" in doneB9["summary"], doneB9)
+    chatsB = [c for c in MOCK_AI9["chat"][chat_b0:]
+              if any(m.get("role") == "user" and m.get("content") == _LI_9
+                     for m in c["messages"])]
+    check6("A9: LLM history carries the SPOKEN part as the assistant line (never the full reply)",
+           len(chatsB) == 1
+           and any(m.get("role") == "assistant" and m.get("content") == spokenB
+                   for m in chatsB[0]["messages"])
+           and not any(m.get("role") == "assistant" and m.get("content") == _OPEN_B_9
+                       for m in chatsB[0]["messages"]),
+           [m.get("content") for c in chatsB for m in c["messages"]
+            if m.get("role") == "assistant"])
+
+    # ── silence: nudge → answer resets → nudge again → polite close ──
+    cidS9 = campaign6(baseA9, tokenA9, agS9["agent_id"], "A9 — Silence Batch",
+                      "self_hosted",
+                      "callee_name,phone_number,bank_name,state\n"
+                      "W. Khan,9500000032,Tata Capital,West Bengal\n")
+    call6(baseA9, "POST", f"/api/campaigns/{cidS9}/dispatch", token=tokenA9)
+    _, callsS9 = call6(baseA9, "GET", f"/api/campaigns/{cidS9}/calls", token=tokenA9)
+    sS9 = callsS9["calls"][0]
+    MOCK_STT9["mode"] = "talk"
+    chat_s0, tts_s0 = len(MOCK_AI9["chat"]), len(MOCK_AI9["tts"])
+    audioS9, eventsS9 = bytearray(), []
+    wsS9 = _stream_open8(baseA9, tokenA9, sS9["session_id"])
+    open_target = sum(len(_mock_audio9(s)) for s in _OPEN_SENT_9)
+    okS = _until9(wsS9, audioS9, eventsS9, lambda: len(audioS9) >= open_target, 10)
+    check6("A9: silence scenario — the opening is spoken in full first",
+           okS and len(audioS9) == open_target, len(audioS9))
+    okS = _until9(wsS9, audioS9, eventsS9,
+                  lambda: len(audioS9) >= open_target + len(_mock_audio9(_NUDGE_9)), 12)
+    ttsS = [t["inputs"][0] for t in MOCK_AI9["tts"][tts_s0:]]
+    check6("A9: SILENCE — after the configured window the agent speaks a nudge",
+           okS and _NUDGE_9 in ttsS, ttsS)
+    chatsS = MOCK_AI9["chat"][chat_s0:]
+    check6("A9: the nudge is an LLM turn carrying the silence context (wording stays the model's)",
+           any(m.get("role") == "user" and "been silent" in m.get("content", "")
+               for c in chatsS for m in c["messages"]),
+           [m.get("content") for c in chatsS for m in c["messages"]][-2:])
+    _media8(wsS9)  # the callee finally answers — the silence counter must reset
+    okS = _until9(wsS9, audioS9, eventsS9,
+                  lambda: len(audioS9) >= open_target + len(_mock_audio9(_NUDGE_9))
+                  + len(_mock_audio9(_RANS_9)), 10)
+    check6("A9: the answer after the nudge gets a normal reply",
+           okS, len(audioS9))
+    okS = _until9(wsS9, audioS9, eventsS9,
+                  lambda: len(audioS9) >= open_target + 2 * len(_mock_audio9(_NUDGE_9))
+                  + len(_mock_audio9(_RANS_9)), 12)
+    ttsS = [t["inputs"][0] for t in MOCK_AI9["tts"][tts_s0:]]
+    check6("A9: a fresh silence earns a fresh nudge (the counter reset on the answer)",
+           okS and ttsS.count(_NUDGE_9) == 2
+           and not any(e.get("event") == "__closed__" for e in eventsS9), ttsS)
+    okS = _until9(wsS9, audioS9, eventsS9,
+                  lambda: any(e.get("event") == "__closed__" for e in eventsS9), 12)
+    tts_close = [t["inputs"][0] for t in MOCK_AI9["tts"][tts_s0:]]
+    check6("A9: prompts exhausted — the polite closing is spoken and the stream ends",
+           okS and "Goodbye." in tts_close
+           and any(t.startswith("Since I cannot hear you") for t in tts_close),
+           tts_close[-2:])
+    try:
+        wsS9.close()
+    except Exception:
+        pass
+    doneS9 = poll8(baseA9, tokenA9, cidS9, sS9["session_id"],
+                   lambda c: c["final_state"] is not None)
+    check6("A9: the silence-ended call finalizes with end_reason no_input (not agent_end_call)",
+           doneS9 is not None and doneS9["final_state"] == "COMPLETED"
+           and doneS9["end_reason"] == "no_input", doneS9 and doneS9["end_reason"])
+    check6("A9: silence transcript — opening, nudge, answer, reply, nudge, closing, in order",
+           doneS9 is not None
+           and [t["text"] for t in doneS9["transcript"]] ==
+               [_OPEN_9, _NUDGE_9, _LANS_9, _RANS_9, _NUDGE_9, _CLOSE_9]
+           and doneS9["disposition"] == "SPOKEN"
+           and "no input" in doneS9["summary"], doneS9 and doneS9["transcript"])
+
+    _ai9_server.shutdown()
+    _stt9_server.shutdown()
 
 finally:
     for _p in _procs6:

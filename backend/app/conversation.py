@@ -45,6 +45,36 @@ A7. LLM/TTS HTTP goes to SARVAM_BASE_URL — the override seam the smoke
 suite points at a local mock Sarvam server; no real provider is called
 in tests.
 
+A9 — barge-in + silence (design §5.2), inside this same loop:
+
+- **Barge-in.** The STT leg reports every non-empty partial through
+  `note_speech_activity()`. While a reply is being spoken, that signal
+  IS an interruption: the engine stops pumping audio frames for the
+  current reply at the next frame boundary, abandons the reply's
+  unsent sentences (they are never synthesised or spoken), asks the
+  transport to flush its buffered audio (the `clear_audio` callback —
+  Plivo's clearAudio message, best-effort; the pump stop is the
+  authoritative cut, and any audio the provider had already played
+  out cannot be recalled), and records the agent turn with ONLY the
+  words actually spoken, flagged `interrupted`. The model's end_call
+  action in an interrupted turn is discarded — the customer took the
+  floor, and their utterance (already queued by the STT leg) becomes
+  the next turn's input. Interruption is a first-class event, never
+  an error.
+- **Silence.** While the engine waits for the customer, a silence
+  deadline runs: `silence_prompt_after_s` past the later of the last
+  agent turn's end and the last STT speech activity (partials count —
+  a customer mid-utterance is never nudged). On a trip, the engine
+  speaks a nudge (an LLM turn carrying a bracketed silence context,
+  the same device as the kickoff); a customer answer resets the
+  counter. Once `silence_max_prompts` nudges have gone unanswered,
+  the next silence speaks the polite closing (an LLM turn carrying
+  the closing context, so the wording is the prompt's own CLOSINGS)
+  and the call ends with end_reason `no_input` — named ahead of the
+  model's own end_call in that turn, because silence is the cause.
+  The max_turns / max_duration guards still outrank the close when
+  they are what actually fires.
+
 Threading: the LLM stream and the TTS requests are blocking HTTP, so a
 turn's producer runs in a worker thread and hands tokens to the event
 loop through a queue; TTS runs via asyncio.to_thread per sentence. The
@@ -66,6 +96,16 @@ from .config import settings
 # greeting, first question) — no greeting text lives in code.
 KICKOFF = ("[The call has just connected. Begin the conversation now, "
            "following your FLOW — speak your opening line.]")
+
+# The two silence contexts (A9, design §5.2) — bracketed engine notes in
+# the same style as KICKOFF: the nudge/closing WORDING stays the
+# model's own, from the agent's prompt; these only name the situation.
+SILENCE_NUDGE = ("[The customer has been silent since your last line. "
+                 "Prompt them once — briefly and politely, following "
+                 "your instructions.]")
+SILENCE_CLOSING = ("[The customer has not responded after repeated "
+                   "prompts. Close the call politely now, following "
+                   "your CLOSINGS, and end the call.]")
 
 END_CALL_TOOL = {
     "type": "function",
@@ -368,6 +408,14 @@ def conversation_outcome(duration_s: int, turns: list, end_reason: str,
                      "the transcript is partial")
     if tts_status == "failed":
         notes.append("TTS leg failed — the callee may not have heard every reply")
+    interruptions = sum(1 for t in out_turns if t.get("interrupted"))
+    if interruptions:
+        notes.append(
+            f"the customer interrupted the agent {interruptions} time(s) — "
+            "interrupted replies are recorded with the words actually spoken")
+    if end_reason == "no_input":
+        notes.append("the call ended after repeated customer silence "
+                     "(no input), following the polite closing")
     summary = (
         "[SELF-HOSTED] Full conversation loop — Sarvam Saaras STT → "
         "Sarvam LLM → Bulbul TTS. "
@@ -412,7 +460,8 @@ class ConversationEngine:
     """
 
     def __init__(self, *, session_id: str, agent, campaign, lead,
-                 language: str, api_key: str, send_audio, close_stream):
+                 language: str, api_key: str, send_audio, close_stream,
+                 clear_audio=None):
         from .transports import lead_variables
 
         self.session_id = session_id
@@ -420,6 +469,10 @@ class ConversationEngine:
         self._api_key = api_key
         self._send_audio = send_audio      # async: bytes -> one playAudio frame set
         self._close_stream = close_stream  # async: ends the Plivo stream (end-call)
+        # A9: async flush of the provider's buffered outbound audio
+        # (Plivo clearAudio) on barge-in; None when the transport has
+        # no such message — stopping our own frame pump is the cut.
+        self._clear_audio = clear_audio
         self._prompt = render_prompt(agent.prompt or "",
                                      lead_variables(campaign, lead))
         self._model = agent.llm_model or "sarvam-105b"
@@ -427,6 +480,10 @@ class ConversationEngine:
                                        agent.voice_gender or "female")
         self._max_duration_s = int(agent.max_duration_s or 300)
         self._max_turns = int(getattr(agent, "max_turns", 50) or 50)
+        self._silence_after_s = int(
+            getattr(agent, "silence_prompt_after_s", 8) or 8)
+        _smp = getattr(agent, "silence_max_prompts", 1)
+        self._silence_max_prompts = 1 if _smp is None else int(_smp)
         self.captured_fields = list(agent.captured_fields or [])
 
         self.turns: list[dict] = []        # the conversation, in order
@@ -438,13 +495,20 @@ class ConversationEngine:
         self.llm_detail = ""
         self.tts_status = "active"
         self.tts_detail = ""
-        self.end_reason = ""               # agent_end_call | max_turns | max_duration
+        self.end_reason = ""               # agent_end_call | max_turns | max_duration | no_input
         self._inbox: asyncio.Queue = asyncio.Queue()
         self._task: asyncio.Task | None = None
         self._t0: float | None = None
         self._agent_turns = 0
         self._ended = False
         self._send_dead = False
+        # A9 state: playback + interruption + silence bookkeeping.
+        self._speaking = False             # a reply turn is being spoken
+        self._interrupt = asyncio.Event()  # set by barge-in mid-reply
+        self._interruptions = 0
+        self._idle_since = 0.0             # when the current wait began
+        self._last_speech_at = 0.0         # last STT partial/final stamp
+        self._silence_prompts_used = 0     # consecutive unanswered nudges
 
     # ── surface for the stream handler ──────────────────────────────
     @property
@@ -463,9 +527,24 @@ class ConversationEngine:
         """STT leg → engine: one final customer segment. Runs on the
         event loop (the STT session's receive task); finals arriving
         after the engine ended are transcript-only and are drained into
-        self.turns by finish()."""
+        self.turns by finish(). A final is speech activity too — it
+        stamps the silence clock (A9)."""
+        self._last_speech_at = time.monotonic()
         if not self._ended:
             self._inbox.put_nowait(turn)
+
+    def note_speech_activity(self, _partial_text: str = "") -> None:
+        """STT leg → engine: the callee is speaking (a non-empty
+        partial just landed, A9 — the session calls this with the
+        partial text, mirroring on_final's contract; the engine needs
+        only the signal). Always stamps the silence clock — a callee
+        mid-utterance is never nudged. While a reply is being spoken
+        the same signal is BARGE-IN: set the interrupt so the frame
+        pump stops at the next frame boundary and the reply is
+        abandoned (design §5.2 — a first-class event, never an error)."""
+        self._last_speech_at = time.monotonic()
+        if self._speaking and not self._ended:
+            self._interrupt.set()
 
     async def start(self) -> None:
         self._t0 = time.monotonic()
@@ -529,20 +608,20 @@ class ConversationEngine:
 
     async def _run(self) -> None:
         try:
-            await self._take_turn(kickoff=True)
+            await self._take_turn(context=KICKOFF)
             while not self._ended:
-                remaining = self._max_duration_s - self._elapsed()
-                if remaining <= 0:
-                    self._end("max_duration")
-                    break
-                try:
-                    turn = await asyncio.wait_for(self._inbox.get(),
-                                                  timeout=remaining)
-                except asyncio.TimeoutError:
-                    self._end("max_duration")
-                    break
-                if turn is None:
+                got = await self._await_input()
+                if got == "closed":
                     break  # stream is closing — finish() called
+                if got == "duration":
+                    self._end("max_duration")
+                    break
+                if got == "silence":
+                    if await self._handle_silence():
+                        break  # the call ended (polite close / guard / failure)
+                    continue
+                turn = got  # a customer final from the STT leg
+                self._silence_prompts_used = 0
                 self.turns.append(turn)
                 self.messages.append({"role": "user",
                                       "content": turn.get("text", "")})
@@ -552,16 +631,95 @@ class ConversationEngine:
         except Exception:
             pass  # leg failures are recorded on the legs, never raised
 
-    async def _take_turn(self, kickoff: bool = False) -> None:
+    async def _await_input(self):
+        """Wait for the next thing that can happen while the customer
+        holds the floor: a customer final (returned as the turn dict),
+        "closed" (the stream is ending — finish() sent the sentinel),
+        "duration" (the max-duration guard), or "silence" (a full
+        silence window passed with no speech activity, A9).
+
+        The silence deadline is `silence_prompt_after_s` past the later
+        of (this wait's start, the last STT speech activity): partials
+        landing mid-wait push the deadline out, so a customer who is
+        mid-utterance when the deadline passes is never nudged — the
+        wait simply re-arms from their last activity."""
+        self._idle_since = time.monotonic()
+        idle_basis = max(self._idle_since, self._last_speech_at)
+        while True:
+            if self._ended:
+                return "closed"
+            now = time.monotonic()
+            remaining = self._max_duration_s - (now - (self._t0 or now))
+            if remaining <= 0:
+                return "duration"
+            silence_in = idle_basis + self._silence_after_s - now
+            if silence_in <= 0:
+                return "silence"
+            try:
+                turn = await asyncio.wait_for(
+                    self._inbox.get(), timeout=min(remaining, silence_in))
+                return "closed" if turn is None else turn
+            except asyncio.TimeoutError:
+                new_basis = max(self._idle_since, self._last_speech_at)
+                if new_basis > idle_basis:
+                    idle_basis = new_basis  # speech raced the deadline
+                    continue
+                return "duration" if remaining <= silence_in else "silence"
+
+    async def _handle_silence(self) -> bool:
+        """One silence window passed unanswered (A9, design §5.2).
+
+        While silence prompts remain, speak one (an LLM turn carrying
+        the bracketed nudge context — the wording is the model's own,
+        from the agent's prompt) and keep waiting. Once they are used
+        up, speak the polite closing the same way and end the call:
+        end_reason no_input is assigned over the model's own end_call
+        in that turn, because the silence is the cause of the ending.
+        A customer who barges in on the closing has answered after
+        all — the call then continues normally. Returns True when the
+        call is over."""
+        if self._silence_prompts_used < self._silence_max_prompts:
+            self._silence_prompts_used += 1
+            await self._take_turn(context=SILENCE_NUDGE)
+            return self._ended
+        outcome = await self._take_turn(context=SILENCE_CLOSING)
+        if outcome == "interrupted":
+            return False  # the customer spoke during the closing
+        if self._ended and self.end_reason in ("max_turns", "max_duration"):
+            return True  # a guard, not the silence, ended this call
+        self.end_reason = "no_input"
+        self._ended = True
+        try:
+            await self._close_stream()
+        except Exception:
+            pass
+        return True
+
+    async def _take_turn(self, context: str | None = None) -> str:
+        """Run one agent turn and speak it. `context`, when given, is a
+        bracketed engine note appended as a user message first (the
+        kickoff, a silence nudge, the silence closing — the wording the
+        model speaks is always its own, from the prompt).
+
+        Returns "completed" | "interrupted" | "failed" | "guarded".
+        Barge-in (A9): if the customer starts speaking mid-reply, the
+        frame pump stops at the next frame boundary, the reply's
+        unsent sentences are abandoned, the transport is asked to
+        flush its buffered audio, and the turn is recorded with ONLY
+        the words actually spoken, flagged interrupted — the model's
+        end_call action in such a turn is discarded, because the
+        customer has taken the floor."""
         if self._agent_turns >= self._max_turns:
             self._end("max_turns")
-            return
+            return "guarded"
         if self._elapsed() > self._max_duration_s:
             self._end("max_duration")
-            return
-        if kickoff:
-            self.messages.append({"role": "user", "content": KICKOFF})
+            return "guarded"
+        if context:
+            self.messages.append({"role": "user", "content": context})
 
+        self._interrupt.clear()
+        self._speaking = True
         loop = asyncio.get_running_loop()
         tokens: asyncio.Queue = asyncio.Queue()
 
@@ -577,18 +735,45 @@ class ConversationEngine:
                                           ("error", type(e).__name__))
 
         producer = asyncio.create_task(asyncio.to_thread(_produce))
+        interrupt_wait = asyncio.ensure_future(self._interrupt.wait())
         chunker = SentenceChunker()
         full_text, tool_name, error = "", "", ""
+        spoken: list[str] = []       # sentences delivered (pumped, or text-standing when TTS is dead)
+        inflight_text, inflight_frames = "", 0  # the sentence the pump was cut inside
+        interrupted = False
         try:
             while True:
-                event = await tokens.get()
+                if self._interrupt.is_set():
+                    interrupted = True
+                    break
+                get_task = asyncio.ensure_future(tokens.get())
+                done, _pending = await asyncio.wait(
+                    {get_task, interrupt_wait},
+                    return_when=asyncio.FIRST_COMPLETED)
+                if get_task not in done:
+                    get_task.cancel()
+                    interrupted = True
+                    break
+                event = get_task.result()
                 if event[0] == "token":
                     for sentence in chunker.feed(event[1]):
-                        await self._speak(sentence)
+                        status, frames = await self._speak(sentence)
+                        if status == "interrupted":
+                            inflight_text, inflight_frames = sentence, frames
+                            interrupted = True
+                            break
+                        spoken.append(sentence)
+                    if interrupted:
+                        break
                 elif event[0] == "end":
                     full_text, tool_name = event[1], event[2]
                     for sentence in chunker.flush():
-                        await self._speak(sentence)
+                        status, frames = await self._speak(sentence)
+                        if status == "interrupted":
+                            inflight_text, inflight_frames = sentence, frames
+                            interrupted = True
+                            break
+                        spoken.append(sentence)
                     break
                 else:  # "error"
                     error = event[1]
@@ -596,9 +781,32 @@ class ConversationEngine:
         finally:
             if not producer.done():
                 producer.cancel()
+            interrupt_wait.cancel()
+            self._speaking = False
         if error:
             self._fail_llm(error)
-            return
+            return "failed"
+
+        if interrupted:
+            self._interruptions += 1
+            parts = list(spoken)
+            if inflight_text and inflight_frames > 0:
+                parts.append(inflight_text)
+            text = " ".join(parts).strip()
+            if self._clear_audio is not None:
+                try:
+                    await self._clear_audio()
+                except Exception:
+                    pass  # best-effort flush; the pump stop is the cut
+            if text:
+                turn = {"speaker": "agent", "text": text,
+                        "offset_s": round(self._elapsed(), 2),
+                        "interrupted": True}
+                self.turns.append(turn)
+                stt_module.append_turn(self.session_id, turn)
+                self.messages.append({"role": "assistant", "content": text})
+                self._agent_turns += 1
+            return "interrupted"
 
         text = (full_text or "").strip()
         if text:
@@ -614,13 +822,26 @@ class ConversationEngine:
                 await self._close_stream()
             except Exception:
                 pass
+        return "completed"
 
-    async def _speak(self, sentence: str) -> None:
-        """Synthesize one sentence and frame its audio back into the
-        Plivo stream. A dead TTS leg is not retried per sentence; a dead
-        stream just stops the audio (the text turn still stands)."""
+    async def _speak(self, sentence: str) -> tuple[str, int]:
+        """Synthesize one sentence and pump its audio into the Plivo
+        stream frame by frame. Returns (status, frames_sent):
+
+        - "spoken" — the whole sentence was pumped.
+        - "interrupted" — barge-in landed: the pump stopped at a frame
+          boundary (frames_sent says how much of the sentence the
+          callee heard; 0 when the cut came before the first frame,
+          e.g. during synthesis).
+        - "failed" — the audio could not be pumped (TTS leg dead or
+          the stream send died); per the A8 rule the sentence's TEXT
+          still stands as delivered in the transcript — only the
+          audio is missing, and the leg records say so.
+        """
         if self.tts_status == "failed" or self._send_dead:
-            return
+            return "failed", 0
+        if self._interrupt.is_set():
+            return "interrupted", 0
         try:
             audio = await asyncio.to_thread(
                 synthesize_tts, self._api_key, sentence, self.language,
@@ -628,9 +849,17 @@ class ConversationEngine:
         except Exception as e:
             self.tts_status = "failed"
             self.tts_detail = f"TTS {type(e).__name__}"[:500]
-            return
+            return "failed", 0
+        if self._interrupt.is_set():
+            return "interrupted", 0
+        frames = 0
         try:
             for i in range(0, len(audio), 160):
+                if self._interrupt.is_set():
+                    return "interrupted", frames
                 await self._send_audio(audio[i:i + 160])
+                frames += 1
         except Exception:
             self._send_dead = True
+            return "failed", frames
+        return "spoken", frames

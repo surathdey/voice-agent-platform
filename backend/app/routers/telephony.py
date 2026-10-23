@@ -40,11 +40,20 @@ are called by the providers, so each route carries its own auth:
   finalizes with the real conversation. If the LLM leg failed, the
   outcome degrades honestly to the STT-shaped record plus a review
   flag — never a faked conversation or disposition.
+  **A9: barge-in + silence live here as wiring** — the STT leg's
+  partial callback feeds the engine's speech-activity signal (a
+  partial while the agent speaks cuts its audio; the engine then
+  asks this handler to flush the provider's buffered audio with
+  Plivo's `clearAudio` message, carrying the stream id Plivo
+  supplied in its events when it did), and the engine's silence
+  state machine (nudge, then polite close with end_reason no_input)
+  runs inside its wait loop. The handler's shape is unchanged.
 """
 import asyncio
 import base64
 import hmac
 import json
+import time
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, status
@@ -198,14 +207,47 @@ async def plivo_stream(websocket: WebSocket, session_id: str):
     engine: conversation.ConversationEngine | None = None
     live: dict | None = None
 
+    # Outbound playback clock (A9): Plivo plays media in real time —
+    # one 160-byte μ-law frame is 20 ms of audio — so frames are PACED
+    # to that clock instead of being dumped into the provider's buffer
+    # as fast as the socket takes them. The first frame of a burst
+    # still leaves instantly (the reply-latency target), but after that
+    # "sent" tracks "heard": the engine's speaking window spans the
+    # reply's true playback duration, which is what gives barge-in a
+    # real window to cut and makes the transcript's "words actually
+    # spoken" exact. An idle gap restarts the clock (a new burst).
+    playback = {"next_at": 0.0}
+
     async def _send_audio(frame: bytes) -> None:
         """One outbound audio frame to the call, in Plivo's playAudio
-        shape (μ-law 8 kHz, base64 payload)."""
+        shape (μ-law 8 kHz, base64 payload), paced to the playback
+        clock above."""
+        now = time.monotonic()
+        if playback["next_at"] < now:
+            playback["next_at"] = now
+        delay = playback["next_at"] - now
+        if delay > 0:
+            await asyncio.sleep(delay)
+        playback["next_at"] += (len(frame) / 160.0) * 0.02
         await websocket.send_text(json.dumps({
             "event": "playAudio",
             "media": {"contentType": "audio/x-mulaw", "sampleRate": 8000,
                       "payload": base64.b64encode(frame).decode()},
         }))
+
+    # A9 barge-in flush: when the engine cuts a reply mid-sentence it
+    # asks for Plivo's clearAudio so the provider drops the audio it
+    # has already buffered. Best-effort by design — the authoritative
+    # cut is the engine stopping its own frame pump; this only clears
+    # what Plivo queued beyond that. The stream id goes in when Plivo
+    # supplied one in its stream events (captured by the pump below).
+    stream_id_holder: dict = {}
+
+    async def _clear_audio() -> None:
+        msg: dict = {"event": "clearAudio"}
+        if stream_id_holder.get("stream_id"):
+            msg["stream_id"] = stream_id_holder["stream_id"]
+        await websocket.send_text(json.dumps(msg))
 
     # The engine's end-call action sets this event instead of closing
     # the socket itself: closing a Starlette WebSocket from a second
@@ -243,8 +285,10 @@ async def plivo_stream(websocket: WebSocket, session_id: str):
                 engine = conversation.ConversationEngine(
                     session_id=session_id, agent=agent, campaign=campaign,
                     lead=lead, language=language, api_key=api_key,
-                    send_audio=_send_audio, close_stream=_close_stream)
+                    send_audio=_send_audio, close_stream=_close_stream,
+                    clear_audio=_clear_audio)
                 pipeline.on_final = engine.enqueue_final
+                pipeline.on_partial = engine.note_speech_activity
         else:
             session.stt_status = "not_configured"
             live = stt.new_live_view(session_id, language, "not_configured")
@@ -262,6 +306,10 @@ async def plivo_stream(websocket: WebSocket, session_id: str):
                     except Exception:
                         continue
                     kind = event.get("event")
+                    sid_in = event.get("stream_id") or (
+                        event.get("start") or {}).get("streamId")
+                    if sid_in:
+                        stream_id_holder["stream_id"] = sid_in
                     if kind == "start":
                         s = db.get(CallSession, session_id)
                         if s is not None and s.state in ("QUEUED", "DIALING"):

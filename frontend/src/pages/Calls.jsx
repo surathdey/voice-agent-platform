@@ -143,6 +143,7 @@ export default function Calls() {
                         </span>{' '}
                         {t.text}
                         {t.partial && <em style={{ color: 'var(--slate)' }}> (live…)</em>}
+                        {t.interrupted && <em style={{ color: 'var(--gold)' }}> (interrupted — only the words actually spoken)</em>}
                       </div>
                     ))}
                   </td>

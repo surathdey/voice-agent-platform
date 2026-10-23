@@ -67,6 +67,7 @@ class AgentIn(BaseModel):
     max_duration_s: int = 300
     max_turns: int = 50  # conversation-loop guard (A8)
     silence_prompt_after_s: int = 8
+    silence_max_prompts: int = 1  # unanswered silence prompts before the polite close (A9)
 
 
 class AgentOut(AgentIn):
