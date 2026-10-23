@@ -27,6 +27,7 @@ class LoginOut(BaseModel):
 class TenantIn(BaseModel):
     name: str
     market: str = "IN"
+    timezone: str = ""                   # IANA name; "" = derive from market (A10)
     provider_mode_default: str = "managed"
     from_numbers: List[str] = []
     concurrency_limit: int = 20
@@ -36,6 +37,7 @@ class TenantOut(BaseModel):
     tenant_id: str
     name: str
     market: str
+    timezone: str = "Asia/Kolkata"       # market timezone — the schedule clock (A10)
     provider_mode_default: str
     from_numbers: List[str] = []
     concurrency_limit: int = 20
@@ -170,6 +172,9 @@ class LeadOut(BaseModel):
     agent_fields: dict = Field(default_factory=dict)
     attempt_count: int = 0
     status: str = "pending"
+    # A10: when a re-queued lead's next attempt becomes due (ISO, UTC);
+    # None when the lead is due now or has reached a final state.
+    next_attempt_at: Optional[str] = None
     created_at: Optional[str] = None
 
 
@@ -302,9 +307,11 @@ class DispatchOut(BaseModel):
     stub: bool
     provider_mode: str
     provider_ready: bool                 # A4: is a real provider configured?
+    timezone: str = ""                   # A10: the market timezone the schedule was evaluated in
     outside_window: bool = False
     created: int = 0                     # new attempts admitted by this run
     already_dispatched: int = 0          # leads skipped: attempt already exists
+    retry_waiting: int = 0               # A10: leads skipped — their retry gap has not elapsed
     finalized: int = 0                   # results written by this run
     placed: int = 0                      # real-transport calls placed (A6) — result lands via webhook / stream
     counts_by_state: dict = Field(default_factory=dict)
@@ -320,6 +327,7 @@ class ResultIn(BaseModel):
     end_reason: str = ""
     disposition: str = ""
     confidence: float = 0.0
+    review_required: bool = False        # A10: was accepted by the schema but dropped before — now carried
     summary: str = ""
     captured_fields: dict = Field(default_factory=dict)
     duration_s: int = 0
@@ -333,3 +341,39 @@ class ResultOut(BaseModel):
     attempt_id: str = ""
     created: bool                        # False = duplicate delivery, stored result returned
     call: CallOut
+
+
+# ── Results surface & dashboard (A10) ─────────────────────────────────────
+# The read models the console's Results card and Dashboard are built from.
+# Both are assembled from the SAME §8.2 records every mode lands through
+# finalize_attempt — that is what "managed-mode parity" means in practice:
+# there is no second, mode-specific results shape anywhere.
+
+class CampaignResultsOut(BaseModel):
+    campaign_id: str
+    agent_id: str = ""
+    # The bucket set parsed from the campaign agent's own single prompt
+    # (its DISPOSITIONS section) — counts_by_disposition carries every
+    # bucket, zero-filled, plus any stored disposition outside the set.
+    buckets: List[str] = []
+    counts_by_disposition: dict = Field(default_factory=dict)
+    attempts_made: int = 0               # sessions created for the campaign
+    results_count: int = 0               # sessions with a terminal §8.2 result
+    connected: int = 0                   # results whose final_state is COMPLETED
+    connect_rate: float = 0.0            # connected / results_count (0 when no results)
+    review_required: int = 0             # results flagged for human review
+    leads_total: int = 0
+    leads_by_state: dict = Field(default_factory=dict)   # pending | attempted | exhausted
+    awaiting_retry: int = 0              # pending leads whose retry gap has not elapsed
+    total_duration_s: int = 0
+
+
+class DashboardOut(BaseModel):
+    timezone: str = ""                   # the tenant's market timezone
+    active_campaigns: int = 0
+    campaigns_by_status: dict = Field(default_factory=dict)
+    calls_today: int = 0                 # sessions started on the market-local today
+    calls_total: int = 0
+    results_total: int = 0
+    dispositions: dict = Field(default_factory=dict)     # tenant-wide totals across campaigns
+    review_queue_count: int = 0          # results flagged review_required, all campaigns

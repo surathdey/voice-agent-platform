@@ -56,14 +56,36 @@ export default function Calls() {
   const [data, setData] = useState(null)
   const [error, setError] = useState('')
   const [openId, setOpenId] = useState('')
+  const [campaigns, setCampaigns] = useState([])
+  const [dispositions, setDispositions] = useState([])
+  const [fCampaign, setFCampaign] = useState('')
+  const [fDisposition, setFDisposition] = useState('')
+  const [fReview, setFReview] = useState(false)
 
   async function load() {
-    try { setData(await api('/api/calls')) }
-    catch (e) { setError(e.message) }
+    try {
+      const qs = new URLSearchParams()
+      if (fCampaign) qs.set('campaign_id', fCampaign)
+      if (fDisposition) qs.set('disposition', fDisposition)
+      if (fReview) qs.set('review_required', 'true')
+      const suffix = qs.toString() ? `?${qs}` : ''
+      setData(await api(`/api/calls${suffix}`))
+    } catch (e) { setError(e.message) }
   }
-  useEffect(() => { load() }, [])
+  useEffect(() => { load() }, [fCampaign, fDisposition, fReview])
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const [camps, dash] = await Promise.all([api('/api/campaigns'), api('/api/dashboard')])
+        setCampaigns(camps || [])
+        setDispositions(Object.keys(dash?.dispositions || {}).sort())
+      } catch { /* filters are a convenience — the list works without them */ }
+    })()
+  }, [])
 
   const counts = data?.counts_by_state || {}
+  const filtered = Boolean(fCampaign || fDisposition || fReview)
 
   return (
     <div>
@@ -78,6 +100,43 @@ export default function Calls() {
       </div>
 
       {error && <div className="error">{error}</div>}
+
+      <div className="card" style={{ marginBottom: 16, padding: '14px 18px' }}>
+        <div className="filter-bar">
+          <div className="field">
+            <label>Campaign</label>
+            <select value={fCampaign} onChange={(e) => setFCampaign(e.target.value)}>
+              <option value="">All campaigns</option>
+              {campaigns.map((c) => (
+                <option key={c.campaign_id} value={c.campaign_id}>{c.name}</option>
+              ))}
+            </select>
+          </div>
+          <div className="field">
+            <label>Disposition</label>
+            <select value={fDisposition} onChange={(e) => setFDisposition(e.target.value)}>
+              <option value="">All dispositions</option>
+              {dispositions.map((d) => <option key={d} value={d}>{d}</option>)}
+            </select>
+          </div>
+          <label className="check-row" style={{ paddingBottom: 9 }}>
+            <input type="checkbox" checked={fReview}
+              onChange={(e) => setFReview(e.target.checked)} />
+            Needs review only
+          </label>
+          {filtered && (
+            <button className="btn small secondary" style={{ marginBottom: 2 }}
+              onClick={() => { setFCampaign(''); setFDisposition(''); setFReview(false) }}>
+              Clear filters
+            </button>
+          )}
+          {data && (
+            <span style={{ marginLeft: 'auto', color: 'var(--slate)', fontSize: 13.5, paddingBottom: 9 }}>
+              {data.total} call{data.total === 1 ? '' : 's'}{filtered ? ' match' : ''}
+            </span>
+          )}
+        </div>
+      </div>
 
       {Object.keys(counts).length > 0 && (
         <div className="summary-badges">
@@ -153,7 +212,9 @@ export default function Calls() {
             ))}
             {data && data.total === 0 && (
               <tr><td colSpan={11} style={{ color: 'var(--slate)' }}>
-                No calls yet — open an active campaign and choose “Run dispatch”.
+                {filtered
+                  ? 'No calls match these filters.'
+                  : 'No calls yet — open an active campaign and choose “Run dispatch”.'}
               </td></tr>
             )}
             {!data && !error && (

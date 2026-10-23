@@ -6,15 +6,21 @@ import LeadsUpload from './LeadsUpload'
    business settings, its schedule/retry configuration, and ITS leads only.
    A5 adds dispatch: an active campaign can run the dispatcher (stub
    transport in this build — simulated calls, real result records) and
-   shows attempt counts by state. The results spreadsheet export and the
-   rich running-campaign dashboard arrive with A10. */
+   shows attempt counts by state. A10 adds the RESULTS card below the
+   dispatch card: counts per disposition (buckets from the agent's own
+   prompt), attempts made, connect rate and leads by state — read from
+   GET /api/campaigns/{id}/results, the same §8.2 records the Calls
+   page and the Dashboard aggregate. The results spreadsheet export
+   arrives with the Phase B agent builds. */
 const STATUS_PILL = { draft: 'navy', active: 'teal', paused: 'gold', completed: 'slate' }
 const STATUS_LABEL = { draft: 'Draft', active: 'Running', paused: 'Paused', completed: 'Completed' }
+const LEAD_PILL = { pending: 'gold', attempted: 'teal', exhausted: 'red' }
 
 export default function CampaignDetail({ campaignId, onBack }) {
   const [campaign, setCampaign] = useState(null)
   const [leads, setLeads] = useState(null)
   const [calls, setCalls] = useState(null)
+  const [results, setResults] = useState(null)
   const [dispatchMsg, setDispatchMsg] = useState('')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
@@ -28,6 +34,8 @@ export default function CampaignDetail({ campaignId, onBack }) {
       setLeads(l)
       const cl = await api(`/api/campaigns/${campaignId}/calls`)
       setCalls(cl)
+      const rs = await api(`/api/campaigns/${campaignId}/results`)
+      setResults(rs)
     } catch (e) { setError(e.message) }
   }
   useEffect(() => { load() }, [campaignId])
@@ -122,7 +130,10 @@ export default function CampaignDetail({ campaignId, onBack }) {
         </div>
         {dispatchMsg && <p style={{ marginTop: 10, marginBottom: 0 }}>{dispatchMsg}</p>}
         <p className="footnote" style={{ marginTop: 10 }}>
-          Attempts are admitted per the schedule window and daily cap. The transport is
+          Attempts are admitted per the schedule — window, calling days and daily
+          cap, all in the tenant's market time — and leads whose last attempt
+          ended no-answer, busy or failed are re-queued for another attempt
+          after the retry gap, up to the campaign's attempt limit. The transport is
           decided by the platform mode: in stub mode calls are simulated end-to-end and
           land as §8.2 result records immediately; with a live mode configured
           (TELEPHONY_MODE + the tenant's provider), calls are placed for real and their
@@ -130,6 +141,63 @@ export default function CampaignDetail({ campaignId, onBack }) {
           says which transport ran — see Calls for the list.
         </p>
       </div>
+
+      {results && results.results_count > 0 && (
+        <div className="card" style={{ marginBottom: 20 }}>
+          <h3 className="section-title">Results</h3>
+          <div className="stat-grid" style={{ marginBottom: 14 }}>
+            <div className="stat-card">
+              <div className="n">{results.attempts_made}</div>
+              <div className="l">Attempts made</div>
+            </div>
+            <div className="stat-card">
+              <div className="n">{results.connected}</div>
+              <div className="l">Connected</div>
+            </div>
+            <div className="stat-card">
+              <div className="n">{Math.round(results.connect_rate * 100)}%</div>
+              <div className="l">Connect rate</div>
+            </div>
+            <div className="stat-card">
+              <div className="n" style={results.review_required ? { color: 'var(--danger)' } : undefined}>
+                {results.review_required}
+              </div>
+              <div className="l">Needs review</div>
+            </div>
+          </div>
+          {(() => {
+            const rows = Object.entries(results.counts_by_disposition || {})
+              .sort((a, b) => b[1] - a[1])
+            const max = Math.max(1, ...rows.map(([, n]) => n))
+            return rows.map(([name, n]) => (
+              <div className="bar-row" key={name}>
+                <span className="bar-name">{name}</span>
+                <span className="bar-track">
+                  <span className={`bar-fill${n === 0 ? ' empty' : ''}`}
+                    style={{ width: `${(n / max) * 100}%` }} />
+                </span>
+                <span className="num">{n}</span>
+              </div>
+            ))
+          })()}
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 14, alignItems: 'center' }}>
+            <span style={{ color: 'var(--slate)', fontSize: 13 }}>Leads:</span>
+            {Object.entries(results.leads_by_state || {}).map(([st, n]) => (
+              <span key={st} className={`pill ${LEAD_PILL[st] || 'slate'}`}>{st} · {n}</span>
+            ))}
+            {results.awaiting_retry > 0 && (
+              <span style={{ color: 'var(--slate)', fontSize: 13 }}>
+                {results.awaiting_retry} awaiting their retry gap
+              </span>
+            )}
+          </div>
+          <p className="footnote" style={{ marginTop: 12 }}>
+            Disposition buckets come from the agent's own prompt — its
+            DISPOSITIONS section is the single source of truth, so editing
+            the prompt changes what is counted here.
+          </p>
+        </div>
+      )}
 
       <div className="two-col" style={{ marginBottom: 20 }}>
         <div className="card">
@@ -184,7 +252,7 @@ export default function CampaignDetail({ campaignId, onBack }) {
           <thead>
             <tr><th>Name</th><th>Phone</th><th>Bank</th><th>State</th>
               <th>{campaign.identifier_label || 'Identifier'}</th><th>Other fields</th>
-              <th>Status</th><th className="num">Attempts</th></tr>
+              <th>Status</th><th>Next attempt</th><th className="num">Attempts</th></tr>
           </thead>
           <tbody>
             {(leads?.leads || []).map((l) => (
@@ -197,11 +265,16 @@ export default function CampaignDetail({ campaignId, onBack }) {
                 <td style={{ color: 'var(--slate)', fontSize: 13 }}>
                   {otherFields(l).map(([k, v]) => `${k}: ${v}`).join(' · ') || '—'}</td>
                 <td>{l.status}</td>
+                <td style={{ whiteSpace: 'nowrap', fontSize: 13 }}>
+                  {l.next_attempt_at
+                    ? new Date(l.next_attempt_at + (l.next_attempt_at.endsWith('Z') ? '' : 'Z')).toLocaleString()
+                    : '—'}
+                </td>
                 <td className="num">{l.attempt_count}</td>
               </tr>
             ))}
             {leads && leads.total === 0 && (
-              <tr><td colSpan={8} style={{ color: 'var(--slate)' }}>
+              <tr><td colSpan={9} style={{ color: 'var(--slate)' }}>
                 No leads yet — add this campaign’s list with “+ Add leads (CSV)”.
               </td></tr>
             )}

@@ -248,7 +248,9 @@ def _lead_out(l: Lead) -> LeadOut:
         lead_id=l.lead_id, campaign_id=l.campaign_id, phone_number=l.phone_number,
         name=l.name, bank_name=l.bank_name, state=l.state,
         agent_fields=l.agent_fields or {}, attempt_count=l.attempt_count,
-        status=l.status, created_at=l.created_at.isoformat() if l.created_at else None,
+        status=l.status,
+        next_attempt_at=l.next_attempt_at.isoformat() if l.next_attempt_at else None,
+        created_at=l.created_at.isoformat() if l.created_at else None,
     )
 
 

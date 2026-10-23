@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke tests for Phase A chunks 1–8 (A1–A9) against a running server.
+"""Smoke tests for Phase A chunks 1–9 (A1–A10) against a running server.
 
 Usage:  python3 scripts/smoke_test.py [base_url]     (default http://localhost:8000)
         Run with the backend venv python (backend/.venv/bin/python) —
@@ -27,7 +27,14 @@ per call in the lead's resolved language with the tenant key, media
 frames forwarded, partial transcript on the live view, final segments
 persisted mid-call and carried into the §8.2 result; STT-down path
 (failure recorded, transcript marked partial, call still finalizes
-once); no-config path identical to the A6 spike (A7).
+once); no-config path identical to the A6 spike (A7) · dispatch at
+scale — schedule/windows/days/start-date/daily-cap evaluated in the
+tenant's MARKET-LOCAL timezone, retry/re-queue of no-answer/busy/failed
+attempts as NEW attempts (gap honoured, exhaustion final, exactly one
+result per attempt), campaign results summary + tenant dashboard +
+calls filters, and managed-mode parity: the same result-surface
+assertions against a stub-completed call and a fake-Vapi
+webhook-completed call, incl. the review-flag gap (A10).
 
 Run against a FRESH database: like the earlier chunks, the suite seeds its
 own tenants/agents/campaigns/settings and asserts exact fresh-state values.
@@ -424,7 +431,7 @@ A5_MAP = {"callee_name": "name", "phone_number": "phone_number",
 _, camp5 = call("POST", "/api/campaigns", {
     "agent_id": rpi["agent_id"], "name": "A5 — Dispatch Batch",
     "product": "vehicle_loan", "provider_mode": "self_hosted",
-    "schedule": {"window_start": "00:00", "window_end": "23:59", "daily_cap": 2000},
+    "schedule": {"window_start": "00:00", "window_end": "23:59", "calling_days": "Mon - Sun", "daily_cap": 2000},
 }, token=token, expect=201)
 cid5 = camp5["campaign_id"]
 call_upload(f"/api/campaigns/{cid5}/leads/upload", A5_CSV, token=token,
@@ -509,7 +516,7 @@ print("  PASS  paused and completed campaigns refuse dispatch")
 
 print("── A5: schedule window + daily cap admission ──")
 _now = datetime.utcnow()
-_win = {"window_start": (_now + timedelta(hours=2)).strftime("%H:%M"),
+_win = {"calling_days": "Mon - Sun", "window_start": (_now + timedelta(hours=2)).strftime("%H:%M"),
         "window_end": (_now + timedelta(hours=3)).strftime("%H:%M"),
         "daily_cap": 2000}
 _, campW = call("POST", "/api/campaigns", {
@@ -527,7 +534,7 @@ print("  PASS  outside the calling window, no attempt is admitted")
 _, campC = call("POST", "/api/campaigns", {
     "agent_id": rpi["agent_id"], "name": "A5 — Daily Cap 2",
     "provider_mode": "self_hosted",
-    "schedule": {"window_start": "00:00", "window_end": "23:59", "daily_cap": 2},
+    "schedule": {"window_start": "00:00", "window_end": "23:59", "calling_days": "Mon - Sun", "daily_cap": 2},
 }, token=token, expect=201)
 call_upload(f"/api/campaigns/{campC['campaign_id']}/leads/upload",
             "callee_name,phone_number,bank_name,state\n"
@@ -720,7 +727,7 @@ def campaign6(base, token, agent_id, name, mode, csv_text=A6_CSV):
     _s, camp = call6(base, "POST", "/api/campaigns", {
         "agent_id": agent_id, "name": name, "product": "vehicle_loan",
         "provider_mode": mode,
-        "schedule": {"window_start": "00:00", "window_end": "23:59", "daily_cap": 2000},
+        "schedule": {"window_start": "00:00", "window_end": "23:59", "calling_days": "Mon - Sun", "daily_cap": 2000},
     }, token=token, expect=201)
     cid = camp["campaign_id"]
     up = upload6(base, f"/api/campaigns/{cid}/leads/upload", csv_text, token, A6_MAP)
@@ -2162,6 +2169,309 @@ try:
 
     _ai9_server.shutdown()
     _stt9_server.shutdown()
+
+    # ── A10: dispatch at scale, results surface, managed parity ──────
+    # Main-instance checks (market-local schedule, results summary,
+    # dashboard, calls filters) run against BASE with call(); the retry
+    # and parity checks boot one more managed instance on the fake
+    # provider (start_app6/call6), because retry outcomes arrive via the
+    # Vapi webhook — a stub dispatch finalizes synchronously and can
+    # never produce a no-answer to retry from.
+    print("── A10: market-local schedule — windows evaluated in the tenant's timezone ──")
+    from zoneinfo import ZoneInfo as _ZI
+    _kol = _ZI("Asia/Kolkata")
+    _now_kol = datetime.now(_kol)
+    _now_utc = datetime.utcnow()
+
+    _, _me10 = call("GET", "/api/tenants/me", token=token)
+    check6("A10: tenant carries its market timezone (QGBS → Asia/Kolkata)",
+           _me10["timezone"] == "Asia/Kolkata", _me10)
+
+    def _hhmm(dt):
+        return dt.strftime("%H:%M")
+
+    # A window AROUND Kolkata-now: under A5's UTC evaluation this window
+    # (Kolkata wall-clock strings) excludes UTC-now by 5½ hours, so an
+    # admitted dispatch proves the fix. Window length 60 min, centred
+    # on local now; wrap-safe via the dispatcher's wrap handling.
+    _w_in = {"window_start": _hhmm(_now_kol - timedelta(minutes=20)),
+             "window_end": _hhmm(_now_kol + timedelta(minutes=40)),
+             "calling_days": "Mon - Sun", "daily_cap": 2000}
+    _, _campIn = call("POST", "/api/campaigns", {
+        "agent_id": rpi["agent_id"], "name": "A10 — Local Window Admits",
+        "provider_mode": "self_hosted", "schedule": _w_in,
+    }, token=token, expect=201)
+    _cidIn = _campIn["campaign_id"]
+    call_upload(f"/api/campaigns/{_cidIn}/leads/upload", A5_CSV, token=token,
+                fields={"mapping": json.dumps(A5_MAP)})
+    call("POST", f"/api/campaigns/{_cidIn}/status", {"status": "active"}, token=token)
+    _, _repIn = call("POST", f"/api/campaigns/{_cidIn}/dispatch", token=token)
+    check6("A10: window around MARKET-LOCAL now admits (A5's UTC check would refuse)",
+           _repIn["outside_window"] is False and _repIn["created"] == 5
+           and _repIn["timezone"] == "Asia/Kolkata", _repIn)
+
+    _w_out = {"window_start": _hhmm(_now_kol + timedelta(hours=3)),
+              "window_end": _hhmm(_now_kol + timedelta(hours=4)),
+              "calling_days": "Mon - Sun", "daily_cap": 2000}
+    _, _campOut = call("POST", "/api/campaigns", {
+        "agent_id": rpi["agent_id"], "name": "A10 — Local Window Refuses",
+        "provider_mode": "self_hosted", "schedule": _w_out,
+    }, token=token, expect=201)
+    call_upload(f"/api/campaigns/{_campOut['campaign_id']}/leads/upload", A5_CSV,
+                token=token, fields={"mapping": json.dumps(A5_MAP)})
+    call("POST", f"/api/campaigns/{_campOut['campaign_id']}/status",
+         {"status": "active"}, token=token)
+    _, _repOut = call("POST", f"/api/campaigns/{_campOut['campaign_id']}/dispatch", token=token)
+    check6("A10: window 3h ahead in market-local time refuses, and the message names the timezone",
+           _repOut["outside_window"] is True and _repOut["created"] == 0
+           and "Asia/Kolkata" in _repOut["message"], _repOut)
+
+    # Calling-days gate: a schedule naming ONLY a different weekday.
+    _days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    _other_day = _days[(_now_kol.weekday() + 1) % 7]
+    _, _campDay = call("POST", "/api/campaigns", {
+        "agent_id": rpi["agent_id"], "name": "A10 — Calling Days Gate",
+        "provider_mode": "self_hosted",
+        "schedule": {"window_start": "00:00", "window_end": "23:59",
+                     "calling_days": _other_day, "daily_cap": 2000},
+    }, token=token, expect=201)
+    call_upload(f"/api/campaigns/{_campDay['campaign_id']}/leads/upload", A5_CSV,
+                token=token, fields={"mapping": json.dumps(A5_MAP)})
+    call("POST", f"/api/campaigns/{_campDay['campaign_id']}/status",
+         {"status": "active"}, token=token)
+    _, _repDay = call("POST", f"/api/campaigns/{_campDay['campaign_id']}/dispatch", token=token)
+    check6("A10: today outside the calling days → nothing admitted",
+           _repDay["outside_window"] is True and _repDay["created"] == 0
+           and "calling days" in _repDay["message"], _repDay)
+
+    # Start-date gate: the campaign starts tomorrow (market-local).
+    _tomorrow = (_now_kol + timedelta(days=1)).date().isoformat()
+    _, _campSd = call("POST", "/api/campaigns", {
+        "agent_id": rpi["agent_id"], "name": "A10 — Starts Tomorrow",
+        "provider_mode": "self_hosted",
+        "schedule": {"start_date": _tomorrow, "window_start": "00:00",
+                     "window_end": "23:59", "calling_days": "Mon - Sun",
+                     "daily_cap": 2000},
+    }, token=token, expect=201)
+    call_upload(f"/api/campaigns/{_campSd['campaign_id']}/leads/upload", A5_CSV,
+                token=token, fields={"mapping": json.dumps(A5_MAP)})
+    call("POST", f"/api/campaigns/{_campSd['campaign_id']}/status",
+         {"status": "active"}, token=token)
+    _, _repSd = call("POST", f"/api/campaigns/{_campSd['campaign_id']}/dispatch", token=token)
+    check6("A10: before the start date → nothing admitted",
+           _repSd["outside_window"] is True and _repSd["created"] == 0
+           and "start date" in _repSd["message"], _repSd)
+
+    print("── A10: campaign results summary + dashboard + calls filters ──")
+    _, _res5 = call("GET", f"/api/campaigns/{cid5}/results", token=token)
+    _exp_counts = {b: (1 if b in RPI_BUCKETS[:5] else 0) for b in RPI_BUCKETS}
+    check6("A10: results summary — buckets from the agent's own prompt, zero-filled counts",
+           _res5["buckets"] == RPI_BUCKETS
+           and _res5["counts_by_disposition"] == _exp_counts, _res5)
+    check6("A10: results summary — attempts / connect rate / leads by state",
+           _res5["attempts_made"] == 5 and _res5["results_count"] == 5
+           and _res5["connected"] == 5 and _res5["connect_rate"] == 1.0
+           and _res5["review_required"] == 0
+           and _res5["leads_by_state"] == {"attempted": 5}
+           and _res5["leads_total"] == 5 and _res5["awaiting_retry"] == 0, _res5)
+    call("GET", f"/api/campaigns/{cid5}/results", token=token2, expect=404)
+    print("  PASS  results summary is tenant-scoped (tenant 2 → 404)")
+
+    _, _dash = call("GET", "/api/dashboard", token=token)
+    check6("A10: dashboard — totals across campaigns (7 from A5 + 5 admitted above)",
+           _dash["calls_total"] == 12 and _dash["results_total"] == 12
+           and _dash["timezone"] == "Asia/Kolkata"
+           and _dash["dispositions"].get("RPC_CONFIRMED") == 3
+           and _dash["dispositions"].get("CPC_CONFIRMED") == 3
+           and _dash["review_queue_count"] == 0
+           and _dash["active_campaigns"] >= 1
+           and 5 <= _dash["calls_today"] <= 12, _dash)
+    _, _dash2 = call("GET", "/api/dashboard", token=token2)
+    check6("A10: dashboard is tenant-scoped (tenant 2 sees zeros)",
+           _dash2["calls_total"] == 0 and _dash2["results_total"] == 0
+           and _dash2["review_queue_count"] == 0, _dash2)
+
+    _, _f1 = call("GET", "/api/calls?disposition=RPC_CONFIRMED", token=token)
+    check6("A10: calls filter — disposition=RPC_CONFIRMED matches all three campaigns' first results",
+           _f1["total"] == 3
+           and all(c["disposition"] == "RPC_CONFIRMED" for c in _f1["calls"]), _f1["total"])
+    _, _f2 = call("GET", "/api/calls?disposition=DECEASED_CASE", token=token)
+    check6("A10: calls filter — a bucket never recorded matches nothing",
+           _f2["total"] == 0, _f2["total"])
+    _, _f3 = call("GET", "/api/calls?review_required=true", token=token)
+    _, _f4 = call("GET", f"/api/calls?campaign_id={cid5}&disposition=CPC_CONFIRMED", token=token)
+    check6("A10: calls filter — review_required + campaign/disposition combined",
+           _f3["total"] == 0 and _f4["total"] == 1
+           and _f4["calls"][0]["campaign_id"] == cid5, (_f3["total"], _f4["total"]))
+
+    print("── A10: retry / re-queue — no-answer earns a NEW attempt, never a second result ──")
+    baseR = start_app6(18112, "a10retry", {
+        "TELEPHONY_MODE": "managed", "VAPI_API_KEY": "sk-fake-a10",
+    })
+    tokenR = login6(baseR)
+    _, agentsR = call6(baseR, "GET", "/api/agents", token=tokenR)
+    rpiR = agentsR[0]
+
+    def _campaignR(name, retry, csv_text):
+        _s, camp = call6(baseR, "POST", "/api/campaigns", {
+            "agent_id": rpiR["agent_id"], "name": name, "product": "vehicle_loan",
+            "provider_mode": "managed", "retry_rules": retry,
+            "schedule": {"window_start": "00:00", "window_end": "23:59",
+                         "calling_days": "Mon - Sun", "daily_cap": 2000},
+        }, token=tokenR, expect=201)
+        cid = camp["campaign_id"]
+        upload6(baseR, f"/api/campaigns/{cid}/leads/upload", csv_text, tokenR, A6_MAP)
+        call6(baseR, "POST", f"/api/campaigns/{cid}/status", {"status": "active"}, token=tokenR)
+        return cid
+
+    def _webhookR(session_id, call_id, ended, structured=None, extra=None):
+        msg = {"type": "end-of-call-report", "endedReason": ended,
+               "startedAt": "2026-10-23T11:00:00.000Z",
+               "endedAt": "2026-10-23T11:00:30.000Z",
+               "call": {"id": call_id, "metadata": {"session_id": session_id}},
+               "analysis": {"structuredData": structured or {}},
+               "summary": "", "artifact": {}, "costBreakdown": {"total": 0.02}}
+        msg.update(extra or {})
+        return call6(baseR, "POST", "/api/telephony/vapi/webhook", {"message": msg},
+                     headers={"x-vapi-secret": "a6-webhook-secret"})
+
+    def _sessionsR(cid):
+        _s, cl = call6(baseR, "GET", f"/api/campaigns/{cid}/calls", token=tokenR)
+        return cl["calls"]
+
+    def _leadsR(cid):
+        _s, ll = call6(baseR, "GET", f"/api/campaigns/{cid}/leads", token=tokenR)
+        return ll["leads"]
+
+    # Campaign A — retry gap 1 day: the re-queued lead waits.
+    cidRA = _campaignR("A10 — Retry Waits For The Gap",
+                       {"max_attempts": 3, "retry_gap_days": 1, "retry_different_time": False},
+                       "callee_name,phone_number,bank_name,state\n"
+                       "R. One,9400000001,Tata Capital,Bihar\n")
+    _, _repRA = call6(baseR, "POST", f"/api/campaigns/{cidRA}/dispatch", token=tokenR)
+    check6("A10: managed dispatch places attempt 1", _repRA["placed"] == 1, _repRA)
+    _sessRA = _sessionsR(cidRA)[0]
+    _webhookR(_sessRA["session_id"], "call_a10_a1", "customer-did-not-answer")
+    _leadRA = _leadsR(cidRA)[0]
+    _dueRA = datetime.fromisoformat(_leadRA["next_attempt_at"]) if _leadRA["next_attempt_at"] else None
+    check6("A10: NO_ANSWER re-queues the lead — pending again, attempt counted, due ≈ +1 day",
+           _leadRA["status"] == "pending" and _leadRA["attempt_count"] == 1
+           and _dueRA is not None
+           and datetime.utcnow() + timedelta(hours=12) < _dueRA < datetime.utcnow() + timedelta(hours=36),
+           _leadRA)
+    _, _repRA2 = call6(baseR, "POST", f"/api/campaigns/{cidRA}/dispatch", token=tokenR)
+    check6("A10: dispatch inside the retry gap admits nothing and SAYS the lead is waiting",
+           _repRA2["created"] == 0 and _repRA2["retry_waiting"] == 1, _repRA2)
+    _resRA = call6(baseR, "GET", f"/api/campaigns/{cidRA}/results", token=tokenR)[1]
+    check6("A10: results summary reflects the re-queue (awaiting_retry, leads by state)",
+           _resRA["awaiting_retry"] == 1 and _resRA["leads_by_state"] == {"pending": 1}
+           and _resRA["attempts_made"] == 1 and _resRA["connect_rate"] == 0.0, _resRA)
+
+    # Campaign B — gap 0, max 2 attempts: retry fires at once, then exhausts.
+    cidRB = _campaignR("A10 — Retry Then Exhaust",
+                       {"max_attempts": 2, "retry_gap_days": 0, "retry_different_time": False},
+                       "callee_name,phone_number,bank_name,state\n"
+                       "S. Two,9400000002,Tata Capital,Bihar\n"
+                       "T. Three,9400000003,Tata Capital,Bihar\n")
+    _, _repRB = call6(baseR, "POST", f"/api/campaigns/{cidRB}/dispatch", token=tokenR)
+    check6("A10: campaign B places 2 first attempts", _repRB["placed"] == 2, _repRB)
+    for _s1 in _sessionsR(cidRB):
+        _webhookR(_s1["session_id"], f"call_a10_b_{_s1['attempt_id']}", "customer-busy")
+    _leadsRB = _leadsR(cidRB)
+    check6("A10: BUSY re-queues both leads, due immediately with gap 0",
+           all(l["status"] == "pending" and l["attempt_count"] == 1
+               and (l["next_attempt_at"] is None
+                    or datetime.fromisoformat(l["next_attempt_at"]) <= datetime.utcnow() + timedelta(minutes=1))
+               for l in _leadsRB), _leadsRB)
+    _, _repRB2 = call6(baseR, "POST", f"/api/campaigns/{cidRB}/dispatch", token=tokenR)
+    _sessRB2 = _sessionsR(cidRB)
+    check6("A10: second dispatch creates NEW attempts (attempt 2 ids), 4 sessions total",
+           _repRB2["created"] == 2 and _repRB2["placed"] == 2
+           and len(_sessRB2) == 4
+           and sum(1 for s in _sessRB2 if s["attempt_id"].endswith("_2")) == 2, _repRB2)
+    for _s2 in _sessRB2:
+        if _s2["attempt_id"].endswith("_2"):
+            _webhookR(_s2["session_id"], f"call_a10_b2_{_s2['attempt_id']}", "customer-did-not-answer")
+    _leadsRB2 = _leadsR(cidRB)
+    _sessRB3 = _sessionsR(cidRB)
+    check6("A10: attempts exhausted → leads reach the final state and stop",
+           all(l["status"] == "exhausted" and l["attempt_count"] == 2
+               and l["next_attempt_at"] is None for l in _leadsRB2), _leadsRB2)
+    check6("A10: exactly one result per attempt across retries (4 attempts, 4 results)",
+           len(_sessRB3) == 4
+           and all(s["final_state"] in ("BUSY", "NO_ANSWER") for s in _sessRB3), len(_sessRB3))
+    _, _repRB3 = call6(baseR, "POST", f"/api/campaigns/{cidRB}/dispatch", token=tokenR)
+    check6("A10: exhausted leads are never dispatched again",
+           _repRB3["created"] == 0 and _repRB3["retry_waiting"] == 0, _repRB3)
+
+    print("── A10: managed-mode parity — the same result surface as the stub ──")
+    cidRP = _campaignR("A10 — Parity Batch",
+                       {"max_attempts": 3, "retry_gap_days": 1, "retry_different_time": False},
+                       "callee_name,phone_number,bank_name,state\n"
+                       "P. Parity,9400000009,Tata Capital,West Bengal\n")
+    call6(baseR, "POST", f"/api/campaigns/{cidRP}/dispatch", token=tokenR)
+    _sessRP = _sessionsR(cidRP)[0]
+    _webhookR(_sessRP["session_id"], "call_a10_parity", "customer-ended-call",
+              structured={"disposition": "RPC_CONFIRMED", "identity_confirmed": True},
+              extra={"startedAt": "2026-10-23T11:00:00.000Z",
+                     "endedAt": "2026-10-23T11:00:47.000Z",
+                     "summary": "Customer confirmed identity.",
+                     "artifact": {"recordingUrl": "https://recordings.example/parity.mp3",
+                                  "transcript": "AI: Namaste, am I speaking with P. Parity?\nUser: Yes, speaking."},
+                     "costBreakdown": {"total": 0.11, "transport": 0.05,
+                                       "stt": 0.02, "llm": 0.03, "tts": 0.01}})
+    _managed_call = _sessionsR(cidRP)[0]
+    _, _stub_list = call("GET", f"/api/campaigns/{cid5}/calls", token=token)
+    _stub_call = _stub_list["calls"][0]
+    _COST_KEYS = {"telephony", "stt", "llm", "tts", "total", "currency", "mode"}
+    check6("A10 PARITY: managed and stub calls expose the identical CallOut field set",
+           set(_managed_call.keys()) == set(_stub_call.keys()),
+           (set(_managed_call) ^ set(_stub_call)))
+    check6("A10 PARITY: identical result-surface values where the mode guarantees them",
+           _managed_call["final_state"] == "COMPLETED"
+           and _stub_call["final_state"] == "COMPLETED"
+           and _managed_call["disposition"] == "RPC_CONFIRMED"
+           and _managed_call["duration_s"] == 47 and _stub_call["duration_s"] > 0
+           and _managed_call["captured_fields"].get("identity_confirmed") is True
+           and isinstance(_stub_call["captured_fields"].get("identity_confirmed"), bool)
+           and _managed_call["recording_url"].endswith("parity.mp3")
+           and isinstance(_stub_call["recording_url"], str)
+           and _managed_call["review_required"] is False
+           and _stub_call["review_required"] is False, _managed_call)
+    check6("A10 PARITY: cost breakdown carries the contract keys in both modes",
+           _COST_KEYS <= set(_managed_call["cost_breakdown"])
+           and _COST_KEYS <= set(_stub_call["cost_breakdown"])
+           and _managed_call["cost_breakdown"]["mode"] == "managed"
+           and _managed_call["cost_breakdown"]["total"] == 0.11
+           and _stub_call["cost_breakdown"]["mode"] == "stub",
+           (_managed_call["cost_breakdown"], _stub_call["cost_breakdown"]))
+    check6("A10 PARITY: transcripts share the {speaker, text, offset_s} turn shape",
+           len(_managed_call["transcript"]) == 2
+           and all({"speaker", "text", "offset_s"} <= set(t) for t in _managed_call["transcript"])
+           and all({"speaker", "text", "offset_s"} <= set(t) for t in _stub_call["transcript"]),
+           _managed_call["transcript"])
+
+    # The closed gap: a CONNECTED managed call whose analysis returns no
+    # disposition must land review-flagged, exactly like the self-hosted
+    # classifier-failure path (A8) — not as an unclassified success.
+    cidRD = _campaignR("A10 — Parity Review Gap",
+                       {"max_attempts": 3, "retry_gap_days": 1, "retry_different_time": False},
+                       "callee_name,phone_number,bank_name,state\n"
+                       "Q. Quiet,9400000010,Tata Capital,Bihar\n")
+    call6(baseR, "POST", f"/api/campaigns/{cidRD}/dispatch", token=tokenR)
+    _sessRD = _sessionsR(cidRD)[0]
+    _webhookR(_sessRD["session_id"], "call_a10_review", "customer-ended-call")
+    _callRD = _sessionsR(cidRD)[0]
+    check6("A10 PARITY: connected managed call with NO disposition → review flag (the A8 behaviour)",
+           _callRD["final_state"] == "COMPLETED" and _callRD["disposition"] == ""
+           and _callRD["review_required"] is True
+           and "no disposition" in _callRD["summary"], _callRD)
+    _, _dashR = call6(baseR, "GET", "/api/dashboard", token=tokenR)
+    check6("A10: dashboard counts the review queue across campaigns (managed instance)",
+           _dashR["review_queue_count"] == 1, _dashR)
+    _, _fR = call6(baseR, "GET", "/api/calls?review_required=true", token=tokenR)
+    check6("A10: calls filter finds the flagged managed call",
+           _fR["total"] == 1 and _fR["calls"][0]["session_id"] == _sessRD["session_id"], _fR["total"])
 
 finally:
     for _p in _procs6:

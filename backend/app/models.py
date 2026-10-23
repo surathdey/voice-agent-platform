@@ -42,6 +42,12 @@ class Tenant(Base):
     tenant_id: Mapped[str] = mapped_column(String(40), primary_key=True, default=lambda: new_id("ten"))
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     market: Mapped[str] = mapped_column(String(4), default="IN")  # NA | IN
+    # Market timezone (IANA name) — the clock every schedule question is
+    # answered in (A10): calling windows/days, start dates, daily caps,
+    # retry due times. Set from the market at provisioning
+    # (app.market_time.MARKET_TIMEZONES), stored resolved so it can be
+    # corrected per tenant without a code change.
+    timezone: Mapped[str] = mapped_column(String(60), default="Asia/Kolkata")
     provider_mode_default: Mapped[str] = mapped_column(String(20), default="managed")
     # Secret REFERENCES only (e.g. vault paths) — never raw keys in this table.
     provider_credential_refs: Mapped[dict] = mapped_column(JSON, default=dict)
@@ -182,6 +188,14 @@ class Lead(Base):
     agent_fields: Mapped[dict] = mapped_column(JSON, default=dict)   # keys defined by the agent
     attempt_count: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(30), default="pending")
+    # Retry scheduling (A10): when an attempt ends no-answer / busy /
+    # failed with attempts remaining, finalize_attempt re-queues the lead
+    # (status back to "pending" — the only status dispatch admits) and
+    # stamps this with when the next attempt becomes due (naive UTC):
+    # ended_at + the campaign's retry gap, with the different-time-of-day
+    # shift applied in market-local time when configured. NULL = due now
+    # (fresh lead) or not awaiting a retry (final state reached).
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 

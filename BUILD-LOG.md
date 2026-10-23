@@ -1,5 +1,122 @@
 # BUILD LOG
 
+## Chunk 9 — Phase A: A10 Dispatch at Scale, Results Surface & Dashboard, Managed-Mode Parity (2026-10-23)
+
+### Built
+- **Market-local schedule (the A5 UTC debt, closed).** New module
+  `app/market_time.py` + `tenants.timezone` (migration
+  `008_a10_dispatch_scale.sql`; provisioning derives it from the market
+  — IN → Asia/Kolkata, NA → America/Toronto — and it is exposed on the
+  tenant API). ALL schedule questions are now answered in the tenant's
+  market time: the calling window, the calling days (parsed from the
+  schedule's text — "Mon – Sat" / "Mon, Wed, Fri" / ranges; unparseable
+  text imposes no restriction rather than silently blocking), the
+  campaign start date, and the daily cap (sessions started on the
+  market-local day count). The dispatch report carries the timezone it
+  evaluated in and its refusal message names it.
+- **Retry / re-queue (exactly-one-result stays per attempt, absolute).**
+  `finalize_attempt` — still the single terminal writer — now routes
+  the lead by outcome: NO_ANSWER / BUSY / FAILED with attempts
+  remaining **re-queues** the lead (`pending` + `next_attempt_at` =
+  attempt end + the campaign's retry gap; with `retry_different_time`
+  the due time is moved to the opposite end of the calling window in
+  market-local time). Dispatch admits a re-queued lead only once its
+  gap has elapsed — as a NEW session with the next deterministic
+  attempt_id (…_2, …_3) and its own single result; leads skipped for
+  the gap are counted in the report (`retry_waiting`), never silently
+  dropped. Attempts exhausted → `exhausted` (final); COMPLETED /
+  VOICEMAIL → `attempted` (done, unchanged A5 semantics). Tenant
+  concurrency batching is unchanged: the worker drains admitted
+  attempts in batches of `tenant.concurrency_limit`, behind the same
+  service boundary as A5/A6.
+- **Results surface.** `GET /api/campaigns/{id}/results`: counts per
+  disposition over the bucket set parsed from the campaign agent's own
+  single prompt (zero-filled; a stored disposition outside the set is
+  appended, never hidden), attempts made, results, connected count,
+  connect rate, review count, leads by state + awaiting-retry count,
+  total duration. `GET /api/dashboard` (the tenant home): active
+  campaigns + campaigns by status, calls today (market-local), calls /
+  results totals, per-disposition totals across campaigns, and the
+  human-review queue count. `GET /api/calls` gains `?disposition=` and
+  `?review_required=` filters (counts computed over the filtered set).
+  UI: a new **Dashboard** page (nav enabled; the console's landing
+  view) with stat cards + disposition bars + review-queue panel; the
+  campaign page gains a **Results card** (attempts / connected /
+  connect rate / needs-review stats, per-bucket bars, leads-by-state
+  pills) and a Next-attempt column on the leads table; the Calls page
+  gains a campaign / disposition / needs-review filter bar. Also
+  folded in: `ResultIn` now actually carries `review_required` (the
+  receiver read it, the schema dropped it).
+- **Managed-mode parity (audited field by field).** The audit compared
+  the Vapi webhook mapping against the stub outcome and the self-hosted
+  finalize outcomes across the result surface: duration, recording
+  reference, cost_breakdown, disposition, captured fields, transcript
+  shape, final/end state, review flag. All were present and equivalent
+  **except one gap, now closed**: a CONNECTED managed call whose
+  analysis returned no disposition was stored as an unclassified
+  success, where the self-hosted path flags exactly that case for
+  review (A8 classifier honesty). `map_vapi_report` now sets
+  `review_required` for COMPLETED + no disposition (with an explanatory
+  summary when Vapi sent none) — no bucket is ever invented. The parity
+  smoke test runs the same assertions against a stub-completed call and
+  a fake-Vapi webhook-completed call: identical CallOut field set,
+  identical cost-contract keys, and the shared guarantees (final state,
+  disposition, duration > 0, captured-field typing, transcript turn
+  shape, review flag semantics).
+
+### Verification
+- `scripts/smoke_test.py`: **426 passed, 0 failed**, repeat run
+  **429/0** (the small count difference is the pre-existing poll-gated
+  checks in the A5/A9 sections; every A10 check passed in both runs).
+  All 337 pre-existing checks intact. The new A10 section (89 counted
+  checks) covers: tenant timezone exposure; a window around
+  market-local now admits (it excludes UTC-now by 5½ hours, so it
+  proves the fix, not just the code path); a window 3 h ahead refuses
+  with the timezone named; calling-days and start-date gates refuse;
+  results summary exact against the A5 batch (8 prompt buckets,
+  zero-filled, connect rate 1.0, leads by state); dashboard totals
+  (12 calls/results tenant-wide, per-disposition totals, review queue
+  0) and tenant-2 zeros + 404; calls filters (disposition present /
+  absent / combined with campaign, review flag); retry on a fake-Vapi
+  instance — gap 1 day re-queue (due ≈ +24 h, dispatch reports
+  `retry_waiting: 1`, results show `awaiting_retry: 1`), gap 0 re-queue
+  (second dispatch creates attempt-2 sessions; 4 attempts → 4 results,
+  one each), exhaustion to the final state, and no re-dispatch after;
+  parity (identical field sets + values, cost keys, transcript shape,
+  and the review-flag gap closed: connected + no disposition → flagged,
+  visible on the dashboard count and through the calls filter).
+  Frontend: `vite build` clean.
+- **Fixture note:** legacy dispatch fixtures (A5/A6 helpers) now pin
+  `calling_days: "Mon - Sun"` — calling-days became enforced behaviour
+  in this chunk, and those fixtures assert dispatch/window/cap
+  behaviour, not weekday behaviour. Their assertions are unchanged.
+  A campaign left on the product default ("Mon – Sat") will now
+  genuinely not dispatch on a Sunday — that is the schedule working
+  as configured.
+
+### Known limitations (deliberate, for this chunk)
+- The dispatch worker is still synchronous inside the dispatch
+  request (the A5 boundary); concurrency is honoured as batch size,
+  not as parallel in-flight calls. A background worker remains a
+  production-hardening step behind the same `Dispatcher` boundary.
+- Retry due times are computed once, at finalize, from the campaign's
+  rules as they then stand; editing retry rules afterwards does not
+  move already-stamped `next_attempt_at` values.
+- `calling_days` is free text by design (A3); the parser covers the
+  shapes the wizard produces and common variants, and treats anything
+  else as "no day restriction" — a structured day picker is a UI
+  refinement, not a dispatch blocker.
+- The QGBS seed tenant's timezone is Asia/Kolkata; tenant timezones
+  are set at provisioning (no tenant-settings editor yet — the API
+  accepts `timezone` on tenant creation).
+- Still **not proven against live providers** — no keys yet (owner
+  step, unchanged). Everything above is mock/fake-verified.
+
+### Next step
+**A11 — Browser test harness:** an in-browser (microphone) test-call
+surface so the owner can drive the self-hosted conversation loop
+without a phone call, reusing the same stream/finalize path.
+
 ## Chunk 8 — Phase A: A9 Barge-In + Silence Handling in the Self-Hosted Loop (2026-10-23)
 
 ### Built

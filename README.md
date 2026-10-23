@@ -5,20 +5,23 @@ Voice Agent Platform V2 (Greenfield + QGBS MVP)*. Agents are **data, not
 code**: each agent is one prompt plus structured voice/model/language
 configuration, run in campaigns against lead lists.
 
-**This build = Phase A, chunks 1–8: A1 (tenancy + core data model), A2
+**This build = Phase A, chunks 1–9: A1 (tenancy + core data model), A2
 (Agent Config Studio), A3 (Campaigns & Leads), A4 (Provider Settings),
 A5 (Orchestrator skeleton — dispatch + stub transport + §8.2 results),
 A6 (Telephony spike — real Vapi + Plivo transports behind the same
 boundary, per-language Vapi voice profiles), A7 (STT live — Sarvam
 Saaras inside the media stream), A8 (the full conversation loop —
 Saaras finals → Sarvam LLM → Bulbul TTS, with post-call classification
-against the agent prompt's own disposition definitions) and A9
+against the agent prompt's own disposition definitions), A9
 (barge-in + silence handling inside the loop — callee speech cuts
 the agent's audio, silence earns a prompt, then an honest
-`no_input` close).**
+`no_input` close) and A10 (dispatch at scale — schedule, calling
+windows, days and daily caps evaluated in the tenant's MARKET-LOCAL
+time, retry/re-queue of no-answer/busy/failed attempts as new
+attempts, per-campaign results summary + tenant Dashboard, and
+managed-mode parity with the self-hosted result surface).**
 See `BUILD-LOG.md` for what is verified and what comes next
-(A10: campaign dispatch at scale, results/dashboard, managed-mode
-parity).
+(A11: browser test harness; A12: edge cases, load, real per-call cost).
 
 ## Run it (Docker — the owner's route)
 
@@ -56,7 +59,8 @@ cd frontend && npm install && npm run dev   # http://localhost:5173, proxies /ap
 - [ ] `GET /api/health` returns `telephony_mode: "stub"`.
 - [ ] Create a second tenant (`POST /api/tenants`), log in as its admin:
       it sees **zero** agents, and QGBS agent URLs return 404
-      (run `backend/.venv/bin/python scripts/smoke_test.py` — 311 checks automate all of this).
+      (run `backend/.venv/bin/python scripts/smoke_test.py` — the suite's
+      420+ checks automate all of this).
 
 **A2 — Agent Config Studio**
 - [ ] Agents library matches the wireframe layout: cards with LLM, STT/TTS,
@@ -206,6 +210,42 @@ cd frontend && npm install && npm run dev   # http://localhost:5173, proxies /ap
       actually heard — that is what makes the interruption record
       honest.
 
+**A10 — Dispatch at scale, results & dashboard, managed parity**
+- [ ] The sidebar's **Dashboard** is the landing view: active
+      campaigns, calls today, results recorded and the human-review
+      count, plus per-disposition totals across campaigns. "Today"
+      and every schedule on the platform run on the tenant's market
+      clock — the Dashboard names the timezone (QGBS: Asia/Kolkata).
+- [ ] Set a campaign's calling window around the CURRENT market-local
+      time and dispatch: attempts are admitted. The same wall-clock
+      window in UTC no longer decides anything — windows, calling
+      days, start dates and daily caps are all market-local now
+      (A5 evaluated the window in UTC).
+- [ ] On a campaign page, the **Results** card shows attempts made,
+      connected count, connect rate and counts per disposition —
+      the buckets are the ones in the bound agent's own prompt,
+      zero-filled — plus leads by state (pending / attempted /
+      exhausted).
+- [ ] Calls page filters: pick a campaign, a disposition, or tick
+      "Needs review only" — the list and the state counts follow the
+      filters. A result whose classification could not be trusted
+      (either mode) is the kind that shows up under the review filter.
+- [ ] Retry: on a managed campaign, let a call end **no-answer**
+      (fake/test provider) — the lead returns to *pending* with a
+      "Next attempt" time (last attempt + the campaign's retry gap).
+      Dispatch again inside the gap: nothing is admitted and the
+      message says the lead is waiting. After the gap (or with a
+      0-day gap), dispatch creates **attempt 2** — a new call record;
+      the attempt-1 result is untouched, one result per attempt.
+      After the campaign's max attempts, the lead is *exhausted* and
+      is never dispatched again.
+- [ ] Parity: a managed (Vapi) call and a stub call open to the exact
+      same record shape on the Calls page — disposition, duration,
+      recording, captured fields, transcript, cost breakdown — and a
+      connected managed call whose analysis returns no disposition
+      lands flagged **Needs review**, same as a self-hosted call the
+      classifier could not place.
+
 ## Design decisions that override the design doc
 
 1. **Single prompt (owner, 2026-10-23).** The design doc's three-layer prompt
@@ -226,10 +266,14 @@ cd frontend && npm install && npm run dev   # http://localhost:5173, proxies /ap
 backend/    FastAPI app (app/models.py = all six design entities + prompt_versions
             + provider_settings; app/providers.py = provider registry, masked
             views, credential resolution, Test connection;
-            app/orchestrator.py = dispatch service, stub transport, the one
-            idempotent finalize path for §8.2 results;
+            app/market_time.py = the tenant market timezone — windows, days,
+            caps and retry due times are all evaluated on it (A10);
+            app/orchestrator.py = dispatch service (market-local schedule
+            admission, tenant-concurrency batches, retry/re-queue), stub
+            transport, the one idempotent finalize path for §8.2 results;
             app/transports.py = the real transports (A6): Vapi start-call +
-            report mapping, Plivo create-call + answer XML + spike outcomes;
+            report mapping (review-flag parity, A10), Plivo create-call +
+            answer XML + spike outcomes;
             app/stt.py = the STT leg (A7): Saaras streaming client, live
             transcript view, per-session STT persistence;
             app/conversation.py = the conversation brain (A8/A9): Sarvam
@@ -237,11 +281,14 @@ backend/    FastAPI app (app/models.py = all six design entities + prompt_versio
             tool), sentence chunker, Bulbul TTS client, the per-call turn
             engine (barge-in interrupts, silence prompts, no_input
             close), and the post-call classifier;
-            app/routers/ = auth, tenants, agents, campaigns, settings, calls,
+            app/routers/ = auth, tenants, agents, campaigns, settings, calls
+            (incl. campaign results summary + tenant dashboard, A10),
             telephony (provider webhook / answer / stream routes);
-            migrations/001–006 = DDL of record)
+            migrations/001–008 = DDL of record)
 frontend/   React (Vite) console — theme tokens in src/theme.css (wireframe design language);
-            pages: Agents, AgentEditor, Campaigns, CampaignWizard, CampaignDetail, LeadsUpload, Settings, Calls
-scripts/    smoke_test.py — automated acceptance checks (A1 + A2 + A3 + A4 + A5 + A6 + A7 + A8 + A9)
+            pages: Dashboard, Agents, AgentEditor, Campaigns, CampaignWizard,
+            CampaignDetail (dispatch + Results card), LeadsUpload, Settings,
+            Calls (result filters)
+scripts/    smoke_test.py — automated acceptance checks (A1 + A2 + A3 + A4 + A5 + A6 + A7 + A8 + A9 + A10)
 docker-compose.yml   db (PostgreSQL 16) + backend + frontend (nginx)
 ```

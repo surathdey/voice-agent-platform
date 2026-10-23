@@ -357,12 +357,25 @@ def map_vapi_report(message: dict):
 
     artifact = message.get("artifact") or {}
     cb = message.get("costBreakdown") or {}
+    summary = message.get("summary") or analysis.get("summary") or ""
+
+    # Managed-mode parity (A10): the self-hosted path flags a connected
+    # call whose classification produced no disposition (A8 classifier
+    # failure → review_required). The managed path must behave the
+    # same: a call Vapi completed but whose analysis carried no
+    # disposition is flagged for human review — never silently stored
+    # as an unclassified success, and never given an invented bucket.
+    review_required = final_state == "COMPLETED" and not disposition
+    if review_required and not summary:
+        summary = ("Managed call completed, but the provider's analysis "
+                   "returned no disposition — flagged for human review.")
     outcome = {
         "final_state": final_state,
         "end_reason": end_reason,
         "disposition": disposition,
         "confidence": 0.0,
-        "summary": message.get("summary") or analysis.get("summary") or "",
+        "review_required": review_required,
+        "summary": summary,
         "captured_fields": structured,
         "duration_s": duration_s,
         "recording_url": artifact.get("recordingUrl") or message.get("recordingUrl") or "",

@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 
 from ..db import get_db
 from ..deps import get_current_user
+from ..market_time import tenant_timezone_name, timezone_name_for_market
 from ..models import Tenant, User
 from ..schemas import TenantIn, TenantOut
 from ..security import hash_password
@@ -15,6 +16,7 @@ router = APIRouter(prefix="/api/tenants", tags=["tenants"])
 def _out(t: Tenant) -> TenantOut:
     return TenantOut(
         tenant_id=t.tenant_id, name=t.name, market=t.market,
+        timezone=tenant_timezone_name(t),
         provider_mode_default=t.provider_mode_default,
         from_numbers=t.from_numbers or [], concurrency_limit=t.concurrency_limit,
         recording_retention_days=t.recording_retention_days,
@@ -49,6 +51,7 @@ def create_tenant(body: TenantIn, db: Session = Depends(get_db)):
     """
     tenant = Tenant(
         name=body.name, market=body.market,
+        timezone=body.timezone or timezone_name_for_market(body.market),
         provider_mode_default=body.provider_mode_default,
         from_numbers=body.from_numbers, concurrency_limit=body.concurrency_limit,
     )

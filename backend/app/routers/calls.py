@@ -5,8 +5,15 @@
   routing and the stub transport live in app.orchestrator.
 - GET  /api/campaigns/{id}/calls — this campaign's sessions + results,
   with attempt counts by state for the campaign page.
+- GET  /api/campaigns/{id}/results — the campaign's RESULTS SUMMARY
+  (A10): counts per disposition (buckets parsed from the campaign
+  agent's own single prompt), attempts made, connect rate, leads by
+  state — the numbers the campaign page's Results card renders.
 - GET  /api/calls — the tenant's calls across campaigns (Calls page),
-  optional ?campaign_id= filter.
+  optional ?campaign_id= / ?disposition= / ?review_required= filters.
+- GET  /api/dashboard — the tenant home (A10): active campaigns, calls
+  today (market-local), per-disposition totals across campaigns, and
+  the human-review queue count.
 - POST /api/results — the idempotent §8.2 result receiver: the callback
   the self-hosted orchestrator (and the normalised managed webhook) will
   deliver to in A6+. A duplicate delivery returns the stored result —
@@ -14,16 +21,31 @@
 
 Every query is tenant-scoped: another tenant's campaign/session is a 404.
 All call views are assembled into the §8.2 contract shape (CallOut).
+The results/dashboard read models are assembled from the SAME §8.2
+records both modes land through finalize_attempt — managed and
+self-hosted results are indistinguishable here by construction (A10
+managed-mode parity).
 """
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
+from .. import market_time as mt
 from ..db import get_db
 from ..deps import get_current_user
 from .. import stt as stt_module
-from ..models import CallResult, CallSession, Campaign, Lead, User
-from ..orchestrator import Dispatcher, receive_result
-from ..schemas import CallListOut, CallOut, DispatchOut, ResultIn, ResultOut
+from ..models import AgentConfig, CallResult, CallSession, Campaign, Lead, Tenant, User
+from ..orchestrator import Dispatcher, disposition_buckets, receive_result
+from ..schemas import (
+    CallListOut,
+    CallOut,
+    CampaignResultsOut,
+    DashboardOut,
+    DispatchOut,
+    ResultIn,
+    ResultOut,
+)
 
 router = APIRouter(tags=["calls"])
 
@@ -145,18 +167,131 @@ def campaign_calls(campaign_id: str, limit: int = 500, offset: int = 0,
                        calls=[_call_out(db, s) for s in rows])
 
 
+@router.get("/api/campaigns/{campaign_id}/results", response_model=CampaignResultsOut)
+def campaign_results(campaign_id: str, user: User = Depends(get_current_user),
+                       db: Session = Depends(get_db)):
+    """The campaign's results summary (A10). Counts per disposition use
+    the bucket set parsed from the campaign agent's OWN single prompt —
+    the same source the stub rotates through and the classifier is
+    bound to — zero-filled, with any stored disposition outside the set
+    appended so nothing is ever hidden."""
+    c = _campaign_scoped(db, user, campaign_id)
+    agent = db.get(AgentConfig, c.agent_id)
+    buckets = disposition_buckets(agent.prompt if agent else "")
+
+    sessions = (db.query(CallSession)
+                .filter(CallSession.campaign_id == c.campaign_id).all())
+    results = (db.query(CallResult)
+               .join(CallSession, CallResult.session_id == CallSession.session_id)
+               .filter(CallSession.campaign_id == c.campaign_id).all())
+    session_state = {s.session_id: s.state for s in sessions}
+
+    counts = {b: 0 for b in buckets}
+    connected = 0
+    review = 0
+    total_duration = 0
+    for r in results:
+        counts[r.disposition or "(none)"] = counts.get(r.disposition or "(none)", 0) + 1
+        if session_state.get(r.session_id) == "COMPLETED":
+            connected += 1
+        if r.review_required:
+            review += 1
+        total_duration += r.duration_s or 0
+
+    lead_rows = (db.query(Lead.status)
+                 .filter(Lead.campaign_id == c.campaign_id).all())
+    leads_by_state: dict[str, int] = {}
+    for (st,) in lead_rows:
+        leads_by_state[st] = leads_by_state.get(st, 0) + 1
+    now = datetime.utcnow()
+    awaiting = (db.query(Lead)
+                .filter(Lead.campaign_id == c.campaign_id,
+                        Lead.status == "pending",
+                        Lead.next_attempt_at.isnot(None),
+                        Lead.next_attempt_at > now)
+                .count())
+
+    return CampaignResultsOut(
+        campaign_id=c.campaign_id,
+        agent_id=c.agent_id,
+        buckets=buckets,
+        counts_by_disposition=counts,
+        attempts_made=len(sessions),
+        results_count=len(results),
+        connected=connected,
+        connect_rate=(connected / len(results)) if results else 0.0,
+        review_required=review,
+        leads_total=len(lead_rows),
+        leads_by_state=leads_by_state,
+        awaiting_retry=awaiting,
+        total_duration_s=total_duration,
+    )
+
+
+@router.get("/api/dashboard", response_model=DashboardOut)
+def dashboard(user: User = Depends(get_current_user),
+              db: Session = Depends(get_db)):
+    """Tenant home (A10): the day at a glance, from the same §8.2
+    records every mode produces. "Today" is the tenant's market-local
+    day; dispositions are tenant-wide totals across campaigns."""
+    tenant = db.get(Tenant, user.tenant_id)
+    zone = mt.tenant_zone(tenant)
+    today_local = mt.to_local(datetime.utcnow(), zone).date()
+    day_start_utc = mt.local_day_start_utc(today_local, zone)
+
+    campaigns = (db.query(Campaign)
+                 .filter(Campaign.tenant_id == user.tenant_id).all())
+    by_status: dict[str, int] = {}
+    for c in campaigns:
+        by_status[c.status] = by_status.get(c.status, 0) + 1
+
+    calls_total = (db.query(CallSession)
+                   .filter(CallSession.tenant_id == user.tenant_id).count())
+    calls_today = (db.query(CallSession)
+                   .filter(CallSession.tenant_id == user.tenant_id,
+                           CallSession.started_at >= day_start_utc).count())
+
+    results = (db.query(CallResult)
+               .filter(CallResult.tenant_id == user.tenant_id).all())
+    dispositions: dict[str, int] = {}
+    review = 0
+    for r in results:
+        key = r.disposition or "(none)"
+        dispositions[key] = dispositions.get(key, 0) + 1
+        if r.review_required:
+            review += 1
+
+    return DashboardOut(
+        timezone=mt.tenant_timezone_name(tenant),
+        active_campaigns=by_status.get("active", 0),
+        campaigns_by_status=by_status,
+        calls_today=calls_today,
+        calls_total=calls_total,
+        results_total=len(results),
+        dispositions=dispositions,
+        review_queue_count=review,
+    )
+
+
 @router.get("/api/calls", response_model=CallListOut)
-def list_calls(campaign_id: str = "", limit: int = 500, offset: int = 0,
+def list_calls(campaign_id: str = "", disposition: str = "",
+               review_required: bool | None = None,
+               limit: int = 500, offset: int = 0,
                user: User = Depends(get_current_user),
                db: Session = Depends(get_db)):
     q = db.query(CallSession).filter(CallSession.tenant_id == user.tenant_id)
     if campaign_id:
         q = q.filter(CallSession.campaign_id == campaign_id)
+    if disposition or review_required is not None:
+        # Result-bearing filters: sessions without a §8.2 result cannot
+        # match a disposition / review filter by definition.
+        q = q.join(CallResult, CallResult.session_id == CallSession.session_id)
+        if disposition:
+            q = q.filter(CallResult.disposition == disposition)
+        if review_required is not None:
+            q = q.filter(CallResult.review_required == review_required)
     total = q.count()
-    tq = db.query(CallSession.state).filter(CallSession.tenant_id == user.tenant_id)
-    if campaign_id:
-        tq = tq.filter(CallSession.campaign_id == campaign_id)
-    states = _counts(db, tq)
+    states = _counts(db, q.with_entities(CallSession.state))
     rows = (q.order_by(CallSession.started_at, CallSession.session_id)
              .offset(offset).limit(limit).all())
     return CallListOut(total=total, counts_by_state=states,

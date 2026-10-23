@@ -1,0 +1,26 @@
+-- 008_a10_dispatch_scale.sql — Phase A chunk 9 (A10: dispatch at scale,
+-- results surface, managed-mode parity).
+--   tenants.timezone        the tenant's market timezone (IANA name).
+--                           ALL schedule arithmetic — calling windows,
+--                           calling days, start dates, daily caps, retry
+--                           due times — is evaluated in it from A10 on
+--                           (A5 evaluated windows in UTC). Provisioning
+--                           sets it from the market (IN → Asia/Kolkata,
+--                           NA → America/Toronto); the column is the
+--                           resolved value so it can be corrected per
+--                           tenant without a code change.
+--   leads.next_attempt_at   when a re-queued lead becomes dispatchable
+--                           again (naive UTC, the platform's storage
+--                           convention). Set by the finalize path when an
+--                           attempt ends no-answer / busy / failed with
+--                           attempts remaining: ended_at + the campaign's
+--                           retry gap (with the different-time-of-day
+--                           shift applied in market-local time when the
+--                           campaign asks for it). NULL = due now (or the
+--                           lead is not awaiting a retry).
+-- The application also creates fresh tables in this shape on boot
+-- (db.init_db from the models); this file is the DDL of record for
+-- upgrading a database created by 001–007.
+
+ALTER TABLE tenants ADD COLUMN timezone VARCHAR(60) NOT NULL DEFAULT 'Asia/Kolkata';
+ALTER TABLE leads ADD COLUMN next_attempt_at TIMESTAMP NULL;

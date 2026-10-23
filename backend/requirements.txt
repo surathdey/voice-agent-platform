@@ -9,3 +9,4 @@ python-multipart>=0.0.9
 # [standard] already brings it in for the Plivo stream endpoint; the
 # backend now imports it directly, so it is declared).
 websockets>=12
+tzdata>=2024.1

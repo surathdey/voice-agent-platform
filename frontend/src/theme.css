@@ -279,3 +279,23 @@ select.map-target { font-size: 13.5px; }
 .check-row { display: flex; align-items: center; gap: 8px; text-transform: none;
   letter-spacing: 0; font-size: 13.5px; color: var(--ink); font-weight: 500; }
 .check-row input { width: auto; }
+
+/* ── Dashboard + results surface (A10) ──────────────────────────────────── */
+.stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 16px; margin-bottom: 20px; }
+.stat-card {
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+  box-shadow: var(--shadow); padding: 16px 18px;
+}
+/* Inside a .card (campaign Results) the stats sit on the card itself. */
+.card .stat-card { background: transparent; border: 0; box-shadow: none; padding: 2px 0; }
+.stat-card .n { font-size: 30px; font-weight: 700; color: var(--navy); line-height: 1.1; }
+.stat-card .l { font-size: 12px; font-weight: 700; letter-spacing: 0.05em;
+  text-transform: uppercase; color: var(--slate); margin-top: 4px; }
+.bar-row { display: grid; grid-template-columns: 200px 1fr 46px; gap: 10px; align-items: center; margin: 5px 0; font-size: 13px; }
+.bar-row .bar-name { font-family: var(--mono); font-size: 12.5px; color: var(--ink);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bar-track { background: #eef2f5; border-radius: 6px; height: 10px; overflow: hidden; display: block; }
+.bar-fill { background: var(--teal); height: 100%; border-radius: 6px; display: block; min-width: 0; }
+.bar-fill.empty { background: transparent; }
+.filter-bar { display: flex; gap: 14px; flex-wrap: wrap; align-items: flex-end; }
+.filter-bar .field { min-width: 190px; margin-bottom: 0; }

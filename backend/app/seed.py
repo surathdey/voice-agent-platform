@@ -57,7 +57,7 @@ def seed(db: Session) -> None:
     tenant = db.query(Tenant).filter(Tenant.name == settings.SEED_TENANT_NAME).first()
     if tenant is None:
         tenant = Tenant(
-            name=settings.SEED_TENANT_NAME, market="IN",
+            name=settings.SEED_TENANT_NAME, market="IN", timezone="Asia/Kolkata",
             provider_mode_default="managed", concurrency_limit=20,
         )
         db.add(tenant)
