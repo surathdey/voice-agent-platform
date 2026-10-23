@@ -1,3 +1,9 @@
+-- NOTE (post-A12 upgrade-path fix): the application applies this step
+-- automatically at boot via the migration runner (backend/app/
+-- migrations.py) — idempotent, per-object, dialect-aware (PostgreSQL
+-- + SQLite), tracked in the schema_migrations table. This file
+-- remains the DDL of record; the runner step of the same number is
+-- its executable twin.
 -- 002_a3_campaign_fields.sql — Phase A chunk 2 (A3: campaigns & leads).
 -- Campaign gains the §15 business fields: audience, named channel, product
 -- detail, and an updated_at stamp; product narrows to the canonical product

@@ -1,3 +1,9 @@
+-- NOTE (post-A12 upgrade-path fix): the application applies this step
+-- automatically at boot via the migration runner (backend/app/
+-- migrations.py) — idempotent, per-object, dialect-aware (PostgreSQL
+-- + SQLite), tracked in the schema_migrations table. This file
+-- remains the DDL of record; the runner step of the same number is
+-- its executable twin.
 -- 004_a6_voice_gender.sql — Phase A chunk 5 (A6: telephony spike).
 -- AgentConfig gains voice_gender (female | male): the agent persona's
 -- configured voice gender. In managed mode the Vapi transport uses it to

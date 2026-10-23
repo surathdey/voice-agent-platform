@@ -1,3 +1,9 @@
+-- NOTE (post-A12 upgrade-path fix): the application applies this step
+-- automatically at boot via the migration runner (backend/app/
+-- migrations.py) — idempotent, per-object, dialect-aware (PostgreSQL
+-- + SQLite), tracked in the schema_migrations table. This file
+-- remains the DDL of record; the runner step of the same number is
+-- its executable twin.
 -- 007_a9_barge_in_silence.sql — Phase A chunk 8 (A9: barge-in + silence
 -- handling in the self-hosted conversation loop).
 -- Barge-in itself needs no schema: an interrupted agent turn is a

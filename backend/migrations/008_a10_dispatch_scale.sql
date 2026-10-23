@@ -1,3 +1,9 @@
+-- NOTE (post-A12 upgrade-path fix): the application applies this step
+-- automatically at boot via the migration runner (backend/app/
+-- migrations.py) — idempotent, per-object, dialect-aware (PostgreSQL
+-- + SQLite), tracked in the schema_migrations table. This file
+-- remains the DDL of record; the runner step of the same number is
+-- its executable twin.
 -- 008_a10_dispatch_scale.sql — Phase A chunk 9 (A10: dispatch at scale,
 -- results surface, managed-mode parity).
 --   tenants.timezone        the tenant's market timezone (IANA name).

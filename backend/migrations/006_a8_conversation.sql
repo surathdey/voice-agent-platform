@@ -1,3 +1,9 @@
+-- NOTE (post-A12 upgrade-path fix): the application applies this step
+-- automatically at boot via the migration runner (backend/app/
+-- migrations.py) — idempotent, per-object, dialect-aware (PostgreSQL
+-- + SQLite), tracked in the schema_migrations table. This file
+-- remains the DDL of record; the runner step of the same number is
+-- its executable twin.
 -- 006_a8_conversation.sql — Phase A chunk 7 (A8: full conversation loop).
 -- The self-hosted stream gains the LLM + TTS legs beside the A7 STT leg,
 -- and results gain the review flag the post-call classifier sets when it

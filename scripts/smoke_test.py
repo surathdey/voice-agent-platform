@@ -34,7 +34,11 @@ attempts as NEW attempts (gap honoured, exhaustion final, exactly one
 result per attempt), campaign results summary + tenant dashboard +
 calls filters, and managed-mode parity: the same result-surface
 assertions against a stub-completed call and a fake-Vapi
-webhook-completed call, incl. the review-flag gap (A10).
+webhook-completed call, incl. the review-flag gap (A10) · the upgrade
+path (post-A12 fix): a database built at the 002-era shape boots,
+migrates in place via the boot-time migration runner (data intact,
+schema_migrations 1–9), and a second boot is a byte-identical no-op;
+a fresh database still boots to the identical final schema.
 
 Run against a FRESH database: like the earlier chunks, the suite seeds its
 own tenants/agents/campaigns/settings and asserts exact fresh-state values.
@@ -3636,6 +3640,153 @@ try:
     _ai12_server.shutdown()
     _stt12_server.shutdown()
     _fake12_server.shutdown()
+
+    # ── FIX: migration runner — an old database upgrades in place ────
+    # The defect this section locks shut: create_all never alters an
+    # existing table, so a volume created by an early build kept its
+    # early shape and a later build crashed at startup on the first
+    # missing column (tenants.timezone, 008 — the owner's first real
+    # Docker run of the full Phase A code). Every section above boots
+    # FRESH databases, which is exactly why the hole survived A1–A12.
+    print("── FIX: migration runner — 002-era database upgrades in place ──")
+    import sqlite3 as _sqlite3
+
+    def _legacy_db(path):
+        """A database at the 002-era shape: exactly the objects 001 +
+        002 define (001's file executed verbatim; 002's four columns
+        with a literal timestamp default — the file's DEFAULT now() is
+        PostgreSQL-only syntax; the SHAPE is what the fixture must
+        reproduce), plus one tenant row written by the old code."""
+        if os.path.exists(path):
+            os.remove(path)
+        con = _sqlite3.connect(path)
+        con.executescript(
+            open(os.path.join(_BACKEND6, "migrations", "001_initial.sql")).read())
+        for _stmt in (
+            "ALTER TABLE campaigns ADD COLUMN product_detail VARCHAR(300) NOT NULL DEFAULT ''",
+            "ALTER TABLE campaigns ADD COLUMN audience TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE campaigns ADD COLUMN channel VARCHAR(120) NOT NULL DEFAULT 'Service Channel 1'",
+            "ALTER TABLE campaigns ADD COLUMN updated_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT '2026-01-01 00:00:00'",
+        ):
+            con.execute(_stmt)
+        con.execute(
+            "INSERT INTO tenants (tenant_id, name, market,"
+            " provider_mode_default, provider_credential_refs, from_numbers,"
+            " concurrency_limit, recording_retention_days, created_at)"
+            " VALUES ('ten_legacy0001', 'Legacy Tenant', 'IN', 'managed',"
+            " '{}', '[]', 20, 90, '2026-01-01 00:00:00')")
+        con.commit()
+        con.close()
+
+    def _db_cols(path, table):
+        con = _sqlite3.connect(path)
+        try:
+            return {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
+        finally:
+            con.close()
+
+    def _db_query(path, sql):
+        con = _sqlite3.connect(path)
+        try:
+            return con.execute(sql).fetchall()
+        finally:
+            con.close()
+
+    _legacy_path = os.path.join(TMP6, "legacy.db")
+    _legacy_db(_legacy_path)
+    check6("FIX fixture: the 002-era database has NO tenants.timezone "
+           "(the column whose absence crashed the owner's upgraded boot) "
+           "but DOES have 002's campaign fields",
+           "timezone" not in _db_cols(_legacy_path, "tenants")
+           and "product_detail" in _db_cols(_legacy_path, "campaigns"))
+
+    baseL = None
+    try:
+        baseL = start_app6(18118, "legacy", {})
+    except RuntimeError:
+        baseL = None
+    check6("FIX: the app BOOTS against the 002-era database — startup no "
+           "longer dies on the missing 008 column", baseL is not None)
+    if baseL:
+        tokenL = login6(baseL)
+        check6("FIX: login works on the upgraded database (the seed ran "
+               "after the runner)", bool(tokenL))
+        check6("FIX: tenants.timezone now exists and the pre-existing "
+               "tenant row survived with the migration default",
+               "timezone" in _db_cols(_legacy_path, "tenants")
+               and _db_query(_legacy_path,
+                             "SELECT name, timezone FROM tenants "
+                             "WHERE tenant_id = 'ten_legacy0001'")
+               == [("Legacy Tenant", "Asia/Kolkata")])
+        check6("FIX: leads.next_attempt_at exists (008 complete)",
+               "next_attempt_at" in _db_cols(_legacy_path, "leads"))
+        _sess_cols = _db_cols(_legacy_path, "call_sessions")
+        check6("FIX: call_sessions.channel + test_lead exist (009)",
+               {"channel", "test_lead"} <= _sess_cols)
+        check6("FIX: every other step landed — provider_settings table, "
+               "voice_gender / max_turns / silence_max_prompts, "
+               "STT+LLM+TTS columns, review_required",
+               "provider_settings" in {r[0] for r in _db_query(
+                   _legacy_path,
+                   "SELECT name FROM sqlite_master WHERE type = 'table'")}
+               and {"voice_gender", "max_turns", "silence_max_prompts"}
+                   <= _db_cols(_legacy_path, "agent_configs")
+               and {"stt_status", "llm_status", "tts_status"} <= _sess_cols
+               and "review_required" in _db_cols(_legacy_path, "call_results"))
+        check6("FIX: schema_migrations records exactly versions 1-9",
+               [r[0] for r in _db_query(
+                   _legacy_path,
+                   "SELECT version FROM schema_migrations ORDER BY version")]
+               == [1, 2, 3, 4, 5, 6, 7, 8, 9])
+        _recorded_before = _db_query(
+            _legacy_path,
+            "SELECT version, name, applied_at FROM schema_migrations "
+            "ORDER BY version")
+        _tenants_before = _db_query(
+            _legacy_path,
+            "SELECT tenant_id, name, timezone FROM tenants ORDER BY tenant_id")
+
+        # ── second boot against the same file: a pure no-op ──────────
+        _proc = _procs6[-1]
+        _proc.terminate()
+        try:
+            _proc.wait(timeout=5)
+        except Exception:
+            _proc.kill()
+        baseL2 = None
+        try:
+            baseL2 = start_app6(18119, "legacy", {})
+        except RuntimeError:
+            baseL2 = None
+        check6("FIX: a SECOND boot against the upgraded database also "
+               "succeeds", baseL2 is not None)
+        if baseL2:
+            check6("FIX: the second boot changed nothing — "
+                   "schema_migrations rows (incl. applied_at) and the "
+                   "tenants table are identical, so the runner is a "
+                   "no-op on a current database",
+                   _db_query(_legacy_path,
+                             "SELECT version, name, applied_at FROM "
+                             "schema_migrations ORDER BY version")
+                   == _recorded_before
+                   and _db_query(_legacy_path,
+                                 "SELECT tenant_id, name, timezone FROM "
+                                 "tenants ORDER BY tenant_id")
+                   == _tenants_before)
+
+    # ── fresh-database path unchanged ────────────────────────────────
+    # (Every instance above already boots fresh; this asserts the fresh
+    # path explicitly against the migration record itself.)
+    baseF = start_app6(18120, "freshmig", {})
+    _fresh_path = os.path.join(TMP6, "freshmig.db")
+    check6("FIX: a fresh database boots to the identical final schema "
+           "with a complete 1-9 migration record",
+           "timezone" in _db_cols(_fresh_path, "tenants")
+           and "channel" in _db_cols(_fresh_path, "call_sessions")
+           and [r[0] for r in _db_query(
+               _fresh_path,
+               "SELECT version FROM schema_migrations ORDER BY version")]
+           == [1, 2, 3, 4, 5, 6, 7, 8, 9])
 
 finally:
     for _p in _procs6:

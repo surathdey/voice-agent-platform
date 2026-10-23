@@ -1,3 +1,9 @@
+-- NOTE (post-A12 upgrade-path fix): the application applies this step
+-- automatically at boot via the migration runner (backend/app/
+-- migrations.py) — idempotent, per-object, dialect-aware (PostgreSQL
+-- + SQLite), tracked in the schema_migrations table. This file
+-- remains the DDL of record; the runner step of the same number is
+-- its executable twin.
 -- 001_initial.sql — Voice Agent Platform, Phase A (A1) initial schema.
 -- Generated from the SQLAlchemy models in backend/app/models.py (PostgreSQL dialect).
 -- The application also creates tables idempotently on boot (db.init_db);

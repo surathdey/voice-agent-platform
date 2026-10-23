@@ -1,3 +1,9 @@
+-- NOTE (post-A12 upgrade-path fix): the application applies this step
+-- automatically at boot via the migration runner (backend/app/
+-- migrations.py) — idempotent, per-object, dialect-aware (PostgreSQL
+-- + SQLite), tracked in the schema_migrations table. This file
+-- remains the DDL of record; the runner step of the same number is
+-- its executable twin.
 -- 005_a7_stt.sql — Phase A chunk 6 (A7: STT integration).
 -- CallSession gains the self-hosted STT record: the Sarvam Saaras
 -- streaming session opened per call inside the Plivo media stream.

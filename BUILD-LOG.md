@@ -1,5 +1,89 @@
 # BUILD LOG
 
+## Fix — Migration runner: the upgrade path (2026-10-23, post-A12)
+
+### The defect, plainly
+The platform had **no upgrade path, and it was untested because every
+prior verification used fresh databases**. Schema creation was
+`Base.metadata.create_all`, which creates missing tables but never
+alters existing ones, and the numbered files in `backend/migrations/`
+were "DDL of record" that nothing executed. So a database volume
+created by an early build kept its early shape forever. The owner hit
+it on his first real Docker run of the complete Phase A code: he
+pulled, rebuilt, and the backend died at startup —
+`psycopg2.errors.UndefinedColumn: column tenants.timezone does not
+exist` (migration 008, A10) — because his volume predated migrations
+003–009 and nothing was ever going to apply them.
+
+### Built
+- **`backend/app/migrations.py` — a boot-time migration runner**,
+  called from `db.init_db()` BEFORE `create_all` and the seed. It
+  tracks applied steps in a `schema_migrations` table (version PK,
+  name, applied_at) and mirrors the nine numbered files (which keep
+  their numbering and intent, and remain the DDL of record — each
+  file header now says so).
+- **Baseline by marker introspection, not assumption.** A database
+  without `schema_migrations` can be at ANY historical shape, so an
+  unrecorded step is never applied blind: its marker — the live
+  presence of the objects the step owns (008: `tenants.timezone` AND
+  `leads.next_attempt_at`; 003: the `provider_settings` table; 009:
+  `channel` + `test_lead` columns, plus campaign/lead nullability on
+  PostgreSQL) — decides "backfill the record, run no DDL" vs "apply".
+- **Applies are per-object idempotent** (each column added only if
+  missing), so a partial state WITHIN a step converges and an
+  interrupted step resumes safely on the next boot. Steps are
+  dialect-aware: timestamp spellings per dialect; 002's
+  `DEFAULT now()` (PostgreSQL-only) is expressed as a UTC timestamp
+  literal so existing rows are stamped with the migration time in
+  both dialects; 009's `DROP NOT NULL` runs on PostgreSQL only —
+  exactly as 009's own header prescribes, SQLite dev databases keep
+  the legacy NOT NULL (recreate those).
+- **Single source of truth preserved.** On an empty database, step
+  001 creates the initial tables FROM THE MODELS (later markers then
+  verify true and backfill), so `create_all` — which still runs right
+  after the runner — and the migrations cannot fight: fresh and
+  ancient databases end at the identical model schema.
+
+### Verification (native, SQLite — same Docker caveat as chunks 1–11)
+- Runner probed directly against four shapes before the suite grew
+  the section: 002-era (001/002 backfilled, 003–009 applied, tenant
+  row intact with the 008 default), fresh (001/003 applied from the
+  models, rest backfilled), partial-within-008 (timezone present,
+  next_attempt_at missing → converged), 001-era (002 applied on top).
+  Second run in every case: `[]` — a strict no-op.
+- `scripts/smoke_test.py`: the new FIX section builds a database at
+  the **002-era shape** (001's file executed verbatim + 002's
+  columns, one legacy tenant row), boots the real app against it and
+  asserts startup succeeds, `tenants.timezone` /
+  `leads.next_attempt_at` / `call_sessions.channel` + `test_lead`
+  (and every other step's objects) exist afterwards, the legacy row
+  survived, and `schema_migrations` holds exactly 1–9; then boots a
+  SECOND time and asserts the migration record and tenants are
+  byte-identical; plus an explicit fresh-database boot assertion.
+  **Full suite: 589 passed, 0 failed** (580 pre-existing green + the
+  new FIX checks).
+- The owner's own volume is the field test: his next
+  `docker compose up --build` is the first production-shaped run of
+  the runner (PostgreSQL dialect). The SQLite path above is the same
+  code with dialect branches; the PostgreSQL branches (incl. 009's
+  DROP NOT NULL) follow the files' DDL verbatim but have not run
+  against a live PostgreSQL on this VM (no Docker) — stated plainly
+  rather than implied.
+
+### Known limitations (deliberate, for this fix)
+- Indexes on tables that already existed are not backfilled (the
+  001-era files define none; `create_all` adds indexes only with new
+  tables). A performance nuance on ancient volumes, not a correctness
+  gap; a future step can add index markers if it ever matters.
+- Column TYPE drift between eras (e.g. campaigns.product VARCHAR(120)
+  in 001 vs String(40) in the models) is not reconciled — markers
+  check presence, not width; nothing in the app depends on the width.
+
+### Next step
+Owner re-runs `git pull && docker compose up --build` on his Mac —
+his existing volume should now boot the full Phase A app with his
+chunk-1-era test data intact. Then Phase B (B1, RPI) as planned.
+
 ## Chunk 11 — Phase A: A12 Real Per-Call Cost, Edge Cases, Load (2026-10-23)
 
 ### Built

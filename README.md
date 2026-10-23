@@ -49,6 +49,28 @@ supplied per tenant in the console under **Settings → Providers** (tenant
 values override the `.env` placeholders; secrets there are stored
 server-side and only ever shown masked, `••••` + last 4).
 
+## Upgrading an existing deployment
+
+Pulling new code and rebuilding is the whole upgrade:
+
+```bash
+git pull
+docker compose up --build
+```
+
+On boot, the migration runner (`backend/app/migrations.py`) brings an
+existing database up to the current schema **in place** — the numbered
+steps in `backend/migrations/` are applied idempotently and recorded
+in a `schema_migrations` table, so a database volume created by an
+early build gains the columns and tables later builds added, with its
+data intact. (Before this runner existed, an old volume kept its old
+shape and a new build crashed at startup on the first missing column.)
+A current database boots untouched — the runner is a no-op.
+
+The nuclear option still exists for **test data only**: `docker compose
+down -v` deletes the database volume, and the next `up` seeds a fresh
+platform. Never use it on a database whose data you want to keep.
+
 ## Run it natively (development)
 
 ```bash

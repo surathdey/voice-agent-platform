@@ -1,3 +1,9 @@
+-- NOTE (post-A12 upgrade-path fix): the application applies this step
+-- automatically at boot via the migration runner (backend/app/
+-- migrations.py) — idempotent, per-object, dialect-aware (PostgreSQL
+-- + SQLite), tracked in the schema_migrations table. This file
+-- remains the DDL of record; the runner step of the same number is
+-- its executable twin.
 -- 003_a4_provider_settings.sql — Phase A chunk 3 (A4: provider settings).
 -- New table provider_settings: one row per (tenant, provider) holding ALL
 -- configured field values for that provider (identifiers + secrets) in the
