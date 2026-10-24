@@ -285,6 +285,18 @@ def build_vapi_payload(session: CallSession, agent: AgentConfig,
             "provider": model_provider,
             "model": model_name,
             "messages": [{"role": "system", "content": agent.prompt or ""}],
+            # The endCall tool is the ONLY way the assistant can hang up:
+            # without it the model can speak the closing line but the call
+            # stays up until the customer hangs up or a timeout fires —
+            # live-proven 2026-10-24 (RPI v3 test call: opening and the
+            # RPC_CONFIRMED closing spoken word-for-word, then ~25s of
+            # repeated thanks fragments because the call never ended).
+            # With the tool present, the prompt's closing discipline
+            # ("speak the full closing, then end the call immediately")
+            # has a mechanism to act on; Vapi reports the hangup as
+            # endedReason "assistant-ended-call", which the webhook
+            # already maps to a completed result.
+            "tools": [{"type": "endCall"}],
         },
         "voice": vapi_voice(vapi_fields, agent, language),
         "transcriber": _vapi_transcriber(vapi_fields, language),
