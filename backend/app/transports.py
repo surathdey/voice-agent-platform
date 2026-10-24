@@ -285,18 +285,15 @@ def build_vapi_payload(session: CallSession, agent: AgentConfig,
             "provider": model_provider,
             "model": model_name,
             "messages": [{"role": "system", "content": agent.prompt or ""}],
-            # The endCall tool is the ONLY way the assistant can hang up:
-            # without it the model can speak the closing line but the call
-            # stays up until the customer hangs up or a timeout fires —
-            # live-proven 2026-10-24 (RPI v3 test call: opening and the
-            # RPC_CONFIRMED closing spoken word-for-word, then ~25s of
-            # repeated thanks fragments because the call never ended).
-            # With the tool present, the prompt's closing discipline
-            # ("speak the full closing, then end the call immediately")
-            # has a mechanism to act on; Vapi reports the hangup as
-            # endedReason "assistant-ended-call", which the webhook
-            # already maps to a completed result.
-            "tools": [{"type": "endCall"}],
+            # NO tools on purpose — above all no endCall tool. Live
+            # A/B 2026-10-24: without any tool, the RPI v3 test call
+            # spoke its opening and the full verbatim closing (the call
+            # then stayed up — the hangup problem); WITH the endCall
+            # tool added, the model short-circuited BOTH test calls to
+            # a bare one-word farewell and never spoke the approved
+            # closings at all. A tool at closing time competes with the
+            # spoken closing and wins. Hangup is therefore driven by
+            # endCallPhrases below, never by a model-invoked tool.
         },
         "voice": vapi_voice(vapi_fields, agent, language),
         "transcriber": _vapi_transcriber(vapi_fields, language),
@@ -312,6 +309,25 @@ def build_vapi_payload(session: CallSession, agent: AgentConfig,
             },
         },
         "maxDurationSeconds": agent.max_duration_s or 300,
+        # Hangup mechanism: Vapi ends the call when the assistant speaks
+        # one of these phrases. Each phrase occurs ONLY as the final
+        # words of an approved closing in the agent prompts (the RPI
+        # closings in en / hi / bn), so the call can end only by the
+        # agent speaking a complete approved closing — never by a
+        # shortcut farewell. Covers the CONFIRMED, CPC, DENIAL,
+        # DENIAL-REPEATED, CALLBACK, HOSTILE and DECEASED closings in
+        # all three languages. DNC closings end with apology phrases
+        # that also occur mid-closing elsewhere, so they are
+        # deliberately NOT listed; a DNC call ends via the customer's
+        # hangup or the silence timeout.
+        "endCallPhrases": [
+            "ভালো থাকবেন",
+            "आपका दिन शुभ हो",
+            "Have a good day",
+            "চিন্তা করবেন না",
+            "चिंता न करें",
+            "don't worry about this right now",
+        ],
     }
     credential_id = (vapi_fields.get("server_credential_id") or "").strip()
     if credential_id:
