@@ -18,6 +18,7 @@ const PRODUCTS = [
 const CHANNELS = ['Service Channel 1', 'Service Channel 2', 'Service Channel 3']
 const RPI_COLS = ['callee_name', 'phone_number', 'bank_name', 'state']
 const BANK_COLS = ['ACCOUNT_NO', 'CUSTOMER_NAME', 'PRINCIPAL', 'OUTSTANDING', 'MOBILE_NO', 'RegistrationNumber']
+const REMINDER_COLS = [...BANK_COLS, 'due_date', 'amount_due']
 
 function Steps({ current }) {
   return (
@@ -108,7 +109,8 @@ export default function CampaignWizard({ onLaunched, onExit }) {
   }
 
   const isRpi = agent && /rpi|verification/i.test(`${agent.name} ${agent.stage}`)
-  const expectedColumns = agent ? (isRpi ? RPI_COLS : BANK_COLS) : []
+  const isReminder = agent && /reminder/i.test(`${agent.name} ${agent.stage}`)
+  const expectedColumns = agent ? (isRpi ? RPI_COLS : isReminder ? REMINDER_COLS : BANK_COLS) : []
 
   return (
     <div>

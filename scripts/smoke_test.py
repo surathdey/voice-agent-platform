@@ -38,7 +38,11 @@ webhook-completed call, incl. the review-flag gap (A10) · the upgrade
 path (post-A12 fix): a database built at the 002-era shape boots,
 migrates in place via the boot-time migration runner (data intact,
 schema_migrations 1–9), and a second boot is a byte-identical no-op;
-a fresh database still boots to the identical final schema.
+a fresh database still boots to the identical final schema · B2 (Phase B):
+the seeded Payment Reminder agent — 9 disposition buckets parsed from its
+prompt (incl. PAYMENT_DATE_GIVEN), a stub-mode campaign dispatch that
+finalizes, and the built Vapi payload carrying the lead's due_date /
+amount_due variables.
 
 Run against a FRESH database: like the earlier chunks, the suite seeds its
 own tenants/agents/campaigns/settings and asserts exact fresh-state values.
@@ -135,8 +139,8 @@ qgbs_id = me["tenant_id"]
 
 print("── A2: seeded agent (single prompt, v1) ──────")
 _, agents = call("GET", "/api/agents", token=token)
-assert len(agents) == 1, agents
-rpi = agents[0]
+assert len(agents) == 2, agents  # RPI Verification + Payment Reminder (B2 seed)
+rpi = next(a for a in agents if a["name"] == "RPI Verification")
 assert rpi["name"] == "RPI Verification" and rpi["prompt_version"] == 1, rpi
 for section in ("ROLE", "FLOW", "DISPOSITIONS", "CLOSINGS"):
     assert section in rpi["prompt"], f"prompt missing section {section}"
@@ -3972,6 +3976,114 @@ try:
                _fresh_path,
                "SELECT version FROM schema_migrations ORDER BY version")]
            == [1, 2, 3, 4, 5, 6, 7, 8, 9])
+
+    # ── B2: the second seeded agent — Payment Reminder ─────────────
+    # Runs LAST: the BASE (stub-mode) parts add finalized calls to the
+    # seed tenant, and nothing after this section asserts tenant-wide
+    # counts, so they cannot disturb the A1–A10 assertions above.
+    import re as _re
+
+    def _prompt_buckets(prompt):
+        # The orchestrator's disposition_buckets() extraction, verbatim:
+        # `- NAME: …` lines inside the prompt's DISPOSITIONS section.
+        bucket_line = _re.compile(r"^-\s+([A-Z][A-Z0-9_]{2,})\s*(?::|$)")
+        section_head = _re.compile(r"^[A-Z][A-Z /&-]{2,}$")
+        out, in_sec = [], False
+        for raw in (prompt or "").splitlines():
+            line = raw.strip()
+            if line.upper().startswith("DISPOSITIONS"):
+                in_sec = True
+                continue
+            if in_sec:
+                m = bucket_line.match(line)
+                if m:
+                    if m.group(1) not in out:
+                        out.append(m.group(1))
+                    continue
+                if section_head.match(line) and line.upper() not in ("DISPOSITIONS",):
+                    break
+        return out
+
+    print("── B2: seeded Payment Reminder — buckets from its own prompt ──")
+    _, agentsB2 = call("GET", "/api/agents", token=token)
+    remB2 = next(a for a in agentsB2
+                 if a["name"] == "Payment Reminder" and "PAYMENT_DATE_GIVEN" in a["prompt"])
+    check6("B2: seeded Payment Reminder agent (stage Reminder, prompt v1, not the reference)",
+           remB2["stage"] == "Reminder" and remB2["prompt_version"] == 1
+           and remB2["is_reference"] is False, remB2.get("stage"))
+    REM_BUCKETS = _prompt_buckets(remB2["prompt"])
+    check6("B2: 9 disposition buckets parsed from the Reminder prompt, incl. PAYMENT_DATE_GIVEN",
+           len(REM_BUCKETS) == 9 and "PAYMENT_DATE_GIVEN" in REM_BUCKETS, REM_BUCKETS)
+    check6("B2: the Reminder agent captures the stated payment_date field",
+           [f["name"] for f in remB2["captured_fields"]] == ["payment_date"],
+           remB2["captured_fields"])
+
+    print("── B2: stub campaign on the Reminder agent dispatches + finalizes ──")
+    B2_CSV = (
+        "callee_name,phone_number,bank_name,state,due_date,amount_due\n"
+        "P. Reminder,9500000001,Tata Capital,Bihar,2026-11-05,8500\n"
+    )
+    B2_MAP = {**A5_MAP, "due_date": "agent_field", "amount_due": "agent_field"}
+    _, campB2 = call("POST", "/api/campaigns", {
+        "agent_id": remB2["agent_id"], "name": "B2 — Reminder Batch",
+        "product": "vehicle_loan", "provider_mode": "self_hosted",
+        "schedule": {"window_start": "00:00", "window_end": "23:59", "calling_days": "Mon - Sun", "daily_cap": 2000},
+    }, token=token, expect=201)
+    cidB2 = campB2["campaign_id"]
+    _, upB2 = call_upload(f"/api/campaigns/{cidB2}/leads/upload", B2_CSV, token=token,
+                          fields={"mapping": json.dumps(B2_MAP)})
+    check6("B2: lead with due_date/amount_due columns uploads clean",
+           upB2["created"] == 1, upB2)
+    _, leadsB2 = call("GET", f"/api/campaigns/{cidB2}/leads", token=token)
+    check6("B2: due_date + amount_due landed in the lead's agent_fields",
+           leadsB2["leads"][0]["agent_fields"].get("due_date") == "2026-11-05"
+           and leadsB2["leads"][0]["agent_fields"].get("amount_due") == "8500",
+           leadsB2["leads"][0]["agent_fields"])
+    call("POST", f"/api/campaigns/{cidB2}/status", {"status": "active"}, token=token)
+    _, repB2 = call("POST", f"/api/campaigns/{cidB2}/dispatch", token=token)
+    check6("B2: stub dispatch admits + finalizes the Reminder campaign's call",
+           repB2["transport"] == "stub" and repB2["created"] == 1
+           and repB2["finalized"] == 1, repB2)
+    _, clB2 = call("GET", f"/api/campaigns/{cidB2}/calls", token=token)
+    check6("B2: finalized — COMPLETED, the prompt's first bucket (PAYMENT_DATE_GIVEN), payment_date slot present",
+           clB2["total"] == 1 and clB2["calls"][0]["final_state"] == "COMPLETED"
+           and clB2["calls"][0]["disposition"] == "PAYMENT_DATE_GIVEN"
+           and "payment_date" in clB2["calls"][0]["captured_fields"], clB2)
+
+    print("── B2: the built Vapi payload carries due_date/amount_due ──")
+    baseB2 = start_app6(18121, "b2-reminder", {
+        "TELEPHONY_MODE": "managed", "VAPI_API_KEY": "sk-fake-managed",
+        "VAPI_DEFAULT_MODEL": "gpt-4o-mini",
+    })
+    tokenB2 = login6(baseB2)
+    _, agentsMB2 = call6(baseB2, "GET", "/api/agents", token=tokenB2)
+    remMB2 = next(a for a in agentsMB2 if a["name"] == "Payment Reminder")
+    _, campMB2 = call6(baseB2, "POST", "/api/campaigns", {
+        "agent_id": remMB2["agent_id"], "name": "B2 — Reminder Managed",
+        "product": "vehicle_loan", "provider_mode": "managed",
+        "schedule": {"window_start": "00:00", "window_end": "23:59", "calling_days": "Mon - Sun", "daily_cap": 2000},
+    }, token=tokenB2, expect=201)
+    cidMB2 = campMB2["campaign_id"]
+    upMB2 = upload6(baseB2, f"/api/campaigns/{cidMB2}/leads/upload", B2_CSV, tokenB2, B2_MAP)
+    assert upMB2["created"] == 1, upMB2
+    call6(baseB2, "POST", f"/api/campaigns/{cidMB2}/status", {"status": "active"}, token=tokenB2)
+    _reqs_before = len([r for r in FAKE["requests"] if r["path"] == "/call/phone"])
+    _, repMB2 = call6(baseB2, "POST", f"/api/campaigns/{cidMB2}/dispatch", token=tokenB2)
+    check6("B2: managed dispatch places the Reminder call via the Vapi transport",
+           repMB2["transport"] == "managed" and repMB2["created"] == 1
+           and repMB2["placed"] == 1, repMB2)
+    reqsB2 = [r for r in FAKE["requests"] if r["path"] == "/call/phone"][_reqs_before:]
+    check6("B2: fake Vapi received exactly the one Reminder start-call",
+           len(reqsB2) == 1, len(reqsB2))
+    payB2 = json.loads(reqsB2[0]["body"]) if reqsB2 else {}
+    vvB2 = payB2.get("assistantOverrides", {}).get("variableValues", {})
+    check6("B2: payload variableValues carry the lead's due_date + amount_due",
+           vvB2.get("due_date") == "2026-11-05" and vvB2.get("amount_due") == "8500", vvB2)
+    schemaB2 = (payB2.get("assistant", {}).get("analysisPlan", {})
+                .get("structuredDataSchema", {}).get("properties", {}))
+    check6("B2: payload analysis schema = Reminder buckets + payment_date (§8.2 source)",
+           "PAYMENT_DATE_GIVEN" in schemaB2.get("disposition", {}).get("enum", [])
+           and "payment_date" in schemaB2, list(schemaB2))
 
 finally:
     for _p in _procs6:

@@ -133,6 +133,8 @@ def lead_variables(campaign: Campaign, lead: Lead) -> dict:
         "product": campaign.product or "",
         "product_identifier": af.get("product_identifier", "") or "",
         "product_identifier_type": af.get("product_identifier_type", "") or "",
+        "due_date": af.get("due_date", "") or "",
+        "amount_due": af.get("amount_due", "") or "",
     }
 
 
