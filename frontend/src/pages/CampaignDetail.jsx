@@ -57,7 +57,7 @@ export default function CampaignDetail({ campaignId, onBack }) {
   }
 
   async function remove() {
-    if (!window.confirm('Delete this campaign and all its leads?')) return
+    if (!window.confirm('Delete this campaign, all its leads and its call records?')) return
     setBusy(true)
     try { await api(`/api/campaigns/${campaignId}`, { method: 'DELETE' }); onBack() }
     catch (e) { setError(e.message); setBusy(false) }

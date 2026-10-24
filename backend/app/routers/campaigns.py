@@ -26,7 +26,7 @@ from sqlalchemy.orm import Session
 from .. import providers as prov
 from ..db import get_db
 from ..deps import get_current_user
-from ..models import AgentConfig, Campaign, Lead, User
+from ..models import AgentConfig, CallResult, CallSession, Campaign, Lead, User
 from ..schemas import (
     PRODUCTS,
     CampaignIn,
@@ -220,7 +220,21 @@ def update_campaign(campaign_id: str, body: CampaignIn, user: User = Depends(get
 @router.delete("/{campaign_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_campaign(campaign_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     c = _get_scoped(db, user, campaign_id)
-    db.query(Lead).filter(Lead.campaign_id == c.campaign_id).delete()
+    # Delete in foreign-key order: call results -> call sessions -> leads ->
+    # campaign. Sessions reference both the campaign and its leads, results
+    # reference sessions; Postgres enforces those FKs, so deleting the leads
+    # first failed (500) on any campaign that had ever been dispatched.
+    lead_ids = [lid for (lid,) in db.query(Lead.lead_id).filter(Lead.campaign_id == c.campaign_id)]
+    session_q = db.query(CallSession.session_id).filter(CallSession.campaign_id == c.campaign_id)
+    if lead_ids:
+        session_q = db.query(CallSession.session_id).filter(
+            (CallSession.campaign_id == c.campaign_id) | (CallSession.lead_id.in_(lead_ids))
+        )
+    session_ids = [sid for (sid,) in session_q]
+    if session_ids:
+        db.query(CallResult).filter(CallResult.session_id.in_(session_ids)).delete(synchronize_session=False)
+        db.query(CallSession).filter(CallSession.session_id.in_(session_ids)).delete(synchronize_session=False)
+    db.query(Lead).filter(Lead.campaign_id == c.campaign_id).delete(synchronize_session=False)
     db.delete(c)
     db.commit()
     return None
