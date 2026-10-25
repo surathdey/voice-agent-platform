@@ -367,6 +367,12 @@ def finalize_attempt(db: Session, session: CallSession, outcome: dict):
     # deliberately. A lead mid-call still reads "pending" (dispatch
     # never changes a lead's status until finalize), so a multi-lead
     # campaign stays active until its last call lands.
+    # NOTE: SessionLocal runs with autoflush=False, so the count below
+    # would read the PRE-finalize database state (the just-finalized
+    # lead still "pending" there) and skip the completion. Flush the
+    # lead update first — live-proven 2026-10-25: without this flush,
+    # a single-lead campaign stayed active after its call landed.
+    db.flush()
     campaign = db.get(Campaign, session.campaign_id) if session.campaign_id else None
     if campaign is not None and campaign.status == "active":
         pending_left = (db.query(Lead)
