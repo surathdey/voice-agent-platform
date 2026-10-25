@@ -19,6 +19,9 @@ const CHANNELS = ['Service Channel 1', 'Service Channel 2', 'Service Channel 3']
 const RPI_COLS = ['callee_name', 'phone_number', 'bank_name', 'state']
 const BANK_COLS = ['ACCOUNT_NO', 'CUSTOMER_NAME', 'PRINCIPAL', 'OUTSTANDING', 'MOBILE_NO', 'RegistrationNumber']
 const REMINDER_COLS = [...BANK_COLS, 'due_date', 'amount_due']
+const PTP_COLS = [...BANK_COLS] // design §15.3: the bank's file format
+const SET_COLS = [...BANK_COLS] // design §15.4: the bank's file format
+const BRK_COLS = [...BANK_COLS, 'promise_date', 'promised_amount'] // design §15.5: bank's columns plus the original promise
 
 function Steps({ current }) {
   return (
@@ -45,6 +48,7 @@ export default function CampaignWizard({ onLaunched, onExit }) {
   const [details, setDetails] = useState({
     name: '', product: 'vehicle_loan', product_detail: '', purpose: '',
     audience: '', channel: 'Service Channel 1', provider_mode: 'managed',
+    settlement_authority_pct: '',
   })
   const [schedule, setSchedule] = useState({
     start_date: '', calling_days: 'Mon – Sat', window_start: '09:00', window_end: '19:00', daily_cap: 2000,
@@ -66,7 +70,9 @@ export default function CampaignWizard({ onLaunched, onExit }) {
     try {
       const c = await api('/api/campaigns', {
         method: 'POST',
-        body: { agent_id: agentId, ...details, schedule, retry_rules: retry, routing_rules: [] },
+        body: { agent_id: agentId, ...details,
+          settlement_authority_pct: details.settlement_authority_pct === '' ? null : Number(details.settlement_authority_pct),
+          schedule, retry_rules: retry, routing_rules: [] },
       })
       setCampaign(c); setStep(2)
     } catch (e) { setError(e.message) } finally { setBusy(false) }
@@ -82,6 +88,7 @@ export default function CampaignWizard({ onLaunched, onExit }) {
           product_detail: campaign.product_detail, purpose: campaign.purpose,
           audience: campaign.audience, channel: campaign.channel,
           provider_mode: campaign.provider_mode,
+          settlement_authority_pct: campaign.settlement_authority_pct ?? null,
           schedule: { ...schedule, daily_cap: Number(schedule.daily_cap) || 0 },
           retry_rules: {
             max_attempts: Number(retry.max_attempts) || 1,
@@ -110,7 +117,10 @@ export default function CampaignWizard({ onLaunched, onExit }) {
 
   const isRpi = agent && /rpi|verification/i.test(`${agent.name} ${agent.stage}`)
   const isReminder = agent && /reminder/i.test(`${agent.name} ${agent.stage}`)
-  const expectedColumns = agent ? (isRpi ? RPI_COLS : isReminder ? REMINDER_COLS : BANK_COLS) : []
+  const isPtp = agent && /promise-to-pay/i.test(`${agent.name} ${agent.stage}`)
+  const isSettlement = agent && /settlement/i.test(`${agent.name} ${agent.stage}`)
+  const isBroken = agent && /broken/i.test(`${agent.name} ${agent.stage}`)
+  const expectedColumns = agent ? (isRpi ? RPI_COLS : isBroken ? BRK_COLS : isSettlement ? SET_COLS : isPtp ? PTP_COLS : isReminder ? REMINDER_COLS : BANK_COLS) : []
 
   return (
     <div>
@@ -180,12 +190,18 @@ export default function CampaignWizard({ onLaunched, onExit }) {
                 <option value="self_hosted">Self-hosted stack (our orchestrator)</option>
               </select>
               <div className="hint">Chosen per campaign — the same campaign data and results either way.</div></div>
+            {isSettlement && (
+              <div className="field" style={{ marginTop: 14 }}><label><span className="marker" style={{ marginRight: 8 }}>6</span>Settlement authority cap (%)</label>
+                <input type="number" min="0" max="100" value={details.settlement_authority_pct} onChange={setD('settlement_authority_pct')} placeholder="e.g. 30 — max discount the agent may agree on its own" />
+                <div className="hint">Above this cap the case goes to the Human Queue for approval — the agent never refuses outright and never agrees beyond it. Leave blank for zero authority (everything to approval).</div></div>
+            )}
           </div>
           <div className="notes-panel">
             <h4>What this means</h4>
             <p><span className="n">2</span>The campaign states what the loan is, why it is running, and who it is for. The product decides the identifier the agent uses on the call — a vehicle loan by its registration number, a credit card by its last 4 digits, a home loan by its account number.</p>
             <p><span className="n">4</span>The operator picks a named channel. Which number in that channel’s pool dials out is the platform’s job — the operator never sees or manages numbers.</p>
             <p><span className="n">5</span>Managed mode hands the call to the managed platform; self-hosted runs our own orchestrator (Plivo + Sarvam). Switching later is a setting, not a rebuild.</p>
+            {isSettlement && <p><span className="n">6</span>The authority cap is the maximum discount this Settlement agent may agree on its own. Above it, the case goes to the Human Queue — the agent never refuses outright.</p>}
             <p>Not set here: the institution name comes from the lead list itself (the bank_name column), and the call language follows the agent’s own rule — neither changes per campaign.</p>
           </div>
         </div>
@@ -239,7 +255,7 @@ export default function CampaignWizard({ onLaunched, onExit }) {
         <div>
           {[
             ['Agent', `${agent?.name || campaign.agent_name} — from the agent’s configuration (model, voice, language rule, its single prompt)`],
-            ['Details', `Product: ${campaign.product_label}${campaign.product_detail ? ` — ${campaign.product_detail}` : ''} · Channel: ${campaign.channel} · Via: ${campaign.provider_mode === 'managed' ? 'Managed platform' : 'Self-hosted stack'}${campaign.purpose ? ` · Purpose: ${campaign.purpose}` : ''}${campaign.audience ? ` · For: ${campaign.audience}` : ''}`],
+            ['Details', `Product: ${campaign.product_label}${campaign.product_detail ? ` — ${campaign.product_detail}` : ''} · Channel: ${campaign.channel} · Via: ${campaign.provider_mode === 'managed' ? 'Managed platform' : 'Self-hosted stack'}${campaign.purpose ? ` · Purpose: ${campaign.purpose}` : ''}${campaign.audience ? ` · For: ${campaign.audience}` : ''}${campaign.settlement_authority_pct != null ? ` · Authority cap: ${campaign.settlement_authority_pct}%` : ''}`],
             ['Leads', `${campaign.lead_count} leads loaded for this campaign`],
             ['Schedule', `${schedule.start_date ? `Starts ${schedule.start_date} · ` : ''}${schedule.calling_days}, ${schedule.window_start}–${schedule.window_end} · up to ${retry.max_attempts} attempts per lead · daily cap ${schedule.daily_cap}`],
           ].map(([t, b], i) => (

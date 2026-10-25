@@ -80,6 +80,7 @@ export default function CampaignDetail({ campaignId, onBack }) {
           <div className="sub">
             {campaign.agent_name} · {campaign.product_label}
             {campaign.product_detail ? ` — ${campaign.product_detail}` : ''} · {campaign.channel}
+            {campaign.settlement_authority_pct != null ? ` · Authority cap: ${campaign.settlement_authority_pct}%` : ''}
           </div>
         </div>
         <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>

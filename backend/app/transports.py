@@ -135,6 +135,11 @@ def lead_variables(campaign: Campaign, lead: Lead) -> dict:
         "product_identifier_type": af.get("product_identifier_type", "") or "",
         "due_date": af.get("due_date", "") or "",
         "amount_due": af.get("amount_due", "") or "",
+        "outstanding": af.get("outstanding", "") or "",
+        "promise_date": af.get("promise_date", "") or "",
+        "promised_amount": af.get("promised_amount", "") or "",
+        "settlement_cap_pct": (campaign.settlement_authority_pct
+                               if getattr(campaign, "settlement_authority_pct", None) is not None else ""),
     }
 
 

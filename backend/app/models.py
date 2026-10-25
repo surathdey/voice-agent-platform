@@ -164,6 +164,8 @@ class Campaign(Base):
     # Named channel — "Service Channel 1", "Service Channel 2", … NEVER a number.
     channel: Mapped[str] = mapped_column(String(120), default="Service Channel 1")
     provider_mode: Mapped[str] = mapped_column(String(20), default="managed")  # managed | self_hosted
+    # B4: max discount % the Settlement agent may agree on its own (None = no authority set).
+    settlement_authority_pct: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
     status: Mapped[str] = mapped_column(String(30), default="draft")  # draft → active → paused → completed
     schedule: Mapped[dict] = mapped_column(JSON, default=dict)       # start date, calling days/window, daily cap
     retry_rules: Mapped[dict] = mapped_column(JSON, default=dict)    # max attempts, retry gap

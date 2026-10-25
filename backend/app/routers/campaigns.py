@@ -146,6 +146,7 @@ def _out(db: Session, c: Campaign) -> CampaignOut:
         name=c.name, product=c.product, product_label=meta["label"],
         product_detail=c.product_detail, purpose=c.purpose, audience=c.audience,
         channel=c.channel, provider_mode=c.provider_mode, status=c.status,
+        settlement_authority_pct=c.settlement_authority_pct,
         identifier_type=meta["identifier_type"], identifier_label=meta["identifier_label"],
         schedule=c.schedule or {}, retry_rules=c.retry_rules or {},
         routing_rules=c.routing_rules or [],
@@ -164,6 +165,7 @@ def _apply(c: Campaign, body: CampaignIn) -> None:
     c.audience = body.audience
     c.channel = body.channel
     c.provider_mode = body.provider_mode
+    c.settlement_authority_pct = body.settlement_authority_pct
     c.schedule = body.schedule.model_dump()
     c.retry_rules = body.retry_rules.model_dump()
     c.routing_rules = [r.model_dump() for r in body.routing_rules]
@@ -176,6 +178,9 @@ def _validate(body: CampaignIn) -> None:
     if body.provider_mode not in ("managed", "self_hosted"):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
                             "provider_mode must be 'managed' or 'self_hosted'")
+    if body.settlement_authority_pct is not None and not 0 <= body.settlement_authority_pct <= 100:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            "settlement_authority_pct must be between 0 and 100")
 
 
 @router.get("", response_model=list[CampaignOut])

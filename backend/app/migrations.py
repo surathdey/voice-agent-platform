@@ -227,6 +227,15 @@ def _apply_009(conn, insp, dialect):
                     f"ALTER TABLE call_sessions ALTER COLUMN {col} DROP NOT NULL"))
 
 
+def _marker_010(insp, dialect):
+    return _has_columns(insp, "campaigns", "settlement_authority_pct")
+
+
+def _apply_010(conn, insp, dialect):
+    _ensure_column(conn, "campaigns",
+                   "settlement_authority_pct FLOAT")
+
+
 MIGRATIONS = [
     (1, "001_initial", _marker_001, _apply_001),
     (2, "002_a3_campaign_fields", _marker_002, _apply_002),
@@ -237,6 +246,7 @@ MIGRATIONS = [
     (7, "007_a9_barge_in_silence", _marker_007, _apply_007),
     (8, "008_a10_dispatch_scale", _marker_008, _apply_008),
     (9, "009_a11_browser_test", _marker_009, _apply_009),
+    (10, "010_b4_settlement_cap", _marker_010, _apply_010),
 ]
 
 

@@ -37,12 +37,16 @@ assertions against a stub-completed call and a fake-Vapi
 webhook-completed call, incl. the review-flag gap (A10) · the upgrade
 path (post-A12 fix): a database built at the 002-era shape boots,
 migrates in place via the boot-time migration runner (data intact,
-schema_migrations 1–9), and a second boot is a byte-identical no-op;
+schema_migrations 1–10), and a second boot is a byte-identical no-op;
 a fresh database still boots to the identical final schema · B2 (Phase B):
 the seeded Payment Reminder agent — 9 disposition buckets parsed from its
 prompt (incl. PAYMENT_DATE_GIVEN), a stub-mode campaign dispatch that
 finalizes, and the built Vapi payload carrying the lead's due_date /
-amount_due variables.
+amount_due variables · B3–B5 (Phase B): the same pattern for
+Promise-to-Pay Negotiation, Settlement Negotiation (incl. the
+campaign authority cap reaching the call payload) and Broken-Promise
+Recovery · B6: escalation disposition (TRANSFERRED_TO_HUMAN) on all
+three new agents plus human-queue routing-rule flagging.
 
 Run against a FRESH database: like the earlier chunks, the suite seeds its
 own tenants/agents/campaigns/settings and asserts exact fresh-state values.
@@ -139,7 +143,7 @@ qgbs_id = me["tenant_id"]
 
 print("── A2: seeded agent (single prompt, v1) ──────")
 _, agents = call("GET", "/api/agents", token=token)
-assert len(agents) == 2, agents  # RPI Verification + Payment Reminder (B2 seed)
+assert len(agents) == 5, agents  # RPI + Reminder + PTP + Settlement + Broken-Promise (B2–B5 seed)
 rpi = next(a for a in agents if a["name"] == "RPI Verification")
 assert rpi["name"] == "RPI Verification" and rpi["prompt_version"] == 1, rpi
 for section in ("ROLE", "FLOW", "DISPOSITIONS", "CLOSINGS"):
@@ -3922,11 +3926,11 @@ try:
                    <= _db_cols(_legacy_path, "agent_configs")
                and {"stt_status", "llm_status", "tts_status"} <= _sess_cols
                and "review_required" in _db_cols(_legacy_path, "call_results"))
-        check6("FIX: schema_migrations records exactly versions 1-9",
+        check6("FIX: schema_migrations records exactly versions 1-10",
                [r[0] for r in _db_query(
                    _legacy_path,
                    "SELECT version FROM schema_migrations ORDER BY version")]
-               == [1, 2, 3, 4, 5, 6, 7, 8, 9])
+               == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
         _recorded_before = _db_query(
             _legacy_path,
             "SELECT version, name, applied_at FROM schema_migrations "
@@ -3969,18 +3973,19 @@ try:
     baseF = start_app6(18120, "freshmig", {})
     _fresh_path = os.path.join(TMP6, "freshmig.db")
     check6("FIX: a fresh database boots to the identical final schema "
-           "with a complete 1-9 migration record",
+           "with a complete 1-10 migration record",
            "timezone" in _db_cols(_fresh_path, "tenants")
            and "channel" in _db_cols(_fresh_path, "call_sessions")
            and [r[0] for r in _db_query(
                _fresh_path,
                "SELECT version FROM schema_migrations ORDER BY version")]
-           == [1, 2, 3, 4, 5, 6, 7, 8, 9])
+           == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
 
     # ── B2: the second seeded agent — Payment Reminder ─────────────
-    # Runs LAST: the BASE (stub-mode) parts add finalized calls to the
-    # seed tenant, and nothing after this section asserts tenant-wide
-    # counts, so they cannot disturb the A1–A10 assertions above.
+    # Runs after the A1–A10 sections: the BASE (stub-mode) parts add
+    # finalized calls to the seed tenant, and nothing after this section
+    # asserts tenant-wide counts, so they cannot disturb the A1–A10
+    # assertions above. (B3–B6 below follow the same rule.)
     import re as _re
 
     def _prompt_buckets(prompt):
@@ -4084,6 +4089,287 @@ try:
     check6("B2: payload analysis schema = Reminder buckets + payment_date (§8.2 source)",
            "PAYMENT_DATE_GIVEN" in schemaB2.get("disposition", {}).get("enum", [])
            and "payment_date" in schemaB2, list(schemaB2))
+
+    # ── B3: Promise-to-Pay Negotiation ─────────────────────────────
+    print("── B3: seeded Promise-to-Pay Negotiation — buckets from its own prompt ──")
+    _, agentsB3 = call("GET", "/api/agents", token=token)
+    ptpB3 = next(a for a in agentsB3
+                 if a["name"] == "Promise-to-Pay Negotiation" and "PROMISE_TO_PAY" in a["prompt"])
+    check6("B3: seeded PTP agent (stage Negotiation, prompt v1, not the reference)",
+           ptpB3["stage"] == "Negotiation" and ptpB3["prompt_version"] == 1
+           and ptpB3["is_reference"] is False, ptpB3.get("stage"))
+    PTP_BUCKETS = _prompt_buckets(ptpB3["prompt"])
+    check6("B3: 12 disposition buckets parsed from the PTP prompt, incl. PROMISE_TO_PAY + TRANSFERRED_TO_HUMAN",
+           len(PTP_BUCKETS) == 12 and "PROMISE_TO_PAY" in PTP_BUCKETS
+           and "TRANSFERRED_TO_HUMAN" in PTP_BUCKETS, PTP_BUCKETS)
+    check6("B3: the PTP agent captures promise_date + promise_amount + transfer_reason",
+           [f["name"] for f in ptpB3["captured_fields"]] == ["promise_date", "promise_amount", "transfer_reason"],
+           ptpB3["captured_fields"])
+
+    print("── B3: stub campaign on the PTP agent dispatches + finalizes ──")
+    B3_CSV = (
+        "callee_name,phone_number,bank_name,state,outstanding\n"
+        "P. Promiser,9500000002,Tata Capital,Bihar,42000\n"
+    )
+    B3_MAP = {**A5_MAP, "outstanding": "agent_field"}
+    _, campB3 = call("POST", "/api/campaigns", {
+        "agent_id": ptpB3["agent_id"], "name": "B3 — PTP Batch",
+        "product": "vehicle_loan", "provider_mode": "self_hosted",
+        "schedule": {"window_start": "00:00", "window_end": "23:59", "calling_days": "Mon - Sun", "daily_cap": 2000},
+    }, token=token, expect=201)
+    cidB3 = campB3["campaign_id"]
+    _, upB3 = call_upload(f"/api/campaigns/{cidB3}/leads/upload", B3_CSV, token=token,
+                          fields={"mapping": json.dumps(B3_MAP)})
+    check6("B3: lead with outstanding column uploads clean",
+           upB3["created"] == 1, upB3)
+    _, leadsB3 = call("GET", f"/api/campaigns/{cidB3}/leads", token=token)
+    check6("B3: outstanding landed in the lead's agent_fields",
+           leadsB3["leads"][0]["agent_fields"].get("outstanding") == "42000",
+           leadsB3["leads"][0]["agent_fields"])
+    call("POST", f"/api/campaigns/{cidB3}/status", {"status": "active"}, token=token)
+    _, repB3 = call("POST", f"/api/campaigns/{cidB3}/dispatch", token=token)
+    check6("B3: stub dispatch admits + finalizes the PTP campaign's call",
+           repB3["transport"] == "stub" and repB3["created"] == 1
+           and repB3["finalized"] == 1, repB3)
+    _, clB3 = call("GET", f"/api/campaigns/{cidB3}/calls", token=token)
+    check6("B3: finalized — COMPLETED, the prompt's first bucket (PROMISE_TO_PAY), promise_date slot present",
+           clB3["total"] == 1 and clB3["calls"][0]["final_state"] == "COMPLETED"
+           and clB3["calls"][0]["disposition"] == "PROMISE_TO_PAY"
+           and "promise_date" in clB3["calls"][0]["captured_fields"], clB3)
+
+    print("── B3: the built Vapi payload carries outstanding ──")
+    baseB3 = start_app6(18122, "b3-ptp", {
+        "TELEPHONY_MODE": "managed", "VAPI_API_KEY": "sk-fake-managed",
+        "VAPI_DEFAULT_MODEL": "gpt-4o-mini",
+    })
+    tokenB3 = login6(baseB3)
+    _, agentsMB3 = call6(baseB3, "GET", "/api/agents", token=tokenB3)
+    ptpMB3 = next(a for a in agentsMB3 if a["name"] == "Promise-to-Pay Negotiation")
+    _, campMB3 = call6(baseB3, "POST", "/api/campaigns", {
+        "agent_id": ptpMB3["agent_id"], "name": "B3 — PTP Managed",
+        "product": "vehicle_loan", "provider_mode": "managed",
+        "schedule": {"window_start": "00:00", "window_end": "23:59", "calling_days": "Mon - Sun", "daily_cap": 2000},
+    }, token=tokenB3, expect=201)
+    cidMB3 = campMB3["campaign_id"]
+    upMB3 = upload6(baseB3, f"/api/campaigns/{cidMB3}/leads/upload", B3_CSV, tokenB3, B3_MAP)
+    assert upMB3["created"] == 1, upMB3
+    call6(baseB3, "POST", f"/api/campaigns/{cidMB3}/status", {"status": "active"}, token=tokenB3)
+    _reqs_before = len([r for r in FAKE["requests"] if r["path"] == "/call/phone"])
+    _, repMB3 = call6(baseB3, "POST", f"/api/campaigns/{cidMB3}/dispatch", token=tokenB3)
+    check6("B3: managed dispatch places the PTP call via the Vapi transport",
+           repMB3["transport"] == "managed" and repMB3["created"] == 1
+           and repMB3["placed"] == 1, repMB3)
+    reqsB3 = [r for r in FAKE["requests"] if r["path"] == "/call/phone"][_reqs_before:]
+    check6("B3: fake Vapi received exactly the one PTP start-call",
+           len(reqsB3) == 1, len(reqsB3))
+    payB3 = json.loads(reqsB3[0]["body"]) if reqsB3 else {}
+    vvB3 = payB3.get("assistantOverrides", {}).get("variableValues", {})
+    check6("B3: payload variableValues carry the lead's outstanding",
+           vvB3.get("outstanding") == "42000", vvB3)
+    schemaB3 = (payB3.get("assistant", {}).get("analysisPlan", {})
+                .get("structuredDataSchema", {}).get("properties", {}))
+    check6("B3: payload analysis schema = PTP buckets + promise_date/promise_amount (§8.2 source)",
+           "PROMISE_TO_PAY" in schemaB3.get("disposition", {}).get("enum", [])
+           and "promise_date" in schemaB3 and "promise_amount" in schemaB3, list(schemaB3))
+
+    # ── B4: Settlement Negotiation ─────────────────────────────
+    print("── B4: seeded Settlement Negotiation — buckets from its own prompt ──")
+    _, agentsB4 = call("GET", "/api/agents", token=token)
+    setB4 = next(a for a in agentsB4
+                 if a["name"] == "Settlement Negotiation" and "SETTLED" in a["prompt"])
+    check6("B4: seeded Settlement agent (stage Settlement, prompt v1, not the reference)",
+           setB4["stage"] == "Settlement" and setB4["prompt_version"] == 1
+           and setB4["is_reference"] is False, setB4.get("stage"))
+    SET_BUCKETS = _prompt_buckets(setB4["prompt"])
+    check6("B4: 11 disposition buckets parsed from the Settlement prompt, incl. SETTLED + TRANSFERRED_TO_HUMAN",
+           len(SET_BUCKETS) == 11 and "SETTLED" in SET_BUCKETS
+           and "TRANSFERRED_TO_HUMAN" in SET_BUCKETS, SET_BUCKETS)
+    check6("B4: the Settlement agent captures settlement_amount + discount_pct + transfer_reason",
+           [f["name"] for f in setB4["captured_fields"]] == ["settlement_amount", "discount_pct", "transfer_reason"],
+           setB4["captured_fields"])
+
+    print("── B4: campaign authority cap round-trips + stub dispatch finalizes ──")
+    B4_CSV = (
+        "callee_name,phone_number,bank_name,state,outstanding\n"
+        "S. Settler,9500000003,Tata Capital,Bihar,100000\n"
+    )
+    B4_MAP = {**A5_MAP, "outstanding": "agent_field"}
+    _, campB4 = call("POST", "/api/campaigns", {
+        "agent_id": setB4["agent_id"], "name": "B4 — Settlement Batch",
+        "product": "vehicle_loan", "provider_mode": "self_hosted",
+        "settlement_authority_pct": 30,
+        "schedule": {"window_start": "00:00", "window_end": "23:59", "calling_days": "Mon - Sun", "daily_cap": 2000},
+    }, token=token, expect=201)
+    cidB4 = campB4["campaign_id"]
+    check6("B4: campaign authority cap persists (30%)",
+           campB4["settlement_authority_pct"] == 30, campB4)
+    _, upB4 = call_upload(f"/api/campaigns/{cidB4}/leads/upload", B4_CSV, token=token,
+                          fields={"mapping": json.dumps(B4_MAP)})
+    check6("B4: lead with outstanding column uploads clean",
+           upB4["created"] == 1, upB4)
+    call("POST", f"/api/campaigns/{cidB4}/status", {"status": "active"}, token=token)
+    _, repB4 = call("POST", f"/api/campaigns/{cidB4}/dispatch", token=token)
+    check6("B4: stub dispatch admits + finalizes the Settlement campaign's call",
+           repB4["transport"] == "stub" and repB4["created"] == 1
+           and repB4["finalized"] == 1, repB4)
+    _, clB4 = call("GET", f"/api/campaigns/{cidB4}/calls", token=token)
+    check6("B4: finalized — COMPLETED, the prompt's first bucket (SETTLED), settlement_amount slot present",
+           clB4["total"] == 1 and clB4["calls"][0]["final_state"] == "COMPLETED"
+           and clB4["calls"][0]["disposition"] == "SETTLED"
+           and "settlement_amount" in clB4["calls"][0]["captured_fields"], clB4)
+
+    print("── B4: the built Vapi payload carries the authority cap ──")
+    baseB4 = start_app6(18123, "b4-settlement", {
+        "TELEPHONY_MODE": "managed", "VAPI_API_KEY": "sk-fake-managed",
+        "VAPI_DEFAULT_MODEL": "gpt-4o-mini",
+    })
+    tokenB4 = login6(baseB4)
+    _, agentsMB4 = call6(baseB4, "GET", "/api/agents", token=tokenB4)
+    setMB4 = next(a for a in agentsMB4 if a["name"] == "Settlement Negotiation")
+    _, campMB4 = call6(baseB4, "POST", "/api/campaigns", {
+        "agent_id": setMB4["agent_id"], "name": "B4 — Settlement Managed",
+        "product": "vehicle_loan", "provider_mode": "managed",
+        "settlement_authority_pct": 30,
+        "schedule": {"window_start": "00:00", "window_end": "23:59", "calling_days": "Mon - Sun", "daily_cap": 2000},
+    }, token=tokenB4, expect=201)
+    cidMB4 = campMB4["campaign_id"]
+    upMB4 = upload6(baseB4, f"/api/campaigns/{cidMB4}/leads/upload", B4_CSV, tokenB4, B4_MAP)
+    assert upMB4["created"] == 1, upMB4
+    call6(baseB4, "POST", f"/api/campaigns/{cidMB4}/status", {"status": "active"}, token=tokenB4)
+    _reqs_before = len([r for r in FAKE["requests"] if r["path"] == "/call/phone"])
+    _, repMB4 = call6(baseB4, "POST", f"/api/campaigns/{cidMB4}/dispatch", token=tokenB4)
+    check6("B4: managed dispatch places the Settlement call via the Vapi transport",
+           repMB4["transport"] == "managed" and repMB4["created"] == 1
+           and repMB4["placed"] == 1, repMB4)
+    reqsB4 = [r for r in FAKE["requests"] if r["path"] == "/call/phone"][_reqs_before:]
+    check6("B4: fake Vapi received exactly the one Settlement start-call",
+           len(reqsB4) == 1, len(reqsB4))
+    payB4 = json.loads(reqsB4[0]["body"]) if reqsB4 else {}
+    vvB4 = payB4.get("assistantOverrides", {}).get("variableValues", {})
+    check6("B4: payload variableValues carry the campaign's settlement_cap_pct (30) + outstanding",
+           vvB4.get("settlement_cap_pct") == 30 and vvB4.get("outstanding") == "100000", vvB4)
+    schemaB4 = (payB4.get("assistant", {}).get("analysisPlan", {})
+                .get("structuredDataSchema", {}).get("properties", {}))
+    check6("B4: payload analysis schema = Settlement buckets + settlement_amount/discount_pct (§8.2 source)",
+           "SETTLED" in schemaB4.get("disposition", {}).get("enum", [])
+           and "settlement_amount" in schemaB4 and "discount_pct" in schemaB4, list(schemaB4))
+
+    # ── B5: Broken-Promise Recovery ─────────────────────────────
+    print("── B5: seeded Broken-Promise Recovery — buckets from its own prompt ──")
+    _, agentsB5 = call("GET", "/api/agents", token=token)
+    brkB5 = next(a for a in agentsB5
+                 if a["name"] == "Broken-Promise Recovery" and "NEW_PROMISE" in a["prompt"])
+    check6("B5: seeded Broken-Promise agent (stage Recovery, prompt v1, not the reference)",
+           brkB5["stage"] == "Recovery" and brkB5["prompt_version"] == 1
+           and brkB5["is_reference"] is False, brkB5.get("stage"))
+    BRK_BUCKETS = _prompt_buckets(brkB5["prompt"])
+    check6("B5: 11 disposition buckets parsed from the Broken-Promise prompt, incl. NEW_PROMISE + TRANSFERRED_TO_HUMAN",
+           len(BRK_BUCKETS) == 11 and "NEW_PROMISE" in BRK_BUCKETS
+           and "TRANSFERRED_TO_HUMAN" in BRK_BUCKETS, BRK_BUCKETS)
+    check6("B5: the Broken-Promise agent captures promise_date + promise_amount + break_reason + transfer_reason",
+           [f["name"] for f in brkB5["captured_fields"]] == ["promise_date", "promise_amount", "break_reason", "transfer_reason"],
+           brkB5["captured_fields"])
+
+    print("── B5: stub campaign on the Broken-Promise agent dispatches + finalizes ──")
+    B5_CSV = (
+        "callee_name,phone_number,bank_name,state,promise_date,promised_amount\n"
+        "B. Broken,9500000004,Tata Capital,Bihar,2026-10-20,15000\n"
+    )
+    B5_MAP = {**A5_MAP, "promise_date": "agent_field", "promised_amount": "agent_field"}
+    _, campB5 = call("POST", "/api/campaigns", {
+        "agent_id": brkB5["agent_id"], "name": "B5 — Broken-Promise Batch",
+        "product": "vehicle_loan", "provider_mode": "self_hosted",
+        "schedule": {"window_start": "00:00", "window_end": "23:59", "calling_days": "Mon - Sun", "daily_cap": 2000},
+    }, token=token, expect=201)
+    cidB5 = campB5["campaign_id"]
+    _, upB5 = call_upload(f"/api/campaigns/{cidB5}/leads/upload", B5_CSV, token=token,
+                          fields={"mapping": json.dumps(B5_MAP)})
+    check6("B5: lead with promise_date/promised_amount columns uploads clean",
+           upB5["created"] == 1, upB5)
+    _, leadsB5 = call("GET", f"/api/campaigns/{cidB5}/leads", token=token)
+    check6("B5: original promise landed in the lead's agent_fields",
+           leadsB5["leads"][0]["agent_fields"].get("promise_date") == "2026-10-20"
+           and leadsB5["leads"][0]["agent_fields"].get("promised_amount") == "15000",
+           leadsB5["leads"][0]["agent_fields"])
+    call("POST", f"/api/campaigns/{cidB5}/status", {"status": "active"}, token=token)
+    _, repB5 = call("POST", f"/api/campaigns/{cidB5}/dispatch", token=token)
+    check6("B5: stub dispatch admits + finalizes the Broken-Promise campaign's call",
+           repB5["transport"] == "stub" and repB5["created"] == 1
+           and repB5["finalized"] == 1, repB5)
+    _, clB5 = call("GET", f"/api/campaigns/{cidB5}/calls", token=token)
+    check6("B5: finalized — COMPLETED, the prompt's first bucket (NEW_PROMISE), promise_date slot present",
+           clB5["total"] == 1 and clB5["calls"][0]["final_state"] == "COMPLETED"
+           and clB5["calls"][0]["disposition"] == "NEW_PROMISE"
+           and "promise_date" in clB5["calls"][0]["captured_fields"], clB5)
+
+    print("── B5: the built Vapi payload carries the original promise ──")
+    baseB5 = start_app6(18124, "b5-broken", {
+        "TELEPHONY_MODE": "managed", "VAPI_API_KEY": "sk-fake-managed",
+        "VAPI_DEFAULT_MODEL": "gpt-4o-mini",
+    })
+    tokenB5 = login6(baseB5)
+    _, agentsMB5 = call6(baseB5, "GET", "/api/agents", token=tokenB5)
+    brkMB5 = next(a for a in agentsMB5 if a["name"] == "Broken-Promise Recovery")
+    _, campMB5 = call6(baseB5, "POST", "/api/campaigns", {
+        "agent_id": brkMB5["agent_id"], "name": "B5 — Broken-Promise Managed",
+        "product": "vehicle_loan", "provider_mode": "managed",
+        "schedule": {"window_start": "00:00", "window_end": "23:59", "calling_days": "Mon - Sun", "daily_cap": 2000},
+    }, token=tokenB5, expect=201)
+    cidMB5 = campMB5["campaign_id"]
+    upMB5 = upload6(baseB5, f"/api/campaigns/{cidMB5}/leads/upload", B5_CSV, tokenB5, B5_MAP)
+    assert upMB5["created"] == 1, upMB5
+    call6(baseB5, "POST", f"/api/campaigns/{cidMB5}/status", {"status": "active"}, token=tokenB5)
+    _reqs_before = len([r for r in FAKE["requests"] if r["path"] == "/call/phone"])
+    _, repMB5 = call6(baseB5, "POST", f"/api/campaigns/{cidMB5}/dispatch", token=tokenB5)
+    check6("B5: managed dispatch places the Broken-Promise call via the Vapi transport",
+           repMB5["transport"] == "managed" and repMB5["created"] == 1
+           and repMB5["placed"] == 1, repMB5)
+    reqsB5 = [r for r in FAKE["requests"] if r["path"] == "/call/phone"][_reqs_before:]
+    check6("B5: fake Vapi received exactly the one Broken-Promise start-call",
+           len(reqsB5) == 1, len(reqsB5))
+    payB5 = json.loads(reqsB5[0]["body"]) if reqsB5 else {}
+    vvB5 = payB5.get("assistantOverrides", {}).get("variableValues", {})
+    check6("B5: payload variableValues carry the lead's promise_date + promised_amount",
+           vvB5.get("promise_date") == "2026-10-20" and vvB5.get("promised_amount") == "15000", vvB5)
+    schemaB5 = (payB5.get("assistant", {}).get("analysisPlan", {})
+                .get("structuredDataSchema", {}).get("properties", {}))
+    check6("B5: payload analysis schema = Broken-Promise buckets + promise_date/promise_amount/break_reason (§8.2 source)",
+           "NEW_PROMISE" in schemaB5.get("disposition", {}).get("enum", [])
+           and "promise_date" in schemaB5 and "promise_amount" in schemaB5
+           and "break_reason" in schemaB5, list(schemaB5))
+
+    # ── B6: Human Escalation capability ────────────────────────────
+    # Minimal faithful version (design §11.3 B6): the escalation
+    # disposition + transfer-reason capture + human-queue routing
+    # flagging. The live transfer itself (tenant human number config,
+    # Vapi transfer / Plivo dial wiring, Human Queue screen) is NOT
+    # built here — see the build report's open gaps.
+    print("── B6: escalation disposition + human-queue flagging ──")
+    _, agentsB6 = call("GET", "/api/agents", token=token)
+    for _name in ("Promise-to-Pay Negotiation", "Settlement Negotiation",
+                  "Broken-Promise Recovery"):
+        _ag = next(a for a in agentsB6 if a["name"] == _name)
+        _bk = _prompt_buckets(_ag["prompt"])
+        check6(f"B6: {_name} offers TRANSFERRED_TO_HUMAN + captures transfer_reason",
+               "TRANSFERRED_TO_HUMAN" in _bk
+               and "transfer_reason" in [f["name"] for f in _ag["captured_fields"]], _bk)
+    _brkB6 = next(a for a in agentsB6 if a["name"] == "Broken-Promise Recovery")
+    _B6_RULES = [
+        {"disposition": "TRANSFERRED_TO_HUMAN", "action": "human_queue", "target": ""},
+        {"disposition": "SETTLEMENT_NEEDS_APPROVAL", "action": "human_queue", "target": ""},
+        {"disposition": "ESCALATE_TO_HUMAN", "action": "human_queue", "target": ""},
+    ]
+    _, campB6 = call("POST", "/api/campaigns", {
+        "agent_id": _brkB6["agent_id"], "name": "B6 — Escalation Routing",
+        "product": "vehicle_loan", "provider_mode": "self_hosted",
+        "routing_rules": _B6_RULES,
+        "schedule": {"window_start": "00:00", "window_end": "23:59", "calling_days": "Mon - Sun", "daily_cap": 2000},
+    }, token=token, expect=201)
+    check6("B6: escalation routing rules persist on the campaign",
+           campB6["routing_rules"] == _B6_RULES, campB6["routing_rules"])
+    _, campB6g = call("GET", f"/api/campaigns/{campB6['campaign_id']}", token=token)
+    check6("B6: escalation routing rules round-trip on read",
+           campB6g["routing_rules"] == campB6["routing_rules"], campB6g["routing_rules"])
 
 finally:
     for _p in _procs6:

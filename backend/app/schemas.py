@@ -137,6 +137,8 @@ class CampaignIn(BaseModel):
     audience: str = ""
     channel: str = "Service Channel 1"
     provider_mode: str = "managed"       # managed | self_hosted
+    # B4: max discount % the Settlement agent may agree on its own (None = no authority set).
+    settlement_authority_pct: Optional[float] = None
     schedule: ScheduleIn = Field(default_factory=ScheduleIn)
     retry_rules: RetryIn = Field(default_factory=RetryIn)
     routing_rules: List[RoutingRule] = []
