@@ -495,10 +495,14 @@ assert len(attempt_ids) == 5, attempt_ids  # one §8.1 idempotency key per attem
 print("  PASS  every call conforms to §8.2; dispositions round-robin the prompt's buckets in order")
 
 print("── A5: exactly one result per attempt ────────")
-_, rep2 = call("POST", f"/api/campaigns/{cid5}/dispatch", token=token)
-assert rep2["created"] == 0 and rep2["finalized"] == 0, rep2  # leads already done
+# Auto-complete: with every lead done, the campaign completes itself —
+# so a re-dispatch is refused (before the fix it stayed active and
+# returned zeros here; that was the bug, proven live 2026-10-25).
+_, camp5_done = call("GET", f"/api/campaigns/{cid5}", token=token)
+assert camp5_done["status"] == "completed", camp5_done
+call("POST", f"/api/campaigns/{cid5}/dispatch", token=token, expect=400)
 _, cl2 = call("GET", f"/api/campaigns/{cid5}/calls", token=token)
-assert cl2["total"] == 5, cl2  # a duplicate POST creates no second session
+assert cl2["total"] == 5, cl2  # a refused re-dispatch creates no second session
 first = cl["calls"][0]
 _, dupres = call("POST", "/api/results", {
     "session_id": first["session_id"], "attempt_id": first["attempt_id"],
@@ -2597,9 +2601,15 @@ try:
     check6("A10: exactly one result per attempt across retries (4 attempts, 4 results)",
            len(_sessRB3) == 4
            and all(s["final_state"] in ("BUSY", "NO_ANSWER") for s in _sessRB3), len(_sessRB3))
-    _, _repRB3 = call6(baseR, "POST", f"/api/campaigns/{cidRB}/dispatch", token=tokenR)
+    # Auto-complete: with every lead exhausted, nothing is dispatchable —
+    # the campaign completes itself, so a re-dispatch is refused (before
+    # the fix it stayed active and returned zeros here).
+    _, _campRB = call6(baseR, "GET", f"/api/campaigns/{cidRB}", token=tokenR)
+    check6("A10: exhausted leads complete the campaign",
+           _campRB["status"] == "completed", _campRB)
+    call6(baseR, "POST", f"/api/campaigns/{cidRB}/dispatch", token=tokenR, expect=400)
     check6("A10: exhausted leads are never dispatched again",
-           _repRB3["created"] == 0 and _repRB3["retry_waiting"] == 0, _repRB3)
+           True, "re-dispatch refused on completed campaign")
 
     print("── A10: managed-mode parity — the same result surface as the stub ──")
     cidRP = _campaignR("A10 — Parity Batch",
