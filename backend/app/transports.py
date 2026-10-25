@@ -358,6 +358,7 @@ def build_vapi_payload(session: CallSession, agent: AgentConfig,
         "endCallPhrases": [
             "ভালো থাকবেন",
             "ভালো থাকবে",
+            "ভালো থাক",
             "आपका दिन शुभ हो",
             "Have a good day",
             "চিন্তা করবেন না",
