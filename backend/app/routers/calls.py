@@ -93,6 +93,13 @@ def _call_out(db: Session, s: CallSession) -> CallOut:
     # display name/number come from the test-lead snapshot instead.
     snapshot = s.test_lead or {}
     cost = (result.cost_breakdown or {}) if result else {}
+    # Twilio leg (all-in cost): cached into cost_breakdown on first
+    # view; failures never break the read (see twilio_cost).
+    try:
+        from .. import twilio_cost as _tw
+        _tw.ensure_twilio_cost(db, s, result, cost)
+    except Exception:
+        pass
     return CallOut(
         session_id=s.session_id,
         attempt_id=s.attempt_id,

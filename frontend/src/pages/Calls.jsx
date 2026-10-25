@@ -154,7 +154,7 @@ export default function Calls() {
             <tr>
               <th>Started</th><th>Campaign</th><th>Lead</th><th>Number</th>
               <th>State</th><th>Disposition</th><th>Duration</th>
-              <th>Mode</th><th>Transport</th><th>Legs</th><th className="num" style={{ whiteSpace: 'nowrap' }}>Cost (Vapi)</th>
+              <th>Mode</th><th>Transport</th><th>Legs</th><th className="num" style={{ whiteSpace: 'nowrap' }}>Cost (Vapi + Twilio)</th>
             </tr>
           </thead>
           <tbody>
@@ -177,8 +177,8 @@ export default function Calls() {
                   : c.transport}</td>
                 <td><LegsCell c={c} /></td>
                 <td className="num" style={{ whiteSpace: 'nowrap' }}>
-                  {c.cost_breakdown && c.cost_breakdown.total !== undefined
-                    ? `${c.cost_breakdown.total} ${c.cost_breakdown.currency || ''}`.trim()
+                  {c.cost_breakdown && (c.cost_breakdown.total_all_in !== undefined || c.cost_breakdown.total !== undefined)
+                    ? `${c.cost_breakdown.total_all_in ?? c.cost_breakdown.total} ${c.cost_breakdown.currency || ''}`.trim()
                     : '—'}
                 </td>
               </tr>
@@ -210,6 +210,18 @@ export default function Calls() {
                         )}
                         {c.cost_breakdown.cost_source === 'rate_card' && (
                           <span style={{ color: 'var(--slate)' }}> (computed from the tenant's rate card)</span>
+                        )}
+                        {c.cost_breakdown.twilio && c.cost_breakdown.twilio.status === 'completed' && (
+                          <span style={{ color: 'var(--slate)' }}>
+                            {' '}· Twilio {c.cost_breakdown.twilio.cost} {c.cost_breakdown.twilio.currency || ''} —{' '}
+                            <b>all-in {c.cost_breakdown.total_all_in ?? c.cost_breakdown.total} {c.cost_breakdown.currency || ''}</b>
+                          </span>
+                        )}
+                        {c.cost_breakdown.twilio && c.cost_breakdown.twilio.status === 'pending' && (
+                          <span style={{ color: 'var(--slate)' }}> · Twilio cost pending (lands shortly after the call ends)</span>
+                        )}
+                        {c.cost_breakdown.twilio && c.cost_breakdown.twilio.status === 'unavailable' && (
+                          <span style={{ color: 'var(--slate)' }}> · Twilio cost unavailable</span>
                         )}
                         {c.cost_breakdown.basis && (
                           <div style={{ color: 'var(--slate)', fontSize: 12.5, marginTop: 2 }}>

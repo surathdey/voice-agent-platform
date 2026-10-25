@@ -418,7 +418,7 @@ export default function CampaignDetail({ campaignId, onBack }) {
                     <div><b>Duration:</b> {selectedCall.duration_s}s</div>
                     {cost.total != null && (
                       <div>
-                        <div><b>Cost:</b> {cost.total} {cost.currency || 'USD'}</div>
+                        <div><b>Cost (Vapi):</b> {cost.total} {cost.currency || 'USD'}</div>
                         <div style={{ fontSize: 13, color: 'var(--slate)', marginTop: 2 }}>
                           telephony {cost.telephony ?? 0} · STT {cost.stt ?? 0} ·{' '}
                           LLM {cost.llm ?? 0} · TTS {cost.tts ?? 0}
@@ -426,6 +426,22 @@ export default function CampaignDetail({ campaignId, onBack }) {
                           {cost.cost_source === 'provider' && ' (Vapi-reported)'}
                           {cost.cost_source === 'rate_card' && ' (rate card)'}
                         </div>
+                        {cost.twilio && cost.twilio.status === 'completed' && (
+                          <div style={{ fontSize: 13.5, marginTop: 4 }}>
+                            <div><b>Twilio:</b> {cost.twilio.cost} {cost.twilio.currency || 'USD'}</div>
+                            <div><b>Total (all-in):</b> {cost.total_all_in ?? cost.total} {cost.currency || 'USD'}</div>
+                          </div>
+                        )}
+                        {cost.twilio && cost.twilio.status === 'pending' && (
+                          <div style={{ fontSize: 13, color: 'var(--slate)', marginTop: 4 }}>
+                            Twilio cost pending — it lands shortly after the call ends.
+                          </div>
+                        )}
+                        {cost.twilio && cost.twilio.status === 'unavailable' && (
+                          <div style={{ fontSize: 13, color: 'var(--slate)', marginTop: 4 }}>
+                            Twilio cost unavailable (credentials not configured).
+                          </div>
+                        )}
                         {cost.basis && Object.entries(cost.basis).map(([leg, note]) => (
                           <div key={leg} style={{ fontSize: 12.5, color: 'var(--slate)' }}>
                             {leg}: {note}
