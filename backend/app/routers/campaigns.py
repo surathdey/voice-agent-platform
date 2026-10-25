@@ -389,7 +389,16 @@ def export_campaign(campaign_id: str,
     # transcript files, so the text itself is the honest equivalent).
     # Recording is the S3 presigned link when archived, else the Vapi
     # URL as reference (playback lives in the call drawer via proxy).
-    from datetime import timedelta
+    from datetime import timedelta, timezone
+
+    def _iso(dt):
+        # QGBS timestamps carry +00:00; platform stores naive UTC, so
+        # stamp naive values as UTC rather than leaving them bare.
+        if not dt:
+            return ""
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.isoformat()
     ws.append(["ACCOUNT_NO", "CUSTOMER_NAME", "PRINCIPAL", "OUTSTANDING",
                "MOBILE_NO", "RegistrationNumber", "Call ID", "Start Time",
                "End Time", "Duration", "Call Status", "Disposition",
@@ -440,7 +449,7 @@ def export_campaign(campaign_id: str,
         end = ""
         if s.started_at and dur != "" and dur is not None:
             try:
-                end = (s.started_at + timedelta(seconds=float(dur))).isoformat()
+                end = _iso(s.started_at + timedelta(seconds=float(dur)))
             except (TypeError, ValueError):
                 end = ""
         s3_link = ""
@@ -450,7 +459,7 @@ def export_campaign(campaign_id: str,
         ws.append([str(acct) if acct != "" else "", l.name if l else "",
                    _num(af.get("principal")), _num(af.get("outstanding")),
                    mobile, reg, s.session_id,
-                   s.started_at.isoformat() if s.started_at else "", end,
+                   _iso(s.started_at), end,
                    dur, _status_map.get(s.state or "", s.state or ""),
                    disp, cat, r.summary if r else "", text,
                    s3_link or s.recording_url or ""])
