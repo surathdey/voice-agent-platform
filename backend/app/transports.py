@@ -326,9 +326,14 @@ def build_vapi_payload(session: CallSession, agent: AgentConfig,
         # all three languages. DNC closings end with apology phrases
         # that also occur mid-closing elsewhere, so they are
         # deliberately NOT listed; a DNC call ends via the customer's
-        # hangup or the silence timeout.
+        # hangup or the silence timeout. "ভালো থাকবে" is the same
+        # closing word with its final nasal dropped — the rendering
+        # the Bengali closings actually produced on live calls
+        # (2026-10-25, twice on PTP retest v2) — so it is listed
+        # alongside the full form; it occurs only at closings too.
         "endCallPhrases": [
             "ভালো থাকবেন",
+            "ভালো থাকবে",
             "आपका दिन शुभ हो",
             "Have a good day",
             "চিন্তা করবেন না",
