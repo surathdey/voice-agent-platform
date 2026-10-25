@@ -162,7 +162,15 @@ def lead_variables(campaign: Campaign, lead: Lead) -> dict:
 def resolve_language(agent: AgentConfig, lead: Lead) -> str:
     """§9: the application layer resolves the call language from the
     agent's language rule before dispatch (state rule → default → the
-    agent's STT language)."""
+    agent's STT language). A per-lead preferred_language in agent_fields
+    (en / hi / bn, or a full xx-IN code) wins over the rule — additive
+    only: leads without it resolve exactly as before."""
+    fields = (lead.agent_fields or {}) if lead else {}
+    override = (fields.get("preferred_language") or "").strip()
+    if override:
+        code = override.split("-")[0].strip().lower()
+        if code in ("en", "hi", "bn"):
+            return f"{code}-IN"
     rule = agent.language_rule or {}
     by_state = rule.get("by_state") or {}
     return by_state.get(lead.state) or rule.get("default") or agent.stt_language or "hi-IN"
