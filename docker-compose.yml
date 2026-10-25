@@ -4,7 +4,7 @@
 # Frontend: http://localhost:5173   API: http://localhost:8000/api/health
 services:
   db:
-    image: postgres:16-alpine
+    image: docker.io/library/postgres:16-alpine
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-vap}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-vap-demo-password}
@@ -72,7 +72,7 @@ services:
       SEED_USER_EMAIL: ${SEED_USER_EMAIL:-demo@qgbs.example}
       SEED_USER_PASSWORD: ${SEED_USER_PASSWORD:-demo-password}
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     depends_on:
       db:
         condition: service_healthy
@@ -80,7 +80,7 @@ services:
   frontend:
     build: ./frontend
     ports:
-      - "5173:80"
+      - "127.0.0.1:5173:80"
     depends_on:
       - backend
 
