@@ -73,7 +73,14 @@ def _s3_client():
         logger.warning("s3_recordings: boto3 not installed; archival disabled")
         return None
     try:
-        return boto3.client("s3", region_name=region_name())
+        region = region_name()
+        # Regional endpoint (not boto3's global s3.amazonaws.com default
+        # for presigned URLs): the global host 307-redirects to the
+        # regional host, which breaks the presigned signature. A
+        # regional path-style URL needs no redirect and plays as-is.
+        return boto3.client(
+            "s3", region_name=region,
+            endpoint_url=f"https://s3.{region}.amazonaws.com")
     except Exception as exc:  # credentials/region misconfiguration
         logger.warning("s3_recordings: cannot build S3 client: %s", type(exc).__name__)
         return None
