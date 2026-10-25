@@ -47,7 +47,7 @@ attempt_id (…_2, …_3) and its own single result. Exactly-one-result
 stays per ATTEMPT and absolute: finalize_attempt remains the single
 terminal writer and a duplicate delivery is still a no-op. A lead
 whose attempts run out is "exhausted"; a lead that reached a terminal
-conversation outcome (COMPLETED, VOICEMAIL) is done ("attempted").
+conversation outcome (COMPLETED, VOICEMAIL) is done ("done").
 """
 import hashlib
 import re
@@ -358,8 +358,22 @@ def finalize_attempt(db: Session, session: CallSession, outcome: dict):
         else:
             # A conversation outcome (COMPLETED) or VOICEMAIL: the lead
             # is done and leaves the pending pool for good.
-            lead.status = "attempted"
+            lead.status = "done"
             lead.next_attempt_at = None
+
+    # Auto-complete: an active campaign with nothing left dispatchable
+    # (no lead still "pending") is done — nobody has to complete it by
+    # hand. Paused campaigns are left alone: the operator paused them
+    # deliberately. A lead mid-call still reads "pending" (dispatch
+    # never changes a lead's status until finalize), so a multi-lead
+    # campaign stays active until its last call lands.
+    campaign = db.get(Campaign, session.campaign_id) if session.campaign_id else None
+    if campaign is not None and campaign.status == "active":
+        pending_left = (db.query(Lead)
+                        .filter(Lead.campaign_id == campaign.campaign_id,
+                                Lead.status == "pending").count())
+        if pending_left == 0:
+            campaign.status = "completed"
 
     try:
         db.commit()

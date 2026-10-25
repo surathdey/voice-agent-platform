@@ -236,6 +236,46 @@ def _apply_010(conn, insp, dialect):
                    "settlement_authority_pct FLOAT")
 
 
+def _marker_011(insp, dialect):
+    """True when no lead still carries the old "attempted" status — i.e.
+    the rename already holds (fresh databases, where new code writes
+    "done" from the start, land here). The apply is an idempotent
+    UPDATE, so an unprovable marker only ever costs a no-op rewrite."""
+    try:
+        bind = getattr(insp, "bind", None)
+        if bind is None:
+            return False
+        n = bind.execute(text(
+            "SELECT COUNT(*) FROM leads WHERE status = 'attempted'")).scalar()
+        return n == 0
+    except Exception:
+        return False
+
+
+def _apply_011(conn, insp, dialect):
+    """Lead done-status rename + complete already-finished campaigns.
+
+    * Leads: "attempted" (the old terminal done-marker) becomes "done",
+      the word the UI shows. Idempotent — zero rows on fresh databases.
+    * Campaigns: an ACTIVE campaign with at least one lead and no lead
+      still "pending" has nothing left dispatchable, so it becomes
+      "completed" — the same rule finalize_attempt now applies live.
+      Active campaigns with zero leads are left alone: a launched
+      campaign awaiting its CSV upload must not complete itself.
+    """
+    if not _columns(insp, "leads") or not _columns(insp, "campaigns"):
+        return
+    conn.execute(text(
+        "UPDATE leads SET status = 'done' WHERE status = 'attempted'"))
+    conn.execute(text(
+        "UPDATE campaigns SET status = 'completed' WHERE status = 'active' "
+        "AND EXISTS (SELECT 1 FROM leads "
+        "WHERE leads.campaign_id = campaigns.campaign_id) "
+        "AND NOT EXISTS (SELECT 1 FROM leads "
+        "WHERE leads.campaign_id = campaigns.campaign_id "
+        "AND leads.status = 'pending')"))
+
+
 MIGRATIONS = [
     (1, "001_initial", _marker_001, _apply_001),
     (2, "002_a3_campaign_fields", _marker_002, _apply_002),
@@ -247,6 +287,7 @@ MIGRATIONS = [
     (8, "008_a10_dispatch_scale", _marker_008, _apply_008),
     (9, "009_a11_browser_test", _marker_009, _apply_009),
     (10, "010_b4_settlement_cap", _marker_010, _apply_010),
+    (11, "011_lead_done_status", _marker_011, _apply_011),
 ]
 
 

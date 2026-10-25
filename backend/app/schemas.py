@@ -375,7 +375,7 @@ class CampaignResultsOut(BaseModel):
     connect_rate: float = 0.0            # connected / results_count (0 when no results)
     review_required: int = 0             # results flagged for human review
     leads_total: int = 0
-    leads_by_state: dict = Field(default_factory=dict)   # pending | attempted | exhausted
+    leads_by_state: dict = Field(default_factory=dict)   # pending | done | exhausted
     awaiting_retry: int = 0              # pending leads whose retry gap has not elapsed
     total_duration_s: int = 0
     # A12: real cost totals from the results' cost_breakdowns, grouped

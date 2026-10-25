@@ -496,7 +496,7 @@ print("  PASS  every call conforms to §8.2; dispositions round-robin the prompt
 
 print("── A5: exactly one result per attempt ────────")
 _, rep2 = call("POST", f"/api/campaigns/{cid5}/dispatch", token=token)
-assert rep2["created"] == 0 and rep2["finalized"] == 0, rep2  # leads already attempted
+assert rep2["created"] == 0 and rep2["finalized"] == 0, rep2  # leads already done
 _, cl2 = call("GET", f"/api/campaigns/{cid5}/calls", token=token)
 assert cl2["total"] == 5, cl2  # a duplicate POST creates no second session
 first = cl["calls"][0]
@@ -510,7 +510,7 @@ assert dupres["call"]["duration_s"] == first["duration_s"], dupres
 call("POST", "/api/results", {"session_id": "ses_missing"}, token=token, expect=404)
 print("  PASS  re-dispatch and duplicate result delivery never create a second result")
 _, leads5 = call("GET", f"/api/campaigns/{cid5}/leads", token=token)
-assert all(l["attempt_count"] == 1 and l["status"] == "attempted" for l in leads5["leads"]), leads5
+assert all(l["attempt_count"] == 1 and l["status"] == "done" for l in leads5["leads"]), leads5
 print("  PASS  each lead shows exactly one attempt after dispatch")
 
 print("── A5: paused / completed campaigns do not dispatch ──")
@@ -557,7 +557,7 @@ call("POST", f"/api/campaigns/{campC['campaign_id']}/status", {"status": "active
 _, repC = call("POST", f"/api/campaigns/{campC['campaign_id']}/dispatch", token=token)
 assert repC["created"] == 2 and repC["finalized"] == 2, repC
 _, leadsC = call("GET", f"/api/campaigns/{campC['campaign_id']}/leads", token=token)
-assert sum(1 for l in leadsC["leads"] if l["status"] == "attempted") == 2, leadsC
+assert sum(1 for l in leadsC["leads"] if l["status"] == "done") == 2, leadsC
 assert sum(1 for l in leadsC["leads"] if l["status"] == "pending") == 1, leadsC
 print("  PASS  daily cap admits exactly 2 of 3 leads; the third stays pending")
 
@@ -2469,7 +2469,7 @@ try:
            _res5["attempts_made"] == 5 and _res5["results_count"] == 5
            and _res5["connected"] == 5 and _res5["connect_rate"] == 1.0
            and _res5["review_required"] == 0
-           and _res5["leads_by_state"] == {"attempted": 5}
+           and _res5["leads_by_state"] == {"done": 5}
            and _res5["leads_total"] == 5 and _res5["awaiting_retry"] == 0, _res5)
     call("GET", f"/api/campaigns/{cid5}/results", token=token2, expect=404)
     print("  PASS  results summary is tenant-scoped (tenant 2 → 404)")
@@ -3926,11 +3926,11 @@ try:
                    <= _db_cols(_legacy_path, "agent_configs")
                and {"stt_status", "llm_status", "tts_status"} <= _sess_cols
                and "review_required" in _db_cols(_legacy_path, "call_results"))
-        check6("FIX: schema_migrations records exactly versions 1-10",
+        check6("FIX: schema_migrations records exactly versions 1-11",
                [r[0] for r in _db_query(
                    _legacy_path,
                    "SELECT version FROM schema_migrations ORDER BY version")]
-               == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+               == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
         _recorded_before = _db_query(
             _legacy_path,
             "SELECT version, name, applied_at FROM schema_migrations "
@@ -3973,13 +3973,13 @@ try:
     baseF = start_app6(18120, "freshmig", {})
     _fresh_path = os.path.join(TMP6, "freshmig.db")
     check6("FIX: a fresh database boots to the identical final schema "
-           "with a complete 1-10 migration record",
+           "with a complete 1-11 migration record",
            "timezone" in _db_cols(_fresh_path, "tenants")
            and "channel" in _db_cols(_fresh_path, "call_sessions")
            and [r[0] for r in _db_query(
                _fresh_path,
                "SELECT version FROM schema_migrations ORDER BY version")]
-           == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+           == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
 
     # ── B2: the second seeded agent — Payment Reminder ─────────────
     # Runs after the A1–A10 sections: the BASE (stub-mode) parts add

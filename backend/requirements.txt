@@ -10,3 +10,5 @@ python-multipart>=0.0.9
 # backend now imports it directly, so it is declared).
 websockets>=12
 tzdata>=2024.1
+# Campaign spreadsheet export (xlsx).
+openpyxl>=3.1

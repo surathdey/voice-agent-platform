@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react'
-import { api } from '../api'
+import { api, getToken } from '../api'
 import LeadsUpload from './LeadsUpload'
 
 /* Campaign page — opened from the Campaigns list. Shows the campaign's
@@ -11,10 +11,12 @@ import LeadsUpload from './LeadsUpload'
    prompt), attempts made, connect rate and leads by state — read from
    GET /api/campaigns/{id}/results, the same §8.2 records the Calls
    page and the Dashboard aggregate. The results spreadsheet export
-   arrives with the Phase B agent builds. */
+   (GET /api/campaigns/{id}/export) downloads from the page head.
+   Clicking a lead row opens a right-hand drawer with that lead's calls:
+   the selected call's recording player and full transcript. */
 const STATUS_PILL = { draft: 'navy', active: 'teal', paused: 'gold', completed: 'slate' }
 const STATUS_LABEL = { draft: 'Draft', active: 'Running', paused: 'Paused', completed: 'Completed' }
-const LEAD_PILL = { pending: 'gold', attempted: 'teal', exhausted: 'red' }
+const LEAD_PILL = { pending: 'gold', done: 'teal', exhausted: 'red' }
 
 export default function CampaignDetail({ campaignId, onBack }) {
   const [campaign, setCampaign] = useState(null)
@@ -25,6 +27,8 @@ export default function CampaignDetail({ campaignId, onBack }) {
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
   const [showUpload, setShowUpload] = useState(false)
+  const [selectedLead, setSelectedLead] = useState(null)
+  const [selectedCallId, setSelectedCallId] = useState(null)
 
   async function load() {
     try {
@@ -63,6 +67,23 @@ export default function CampaignDetail({ campaignId, onBack }) {
     catch (e) { setError(e.message); setBusy(false) }
   }
 
+  async function exportSheet() {
+    setBusy(true); setError('')
+    try {
+      const res = await fetch(`/api/campaigns/${campaignId}/export`, {
+        headers: { ...(getToken() ? { Authorization: `Bearer ${getToken()}` } : {}) },
+      })
+      if (!res.ok) throw new Error(`Export failed (${res.status})`)
+      const blob = await res.blob()
+      const url = window.URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `${(campaign.name || 'campaign').replace(/[^A-Za-z0-9._-]+/g, '_')}_export.xlsx`
+      document.body.appendChild(a); a.click(); a.remove()
+      window.URL.revokeObjectURL(url)
+    } catch (e) { setError(e.message) } finally { setBusy(false) }
+  }
+
   if (error && !campaign) return <div><div className="error">{error}</div>
     <button className="btn secondary" onClick={onBack}>← Campaigns</button></div>
   if (!campaign) return <div className="sub">Loading…</div>
@@ -90,6 +111,7 @@ export default function CampaignDetail({ campaignId, onBack }) {
           {campaign.status === 'paused' && <button className="btn small" disabled={busy} onClick={() => setStatus('active')}>Resume</button>}
           {(campaign.status === 'active' || campaign.status === 'paused') &&
             <button className="btn small secondary" disabled={busy} onClick={() => setStatus('completed')}>Complete</button>}
+          <button className="btn small secondary" disabled={busy} onClick={exportSheet}>Export spreadsheet</button>
           <button className="btn small danger" disabled={busy} onClick={remove}>Delete</button>
         </div>
       </div>
@@ -274,7 +296,9 @@ export default function CampaignDetail({ campaignId, onBack }) {
           </thead>
           <tbody>
             {(leads?.leads || []).map((l) => (
-              <tr key={l.lead_id}>
+              <tr key={l.lead_id} onClick={() => { setSelectedLead(l); setSelectedCallId(null) }}
+                title="Click to view this lead's calls, recording and transcript"
+                style={{ cursor: 'pointer' }}>
                 <td>{l.name || '—'}</td>
                 <td style={{ fontFamily: 'var(--mono)', fontSize: 13 }}>{l.phone_number}</td>
                 <td>{l.bank_name || '—'}</td>
@@ -300,6 +324,86 @@ export default function CampaignDetail({ campaignId, onBack }) {
         </table>
       </div>
       <p className="footnote">Only this campaign’s leads are shown — every campaign works its own separate list from the lender.</p>
+
+      {selectedLead && (() => {
+        const leadCalls = (calls?.calls || [])
+          .filter((c) => c.lead_id === selectedLead.lead_id)
+          .sort((a, b) => (b.started_at || '').localeCompare(a.started_at || ''))
+        const selectedCall = leadCalls.find((c) => c.session_id === selectedCallId) || leadCalls[0]
+        const cost = selectedCall?.cost_breakdown || {}
+        return (
+          <>
+            <div onClick={() => setSelectedLead(null)}
+              style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.3)', zIndex: 40 }} />
+            <div style={{ position: 'fixed', top: 0, right: 0, bottom: 0, width: 'min(460px, 94vw)',
+              background: '#fff', zIndex: 41, overflowY: 'auto', padding: '18px 20px',
+              boxShadow: '-4px 0 24px rgba(0,0,0,0.2)' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <h2 style={{ fontSize: 19, margin: 0 }}>{selectedLead.name || '—'}</h2>
+                <button className="btn small secondary" onClick={() => setSelectedLead(null)}>Close</button>
+              </div>
+              <div className="sub" style={{ margin: '6px 0 14px' }}>
+                {selectedLead.phone_number} · {selectedLead.bank_name || '—'} · {selectedLead.state || '—'}
+              </div>
+              <dl className="kv" style={{ gridTemplateColumns: '130px 1fr' }}>
+                <dt>Identifier</dt><dd>{selectedLead.agent_fields?.product_identifier || '—'}</dd>
+                <dt>Status</dt><dd>{selectedLead.status}</dd>
+                <dt>Attempts</dt><dd>{selectedLead.attempt_count}</dd>
+                <dt>Next attempt</dt><dd>{selectedLead.next_attempt_at
+                  ? new Date(selectedLead.next_attempt_at + (selectedLead.next_attempt_at.endsWith('Z') ? '' : 'Z')).toLocaleString()
+                  : '—'}</dd>
+              </dl>
+
+              <h3 className="section-title">Calls — {leadCalls.length}</h3>
+              {leadCalls.length === 0 && <p style={{ color: 'var(--slate)' }}>No calls for this lead yet.</p>}
+              {leadCalls.map((c) => (
+                <button key={c.session_id} className="btn small secondary"
+                  style={{ display: 'block', width: '100%', textAlign: 'left', marginBottom: 6,
+                    fontWeight: selectedCall?.session_id === c.session_id ? 'bold' : 'normal' }}
+                  onClick={() => setSelectedCallId(c.session_id)}>
+                  {c.started_at ? new Date(c.started_at + (c.started_at.endsWith('Z') ? '' : 'Z')).toLocaleString() : '—'}
+                  {' · '}{c.state}{c.disposition ? ` · ${c.disposition}` : ''}{c.duration_s ? ` · ${c.duration_s}s` : ''}
+                </button>
+              ))}
+
+              {selectedCall && (
+                <>
+                  <h3 className="section-title">Recording</h3>
+                  {selectedCall.recording_url ? (
+                    <>
+                      <audio controls src={selectedCall.recording_url} style={{ width: '100%' }} />
+                      <div style={{ marginTop: 6 }}>
+                        <a href={selectedCall.recording_url} download>Download recording</a>
+                      </div>
+                    </>
+                  ) : (
+                    <p style={{ color: 'var(--slate)' }}>No recording for this call.</p>
+                  )}
+                  <div style={{ fontSize: 13.5, marginTop: 12 }}>
+                    <div><b>State:</b> {selectedCall.state}</div>
+                    <div><b>Disposition:</b> {selectedCall.disposition || '—'}</div>
+                    <div><b>Duration:</b> {selectedCall.duration_s}s</div>
+                    {cost.total != null && <div><b>Cost:</b> {cost.total} {cost.currency || 'USD'}</div>}
+                    {selectedCall.summary && <div style={{ marginTop: 8 }}>{selectedCall.summary}</div>}
+                  </div>
+                  <h3 className="section-title">Transcript</h3>
+                  {(selectedCall.transcript || []).length === 0 && (
+                    <p style={{ color: 'var(--slate)' }}>No transcript for this call.</p>
+                  )}
+                  {(selectedCall.transcript || []).map((t, i) => (
+                    <div key={i} style={{ marginBottom: 8, fontSize: 14 }}>
+                      <span className={`pill ${t.speaker === 'agent' ? 'teal' : 'slate'}`}>
+                        {t.speaker === 'agent' ? 'AGENT' : 'CUSTOMER'}
+                      </span>{' '}
+                      <span>{t.text}</span>
+                    </div>
+                  ))}
+                </>
+              )}
+            </div>
+          </>
+        )
+      })()}
     </div>
   )
 }

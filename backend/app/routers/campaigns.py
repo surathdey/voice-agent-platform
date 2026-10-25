@@ -21,6 +21,7 @@ import json
 import re
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from .. import providers as prov
@@ -281,6 +282,130 @@ def list_leads(campaign_id: str, limit: int = 500, offset: int = 0,
     total = q.count()
     rows = q.order_by(Lead.created_at, Lead.lead_id).offset(offset).limit(limit).all()
     return LeadListOut(total=total, leads=[_lead_out(l) for l in rows])
+
+
+@router.get("/{campaign_id}/export")
+def export_campaign(campaign_id: str,
+                    user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """The whole campaign as a spreadsheet (xlsx): campaign details,
+    one row per lead with its latest result, and one row per call with
+    recording link and full transcript. The operator's download for a
+    finished campaign — the same §8.2 records the detail page shows."""
+    try:
+        import openpyxl
+        from openpyxl.styles import Font
+    except ImportError:
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            "Spreadsheet export needs the openpyxl package")
+    c = _get_scoped(db, user, campaign_id)  # 404 unless this tenant's campaign
+    agent = db.get(AgentConfig, c.agent_id)
+    leads = (db.query(Lead).filter(Lead.campaign_id == c.campaign_id)
+             .order_by(Lead.created_at, Lead.lead_id).all())
+    sessions = (db.query(CallSession).filter(CallSession.campaign_id == c.campaign_id)
+                .order_by(CallSession.started_at, CallSession.session_id).all())
+    results = {}
+    if sessions:
+        for r in (db.query(CallResult)
+                  .filter(CallResult.session_id.in_(
+                      [s.session_id for s in sessions])).all()):
+            results[r.session_id] = r
+    latest = {}
+    for s in sessions:
+        latest[s.lead_id] = s  # ordered by started_at: last wins
+    connected = sum(1 for s in sessions
+                    if s.session_id in results and s.state == "COMPLETED")
+    disp_counts: dict[str, int] = {}
+    total_cost = 0.0
+    for s in sessions:
+        r = results.get(s.session_id)
+        if r is None:
+            continue
+        disp_counts[r.disposition or "(none)"] = disp_counts.get(r.disposition or "(none)", 0) + 1
+        cb = r.cost_breakdown or {}
+        if cb.get("mode") != "stub":
+            total_cost += float(cb.get("total") or 0.0)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Campaign"
+    sched = c.schedule or {}
+    retry = c.retry_rules or {}
+    kv = [
+        ("Name", c.name),
+        ("Agent", agent.name if agent else ""),
+        ("Product", c.product),
+        ("Channel", c.channel),
+        ("Mode", c.provider_mode),
+        ("Status", c.status),
+        ("Schedule", f"{sched.get('calling_days', '')} "
+                     f"{sched.get('window_start', '')}-{sched.get('window_end', '')}"),
+        ("Retries", f"up to {retry.get('max_attempts', '')} per lead, "
+                    f"gap {retry.get('retry_gap_days', '')} day(s)"),
+        ("Leads", len(leads)),
+        ("Attempts", len(sessions)),
+        ("Connected", connected),
+        ("Total cost (USD)", round(total_cost, 4)),
+    ]
+    for k, v in kv:
+        ws.append([k, v])
+    for name, n in sorted(disp_counts.items()):
+        ws.append([f"Disposition: {name}", n])
+    ws.column_dimensions["A"].width = 22
+    ws.column_dimensions["B"].width = 60
+    for row in ws.iter_rows(min_row=1, max_row=ws.max_row, max_col=1):
+        row[0].font = Font(bold=True)
+
+    ws = wb.create_sheet("Leads")
+    ws.append(["Name", "Phone", "Bank", "State", "Identifier", "Other fields",
+               "Status", "Next attempt", "Attempts", "Last disposition",
+               "Last duration (s)", "Last cost (USD)"])
+    for l in leads:
+        s = latest.get(l.lead_id)
+        r = results.get(s.session_id) if s else None
+        cb = r.cost_breakdown if r else {}
+        others = "; ".join(f"{k}: {v}" for k, v in (l.agent_fields or {}).items()
+                           if k not in ("product_identifier", "product_identifier_type"))
+        ws.append([l.name or "", l.phone_number or "", l.bank_name or "",
+                   l.state or "", (l.agent_fields or {}).get("product_identifier", ""),
+                   others, l.status or "",
+                   l.next_attempt_at.isoformat() if l.next_attempt_at else "",
+                   l.attempt_count or 0, r.disposition if r else "",
+                   r.duration_s if r else "",
+                   cb.get("total", "") if r else ""])
+    for col, w in zip("ABCDEFGHIJKL", [20, 18, 18, 14, 20, 40, 12, 20, 10, 22, 16, 14]):
+        ws.column_dimensions[col].width = w
+
+    ws = wb.create_sheet("Calls")
+    ws.append(["Started", "Lead", "Phone", "State", "Disposition", "Duration (s)",
+               "Cost (USD)", "Recording URL", "Summary", "Transcript"])
+    lead_by_id = {l.lead_id: l for l in leads}
+    for s in sessions:
+        r = results.get(s.session_id)
+        cb = r.cost_breakdown if r else {}
+        turns = s.transcript or []
+        text = "\n".join(
+            f"{'AGENT' if t.get('speaker') == 'agent' else 'CUSTOMER'}: {t.get('text', '')}"
+            for t in turns)
+        l = lead_by_id.get(s.lead_id)
+        ws.append([s.started_at.isoformat() if s.started_at else "",
+                   l.name if l else "", s.to_number or "", s.state or "",
+                   r.disposition if r else "", r.duration_s if r else "",
+                   cb.get("total", "") if r else "", s.recording_url or "",
+                   r.summary if r else "", text])
+    for col, w in zip("ABCDEFGHIJ", [20, 20, 18, 12, 22, 13, 12, 60, 60, 100]):
+        ws.column_dimensions[col].width = w
+    for row in ws.iter_rows(min_row=1, max_row=1):
+        for cell in row:
+            cell.font = Font(bold=True)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", c.name) or "campaign"
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{safe}_export.xlsx"'})
 
 
 @router.post("/{campaign_id}/leads/preview")
