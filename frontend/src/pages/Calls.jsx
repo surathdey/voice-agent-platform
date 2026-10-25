@@ -154,7 +154,7 @@ export default function Calls() {
             <tr>
               <th>Started</th><th>Campaign</th><th>Lead</th><th>Number</th>
               <th>State</th><th>Disposition</th><th>Duration</th>
-              <th>Mode</th><th>Transport</th><th>Legs</th><th className="num" style={{ whiteSpace: 'nowrap' }}>Cost</th>
+              <th>Mode</th><th>Transport</th><th>Legs</th><th className="num" style={{ whiteSpace: 'nowrap' }}>Cost (Vapi)</th>
             </tr>
           </thead>
           <tbody>

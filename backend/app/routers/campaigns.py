@@ -377,7 +377,7 @@ def export_campaign(campaign_id: str,
 
     ws = wb.create_sheet("Calls")
     ws.append(["Started", "Lead", "Phone", "State", "Disposition", "Duration (s)",
-               "Cost (USD)", "Recording URL", "Recording (S3)", "Summary", "Transcript"])
+               "Cost (Vapi, USD)", "Recording URL", "Recording (S3)", "Summary", "Transcript"])
     lead_by_id = {l.lead_id: l for l in leads}
     # S3 links (012) are presigned AT EXPORT TIME (7 days) — never
     # stored, so an exported link is always fresh. Without a bucket or

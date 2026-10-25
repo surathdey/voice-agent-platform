@@ -67,6 +67,7 @@ services:
       SARVAM_BASE_URL: ${SARVAM_BASE_URL:-https://api.sarvam.ai}
       SARVAM_TTS_MODEL: ${SARVAM_TTS_MODEL:-bulbul:v2}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8000}
+      S3_RECORDINGS_BUCKET: ${S3_RECORDINGS_BUCKET:-}
       WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
       SEED_TENANT_NAME: ${SEED_TENANT_NAME:-QGBS}
       SEED_USER_EMAIL: ${SEED_USER_EMAIL:-demo@qgbs.example}
