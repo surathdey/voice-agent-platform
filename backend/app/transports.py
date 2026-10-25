@@ -118,6 +118,16 @@ def ws_base() -> str:
     return base
 
 
+_LOAN_TYPE_LABELS = {"vehicle_loan": "two-wheeler loan"}
+
+
+def _loan_type_label(product):
+    """Display name for a campaign product. Unknown products pass through
+    unchanged, so future products (credit card and others) plug in here
+    without a code change to the variable itself."""
+    return _LOAN_TYPE_LABELS.get(product or "", product or "")
+
+
 def lead_variables(campaign: Campaign, lead: Lead) -> dict:
     """The per-call variables handed to the provider. The agent's single
     prompt addresses the lead through placeholders (e.g. {{lead_name}},
@@ -133,6 +143,12 @@ def lead_variables(campaign: Campaign, lead: Lead) -> dict:
         "product": campaign.product or "",
         "product_identifier": af.get("product_identifier", "") or "",
         "product_identifier_type": af.get("product_identifier_type", "") or "",
+        "account_number": (
+            af.get("account_no", "") or af.get("account_number", "")
+            or (af.get("product_identifier", "") if af.get("product_identifier_type") == "account_number" else "")
+        ),
+        "principal": af.get("principal", "") or "",
+        "loan_type": af.get("loan_type", "") or _loan_type_label(campaign.product),
         "due_date": af.get("due_date", "") or "",
         "amount_due": af.get("amount_due", "") or "",
         "outstanding": af.get("outstanding", "") or "",
