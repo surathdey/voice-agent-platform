@@ -148,13 +148,13 @@ export default function Calls() {
         </div>
       )}
 
-      <div className="card" style={{ padding: '6px 10px' }}>
+      <div className="card" style={{ padding: '6px 10px', overflowX: 'auto' }}>
         <table className="data">
           <thead>
             <tr>
               <th>Started</th><th>Campaign</th><th>Lead</th><th>Number</th>
               <th>State</th><th>Disposition</th><th>Duration</th>
-              <th>Mode</th><th>Transport</th><th>Legs</th><th className="num">Cost</th>
+              <th>Mode</th><th>Transport</th><th>Legs</th><th className="num" style={{ whiteSpace: 'nowrap' }}>Cost</th>
             </tr>
           </thead>
           <tbody>
@@ -176,7 +176,7 @@ export default function Calls() {
                   ? <span className="pill gold">stub</span>
                   : c.transport}</td>
                 <td><LegsCell c={c} /></td>
-                <td className="num">
+                <td className="num" style={{ whiteSpace: 'nowrap' }}>
                   {c.cost_breakdown && c.cost_breakdown.total !== undefined
                     ? `${c.cost_breakdown.total} ${c.cost_breakdown.currency || ''}`.trim()
                     : '—'}

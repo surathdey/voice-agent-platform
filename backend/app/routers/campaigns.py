@@ -377,8 +377,18 @@ def export_campaign(campaign_id: str,
 
     ws = wb.create_sheet("Calls")
     ws.append(["Started", "Lead", "Phone", "State", "Disposition", "Duration (s)",
-               "Cost (USD)", "Recording URL", "Summary", "Transcript"])
+               "Cost (USD)", "Recording URL", "Recording (S3)", "Summary", "Transcript"])
     lead_by_id = {l.lead_id: l for l in leads}
+    # S3 links (012) are presigned AT EXPORT TIME (7 days) — never
+    # stored, so an exported link is always fresh. Without a bucket or
+    # boto3 the column stays blank and the export still succeeds.
+    try:
+        from .. import s3_recordings as _s3
+
+        _s3_on = bool(_s3.bucket_name())
+    except Exception:
+        _s3 = None
+        _s3_on = False
     for s in sessions:
         r = results.get(s.session_id)
         cb = r.cost_breakdown if r else {}
@@ -387,12 +397,17 @@ def export_campaign(campaign_id: str,
             f"{'AGENT' if t.get('speaker') == 'agent' else 'CUSTOMER'}: {t.get('text', '')}"
             for t in turns)
         l = lead_by_id.get(s.lead_id)
+        s3_link = ""
+        if _s3_on and s.recording_s3_key:
+            s3_link = _s3.presigned_playback_url(
+                s.recording_s3_bucket, s.recording_s3_key)
         ws.append([s.started_at.isoformat() if s.started_at else "",
                    l.name if l else "", s.to_number or "", s.state or "",
                    r.disposition if r else "", r.duration_s if r else "",
                    cb.get("total", "") if r else "", s.recording_url or "",
+                   s3_link,
                    r.summary if r else "", text])
-    for col, w in zip("ABCDEFGHIJ", [20, 20, 18, 12, 22, 13, 12, 60, 60, 100]):
+    for col, w in zip("ABCDEFGHIJK", [20, 20, 18, 12, 22, 13, 12, 60, 60, 60, 100]):
         ws.column_dimensions[col].width = w
     for row in ws.iter_rows(min_row=1, max_row=1):
         for cell in row:

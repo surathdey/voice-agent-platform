@@ -1,0 +1,21 @@
+-- NOTE (post-A12 upgrade-path fix): the application applies this step
+-- automatically at boot via the migration runner (backend/app/
+-- migrations.py) — idempotent, per-object, dialect-aware (PostgreSQL
+-- + SQLite), tracked in the schema_migrations table. This file
+-- remains the DDL of record; the runner step of the same number is
+-- its executable twin.
+-- 012_s3_recording_archive.sql — S3 recording archival.
+--   call_sessions.recording_s3_key    object key of the archived
+--                                     recording in the tenant's own
+--                                     PRIVATE bucket ("recordings/
+--                                     <tenant_id>/<session_id>.wav").
+--                                     Empty = not archived.
+--   call_sessions.recording_s3_bucket the bucket the key lives in
+--                                     (from env S3_RECORDINGS_BUCKET).
+-- The bucket stays private: playback and export links are presigned
+-- at request time (7 days), never public-read — these are customer
+-- calls. Archival needs an IAM role (or env credentials) with
+-- s3:PutObject + s3:GetObject on the bucket; without it the code
+-- runs unchanged with archival disabled.
+ALTER TABLE call_sessions ADD COLUMN IF NOT EXISTS recording_s3_key VARCHAR(300) NOT NULL DEFAULT '';
+ALTER TABLE call_sessions ADD COLUMN IF NOT EXISTS recording_s3_bucket VARCHAR(100) NOT NULL DEFAULT '';

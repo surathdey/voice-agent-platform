@@ -276,6 +276,23 @@ def _apply_011(conn, insp, dialect):
         "AND leads.status = 'pending')"))
 
 
+def _marker_012(insp, dialect):
+    return _has_columns(insp, "call_sessions",
+                        "recording_s3_key", "recording_s3_bucket")
+
+
+def _apply_012(conn, insp, dialect):
+    """S3 archival columns on the session (beside recording_url).
+
+    Purely additive, idempotent per column: a deployment without a
+    bucket runs unchanged with both columns empty.
+    """
+    _ensure_column(conn, "call_sessions",
+                   "recording_s3_key VARCHAR(300) NOT NULL DEFAULT ''")
+    _ensure_column(conn, "call_sessions",
+                   "recording_s3_bucket VARCHAR(100) NOT NULL DEFAULT ''")
+
+
 MIGRATIONS = [
     (1, "001_initial", _marker_001, _apply_001),
     (2, "002_a3_campaign_fields", _marker_002, _apply_002),
@@ -288,6 +305,7 @@ MIGRATIONS = [
     (9, "009_a11_browser_test", _marker_009, _apply_009),
     (10, "010_b4_settlement_cap", _marker_010, _apply_010),
     (11, "011_lead_done_status", _marker_011, _apply_011),
+    (12, "012_s3_recording_archive", _marker_012, _apply_012),
 ]
 
 

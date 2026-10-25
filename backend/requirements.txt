@@ -12,3 +12,7 @@ websockets>=12
 tzdata>=2024.1
 # Campaign spreadsheet export (xlsx).
 openpyxl>=3.1
+# S3 recording archival (012): boto3 is imported lazily by
+# app.s3_recordings, so a deployment without it still boots and runs
+# with archival disabled — but it must be installed for archival to work.
+boto3>=1.34

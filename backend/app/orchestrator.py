@@ -59,6 +59,7 @@ from sqlalchemy.orm import Session
 from . import costing
 from . import market_time as mt
 from . import providers as prov
+from . import s3_recordings
 from .config import settings
 from .models import (
     AgentConfig,
@@ -330,6 +331,16 @@ def finalize_attempt(db: Session, session: CallSession, outcome: dict):
         cost_breakdown=costing.finalize_breakdown(db, session, outcome),
     )
     db.add(result)
+
+    # S3 archival (012): best-effort durable copy of the provider
+    # recording, in the tenant's own private bucket. Never raises and
+    # never blocks the result: a failure leaves the Vapi-only recording
+    # and the backfill script can retry this session later. The key
+    # fields ride the same commit below.
+    try:
+        s3_recordings.archive_session_recording(db, session)
+    except Exception:
+        pass
 
     # A11: a browser-test session is NOT a campaign attempt. It carries
     # no lead (lead_id is NULL) — and even if a reference were ever

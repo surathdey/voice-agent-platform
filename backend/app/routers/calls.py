@@ -363,7 +363,13 @@ def call_recording(session_id: str, download: int = 0,
     with the tenant's own API key and streams the audio back
     same-origin, under the operator's JWT. Signed URLs expire, so they
     are never stored or handed to the browser — each playback or
-    download re-signs."""
+    download re-signs.
+
+    S3 archival (012) changes the preference, not the contract: when
+    the session carries an archived copy in the tenant's own private
+    bucket, that copy streams first (durable, no provider round-trip);
+    any S3 failure falls through to the provider path below, so an
+    archived row never plays worse than an unarchived one."""
     s = (db.query(CallSession)
          .filter(CallSession.session_id == session_id,
                  CallSession.tenant_id == user.tenant_id).first())
@@ -374,6 +380,37 @@ def call_recording(session_id: str, download: int = 0,
     camp = db.get(Campaign, s.campaign_id) if s.campaign_id else None
     if camp is not None and camp.provider_mode != "managed":
         raise HTTPException(status.HTTP_404_NOT_FOUND, "No recording for this call")
+    disp = ("attachment" if download else "inline") + f'; filename="{session_id}.wav"'
+    # S3 first (012): the archived copy, when present, is the durable
+    # one. The key is tenant-scoped at archive time; re-check the
+    # prefix here so a row can never stream another tenant's object.
+    # get_object is eager (headers + body handle), so a missing key or
+    # missing credentials fails HERE and falls through to Vapi —
+    # instead of breaking mid-stream after the response started.
+    if (s.recording_s3_key and s.recording_s3_bucket
+            and s.recording_s3_key.startswith(f"recordings/{s.tenant_id}/")):
+        try:
+            from .. import s3_recordings
+
+            _client = s3_recordings._s3_client()
+            _body = _client.get_object(
+                Bucket=s.recording_s3_bucket,
+                Key=s.recording_s3_key)["Body"]
+
+            def _stream_s3():
+                try:
+                    while True:
+                        chunk = _body.read(64 * 1024)
+                        if not chunk:
+                            break
+                        yield chunk
+                finally:
+                    _body.close()
+
+            return StreamingResponse(_stream_s3(), media_type="audio/wav",
+                                     headers={"Content-Disposition": disp})
+        except Exception:
+            pass  # fall through to the provider path below
     try:
         cfg = prov.get_provider_config(s.tenant_id, "managed", db=db)
         api_key = cfg["providers"]["vapi"]["fields"].get("api_key", "")
@@ -407,7 +444,6 @@ def call_recording(session_id: str, download: int = 0,
                     break
                 yield chunk
 
-    disp = ("attachment" if download else "inline") + f'; filename="{session_id}.wav"'
     return StreamingResponse(_stream(), media_type="audio/wav",
                              headers={"Content-Disposition": disp})
 

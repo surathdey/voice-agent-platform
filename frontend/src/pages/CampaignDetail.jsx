@@ -383,7 +383,23 @@ export default function CampaignDetail({ campaignId, onBack }) {
                     <div><b>State:</b> {selectedCall.state}</div>
                     <div><b>Disposition:</b> {selectedCall.disposition || '—'}</div>
                     <div><b>Duration:</b> {selectedCall.duration_s}s</div>
-                    {cost.total != null && <div><b>Cost:</b> {cost.total} {cost.currency || 'USD'}</div>}
+                    {cost.total != null && (
+                      <div>
+                        <div><b>Cost:</b> {cost.total} {cost.currency || 'USD'}</div>
+                        <div style={{ fontSize: 13, color: 'var(--slate)', marginTop: 2 }}>
+                          telephony {cost.telephony ?? 0} · STT {cost.stt ?? 0} ·{' '}
+                          LLM {cost.llm ?? 0} · TTS {cost.tts ?? 0}
+                          {cost.mode === 'stub' && ' (simulated — not real money)'}
+                          {cost.cost_source === 'provider' && ' (Vapi-reported)'}
+                          {cost.cost_source === 'rate_card' && ' (rate card)'}
+                        </div>
+                        {cost.basis && Object.entries(cost.basis).map(([leg, note]) => (
+                          <div key={leg} style={{ fontSize: 12.5, color: 'var(--slate)' }}>
+                            {leg}: {note}
+                          </div>
+                        ))}
+                      </div>
+                    )}
                     {selectedCall.summary && <div style={{ marginTop: 8 }}>{selectedCall.summary}</div>}
                   </div>
                   <h3 className="section-title">Transcript</h3>

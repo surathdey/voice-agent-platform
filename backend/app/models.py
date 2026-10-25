@@ -235,6 +235,12 @@ class CallSession(Base):
     answered_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     recording_url: Mapped[str] = mapped_column(String(500), default="")
+    # S3 archival (012): the durable copy of the provider recording, in
+    # the tenant's own PRIVATE bucket. Empty = not archived (Vapi-only
+    # playback still applies). The key is tenant-scoped
+    # ("recordings/<tenant_id>/<session_id>.wav") so it proves its owner.
+    recording_s3_key: Mapped[str] = mapped_column(String(300), default="")
+    recording_s3_bucket: Mapped[str] = mapped_column(String(100), default="")
     end_reason: Mapped[str] = mapped_column(String(60), default="")
     transcript: Mapped[list] = mapped_column(JSON, default=list)  # [{speaker, text, offset_s}]
     # Self-hosted STT leg (A7): the Sarvam Saaras session opened for this
