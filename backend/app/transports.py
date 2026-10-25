@@ -413,8 +413,11 @@ def _vapi_transcript(message: dict) -> list:
     for m in msgs:
         role = m.get("role")
         text = m.get("content") or m.get("message") or ""
-        if role in ("assistant", "user") and isinstance(text, str) and text.strip():
-            turns.append({"speaker": "agent" if role == "assistant" else "customer",
+        # Vapi voice calls report the assistant's turns with role "bot"
+        # (persisted assistants use "assistant"); both are agent speech.
+        # The "system" turn is the prompt and is never transcript.
+        if role in ("assistant", "bot", "user") and isinstance(text, str) and text.strip():
+            turns.append({"speaker": "agent" if role in ("assistant", "bot") else "customer",
                           "text": text, "offset_s": 0.0})
     if turns:
         return turns
