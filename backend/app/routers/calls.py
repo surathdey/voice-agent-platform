@@ -27,11 +27,15 @@ self-hosted results are indistinguishable here by construction (A10
 managed-mode parity).
 """
 from datetime import datetime
+import json
+import urllib.request
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from .. import market_time as mt
+from .. import providers as prov
 from ..db import get_db
 from ..deps import get_current_user
 from .. import stt as stt_module
@@ -344,6 +348,68 @@ def list_calls(campaign_id: str = "", disposition: str = "",
              .offset(offset).limit(limit).all())
     return CallListOut(total=total, counts_by_state=states,
                        calls=[_call_out(db, s) for s in rows])
+
+
+@router.get("/api/calls/{session_id}/recording")
+def call_recording(session_id: str, download: int = 0,
+                   user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Stream one call's recording to the browser.
+
+    The stored recording_url is the provider's PRIVATE object URL — a
+    browser that opens it directly gets the provider's Authorization
+    error (live-seen: R2 InvalidArgument, an empty 0:00 player, a
+    failed download). So the browser never touches that URL: this
+    endpoint fetches a FRESH short-lived signed URL from the provider
+    with the tenant's own API key and streams the audio back
+    same-origin, under the operator's JWT. Signed URLs expire, so they
+    are never stored or handed to the browser — each playback or
+    download re-signs."""
+    s = (db.query(CallSession)
+         .filter(CallSession.session_id == session_id,
+                 CallSession.tenant_id == user.tenant_id).first())
+    if s is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Call not found")
+    if not s.provider_call_id or s.provider_call_id.startswith("stub_"):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No recording for this call")
+    camp = db.get(Campaign, s.campaign_id) if s.campaign_id else None
+    if camp is not None and camp.provider_mode != "managed":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No recording for this call")
+    try:
+        cfg = prov.get_provider_config(s.tenant_id, "managed", db=db)
+        api_key = cfg["providers"]["vapi"]["fields"].get("api_key", "")
+    except Exception:
+        api_key = ""
+    if not api_key:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY,
+                            "Voice provider not configured")
+    try:
+        req = urllib.request.Request(
+            f"https://api.vapi.ai/call/{s.provider_call_id}",
+            headers={"Authorization": f"Bearer {api_key}",
+                     "User-Agent": "VoiceAgentPlatform/1.0"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            call = json.load(r)
+    except Exception:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY,
+                            "Could not reach the voice provider")
+    art = call.get("artifact") or {}
+    url = art.get("presignedMonoUrl") or art.get("presignedStereoUrl") or ""
+    if not url:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY,
+                            "No playable recording for this call")
+
+    def _stream():
+        req2 = urllib.request.Request(url, headers={"User-Agent": "VoiceAgentPlatform/1.0"})
+        with urllib.request.urlopen(req2, timeout=60) as resp:
+            while True:
+                chunk = resp.read(64 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+
+    disp = ("attachment" if download else "inline") + f'; filename="{session_id}.wav"'
+    return StreamingResponse(_stream(), media_type="audio/wav",
+                             headers={"Content-Disposition": disp})
 
 
 @router.post("/api/results", response_model=ResultOut)

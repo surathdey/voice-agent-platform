@@ -371,9 +371,9 @@ export default function CampaignDetail({ campaignId, onBack }) {
                   <h3 className="section-title">Recording</h3>
                   {selectedCall.recording_url ? (
                     <>
-                      <audio controls src={selectedCall.recording_url} style={{ width: '100%' }} />
+                      <audio controls src={`/api/calls/${selectedCall.session_id}/recording`} style={{ width: '100%' }} />
                       <div style={{ marginTop: 6 }}>
-                        <a href={selectedCall.recording_url} download>Download recording</a>
+                        <a href={`/api/calls/${selectedCall.session_id}/recording?download=1`}>Download recording</a>
                       </div>
                     </>
                   ) : (
