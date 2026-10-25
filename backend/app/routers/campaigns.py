@@ -289,8 +289,10 @@ def export_campaign(campaign_id: str,
                     user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """The whole campaign as a spreadsheet (xlsx): campaign details,
     one row per lead with its latest result, and one row per call with
-    recording link and full transcript. The operator's download for a
-    finished campaign — the same §8.2 records the detail page shows."""
+    recording link and full transcript. The Calls sheet matches the
+    QGBS output columns exactly (ACCOUNT_NO through Recording). The
+    operator's download for a finished campaign — the same §8.2 records
+    the detail page shows."""
     try:
         import openpyxl
         from openpyxl.styles import Font
@@ -344,7 +346,7 @@ def export_campaign(campaign_id: str,
         ("Leads", len(leads)),
         ("Attempts", len(sessions)),
         ("Connected", connected),
-        ("Total cost (USD)", round(total_cost, 4)),
+        ("Total cost (Vapi, USD)", round(total_cost, 4)),
     ]
     for k, v in kv:
         ws.append([k, v])
@@ -358,7 +360,7 @@ def export_campaign(campaign_id: str,
     ws = wb.create_sheet("Leads")
     ws.append(["Name", "Phone", "Bank", "State", "Identifier", "Other fields",
                "Status", "Next attempt", "Attempts", "Last disposition",
-               "Last duration (s)", "Last cost (USD)"])
+               "Last duration (s)", "Last cost (Vapi, USD)"])
     for l in leads:
         s = latest.get(l.lead_id)
         r = results.get(s.session_id) if s else None
@@ -376,8 +378,22 @@ def export_campaign(campaign_id: str,
         ws.column_dimensions[col].width = w
 
     ws = wb.create_sheet("Calls")
-    ws.append(["Started", "Lead", "Phone", "State", "Disposition", "Duration (s)",
-               "Cost (Vapi, USD)", "Recording URL", "Recording (S3)", "Summary", "Transcript"])
+    # Calls sheet matches the QGBS output columns EXACTLY (same headers,
+    # same order): ACCOUNT_NO, CUSTOMER_NAME, PRINCIPAL, OUTSTANDING,
+    # MOBILE_NO, RegistrationNumber, Call ID, Start Time, End Time,
+    # Duration, Call Status, Disposition, Category, Summary, Transcript,
+    # Recording. Category follows the QGBS mapping derived from their
+    # data (ACCEPTED -> Settlement, CALLBACK -> Callback, PRIOR_PAYMENT
+    # -> Payment, everything else -> Other). Transcript is the full
+    # speaker-tagged text (QGBS links to transcript files; we host no
+    # transcript files, so the text itself is the honest equivalent).
+    # Recording is the S3 presigned link when archived, else the Vapi
+    # URL as reference (playback lives in the call drawer via proxy).
+    from datetime import timedelta
+    ws.append(["ACCOUNT_NO", "CUSTOMER_NAME", "PRINCIPAL", "OUTSTANDING",
+               "MOBILE_NO", "RegistrationNumber", "Call ID", "Start Time",
+               "End Time", "Duration", "Call Status", "Disposition",
+               "Category", "Summary", "Transcript", "Recording"])
     lead_by_id = {l.lead_id: l for l in leads}
     # S3 links (012) are presigned AT EXPORT TIME (7 days) — never
     # stored, so an exported link is always fresh. Without a bucket or
@@ -389,29 +405,62 @@ def export_campaign(campaign_id: str,
     except Exception:
         _s3 = None
         _s3_on = False
+    _status_map = {"COMPLETED": "Completed", "FAILED": "Failed",
+                   "NO_ANSWER": "No Answer", "BUSY": "Busy",
+                   "VOICEMAIL": "Voicemail"}
+    _category_map = {"SETTLEMENT_OFFER_ACCEPTED": "Settlement",
+                     "CALLBACK_REQUESTED": "Callback",
+                     "PRIOR_PAYMENT_CLAIMED": "Payment"}
+
+    def _num(v):
+        try:
+            return float(v) if v is not None and str(v).strip() != "" else ""
+        except (TypeError, ValueError):
+            return v
+
     for s in sessions:
         r = results.get(s.session_id)
-        cb = r.cost_breakdown if r else {}
         turns = s.transcript or []
         text = "\n".join(
             f"{'AGENT' if t.get('speaker') == 'agent' else 'CUSTOMER'}: {t.get('text', '')}"
             for t in turns)
         l = lead_by_id.get(s.lead_id)
+        af = (l.agent_fields or {}) if l else {}
+        phone = (l.phone_number if l and l.phone_number else s.to_number) or ""
+        digits = phone.lstrip("+").strip()
+        mobile = int(digits) if digits.isdigit() else phone
+        reg = af.get("product_identifier", "") \
+            if af.get("product_identifier_type") == "registration_number" else ""
+        acct = af.get("account_no") or af.get("account_number") or (
+            af.get("product_identifier", "")
+            if af.get("product_identifier_type") == "account_number" else "")
+        disp = r.disposition if r else ""
+        cat = _category_map.get(disp, "Other") if disp else ""
+        dur = r.duration_s if r else ""
+        end = ""
+        if s.started_at and dur != "" and dur is not None:
+            try:
+                end = (s.started_at + timedelta(seconds=float(dur))).isoformat()
+            except (TypeError, ValueError):
+                end = ""
         s3_link = ""
         if _s3_on and s.recording_s3_key:
             s3_link = _s3.presigned_playback_url(
                 s.recording_s3_bucket, s.recording_s3_key)
-        ws.append([s.started_at.isoformat() if s.started_at else "",
-                   l.name if l else "", s.to_number or "", s.state or "",
-                   r.disposition if r else "", r.duration_s if r else "",
-                   cb.get("total", "") if r else "", s.recording_url or "",
-                   s3_link,
-                   r.summary if r else "", text])
-    for col, w in zip("ABCDEFGHIJK", [20, 20, 18, 12, 22, 13, 12, 60, 60, 60, 100]):
+        ws.append([str(acct) if acct != "" else "", l.name if l else "",
+                   _num(af.get("principal")), _num(af.get("outstanding")),
+                   mobile, reg, s.session_id,
+                   s.started_at.isoformat() if s.started_at else "", end,
+                   dur, _status_map.get(s.state or "", s.state or ""),
+                   disp, cat, r.summary if r else "", text,
+                   s3_link or s.recording_url or ""])
+    for col, w in zip("ABCDEFGHIJKLMNOP",
+                      [22, 20, 13, 13, 18, 18, 24, 28, 28, 10, 13, 26, 12, 60, 100, 60]):
         ws.column_dimensions[col].width = w
     for row in ws.iter_rows(min_row=1, max_row=1):
         for cell in row:
             cell.font = Font(bold=True)
+    wb.active = wb.index(ws)
 
     buf = io.BytesIO()
     wb.save(buf)
