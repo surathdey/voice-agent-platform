@@ -18,6 +18,44 @@ const STATUS_PILL = { draft: 'navy', active: 'teal', paused: 'gold', completed: 
 const STATUS_LABEL = { draft: 'Draft', active: 'Running', paused: 'Paused', completed: 'Completed' }
 const LEAD_PILL = { pending: 'gold', done: 'teal', exhausted: 'red' }
 
+/* Recording player: an <audio> tag cannot send the SPA's Bearer token,
+   so a plain src to the JWT-protected recording proxy 401s and the
+   player sits at 0:00. Fetch the audio WITH the token, then play the
+   blob — same proxy (S3 first, Vapi fallback), no auth weakening. */
+function RecordingPlayer({ sessionId }) {
+  const [url, setUrl] = useState('')
+  const [err, setErr] = useState('')
+  useEffect(() => {
+    let live = true
+    let objectUrl = ''
+    setUrl('')
+    setErr('')
+    fetch(`/api/calls/${sessionId}/recording`, {
+      headers: { ...(getToken() ? { Authorization: `Bearer ${getToken()}` } : {}) },
+    }).then(async (res) => {
+      if (!res.ok) {
+        if (live) setErr(`Recording could not be loaded (${res.status}).`)
+        return
+      }
+      const blob = await res.blob()
+      if (!live) return
+      objectUrl = URL.createObjectURL(blob)
+      setUrl(objectUrl)
+    }).catch(() => { if (live) setErr('Recording could not be loaded.') })
+    return () => { live = false; if (objectUrl) URL.revokeObjectURL(objectUrl) }
+  }, [sessionId])
+  if (err) return <p style={{ color: 'var(--red)' }}>{err}</p>
+  if (!url) return <p style={{ color: 'var(--slate)' }}>Loading recording…</p>
+  return (
+    <>
+      <audio controls src={url} style={{ width: '100%' }} />
+      <div style={{ marginTop: 6 }}>
+        <a href={url} download={`${sessionId}.wav`}>Download recording</a>
+      </div>
+    </>
+  )
+}
+
 export default function CampaignDetail({ campaignId, onBack }) {
   const [campaign, setCampaign] = useState(null)
   const [leads, setLeads] = useState(null)
@@ -370,12 +408,7 @@ export default function CampaignDetail({ campaignId, onBack }) {
                 <>
                   <h3 className="section-title">Recording</h3>
                   {selectedCall.recording_url ? (
-                    <>
-                      <audio controls src={`/api/calls/${selectedCall.session_id}/recording`} style={{ width: '100%' }} />
-                      <div style={{ marginTop: 6 }}>
-                        <a href={`/api/calls/${selectedCall.session_id}/recording?download=1`}>Download recording</a>
-                      </div>
-                    </>
+                    <RecordingPlayer sessionId={selectedCall.session_id} />
                   ) : (
                     <p style={{ color: 'var(--slate)' }}>No recording for this call.</p>
                   )}
