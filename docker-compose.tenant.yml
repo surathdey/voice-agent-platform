@@ -46,7 +46,11 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
     volumes:
-      - ${COMPOSE_PROJECT_NAME}_db:/var/lib/postgresql/data
+      # Static name on purpose: compose prefixes it with the project
+      # name (vap-c1test_db_data), so each box still gets its own
+      # volume. A ${...} key in top-level `volumes:` is NOT
+      # interpolated by compose and fails `config` validation.
+      - db_data:/var/lib/postgresql/data
     # No ports: section deliberately absent. The database is never
     # exposed to the host, let alone the internet (§14.1).
     healthcheck:
@@ -94,7 +98,7 @@ services:
       - backend
 
 volumes:
-  ${COMPOSE_PROJECT_NAME}_db:
+  db_data:
 
 networks:
   default:
