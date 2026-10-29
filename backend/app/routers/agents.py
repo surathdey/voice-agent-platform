@@ -9,12 +9,29 @@ disposition-rule endpoints by design.
 PROMPT VERSIONING: every save that changes the prompt appends a new row to
 prompt_versions (append-only). Rollback appends a new version equal to the
 chosen old text — history is reviewable and edits are reversible.
+
+ROLES (C5): the editor lives behind Super Admin ONLY — create, update,
+delete, and rollback are Super Admin writes, and the Super Admin
+addresses agents by id across tenants (agent configs are the
+platform's own content, not tenant customer data). Tenant users
+never see the config pages: Tenant Admin reads full configs (they
+adopt versions and build campaigns from adopted agents), while Team
+Leaders and Callers get the prompt text REDACTED — they work cases,
+not prompts. Tenant prompt changes happen by ADOPTING a new catalog
+version, never by editing a tenant agent in place.
 """
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from ..db import get_db
-from ..deps import get_current_user
+from ..deps import (
+    get_current_user,
+    require_super_admin,
+    require_tenant_admin_or_super,
+    ROLE_CALLER,
+    ROLE_SUPER_ADMIN,
+    ROLE_TEAM_LEADER,
+)
 from ..models import AgentConfig, PromptVersion, User
 from ..schemas import AgentIn, AgentOut, PromptVersionOut
 
@@ -40,10 +57,14 @@ def _snapshot(db: Session, user: User, agent: AgentConfig, note: str = "") -> in
     return nxt
 
 
-def _out(db: Session, a: AgentConfig) -> AgentOut:
+def _out(db: Session, a: AgentConfig, viewer_role: str | None = None) -> AgentOut:
+    # C5: Team Leaders and Callers work cases, not prompts — the prompt
+    # text is redacted for them (names, stage, and adopted markers stay,
+    # so their lists still read sensibly).
+    prompt = "" if viewer_role in (ROLE_TEAM_LEADER, ROLE_CALLER) else a.prompt
     return AgentOut(
         agent_id=a.agent_id, tenant_id=a.tenant_id, name=a.name, stage=a.stage,
-        purpose=a.purpose, is_reference=a.is_reference, prompt=a.prompt,
+        purpose=a.purpose, is_reference=a.is_reference, prompt=prompt,
         llm_model=a.llm_model, stt_provider=a.stt_provider, stt_language=a.stt_language,
         tts_provider=a.tts_provider, tts_voice_id=a.tts_voice_id,
         voice_gender=a.voice_gender or "female",
@@ -78,11 +99,13 @@ def _apply(a: AgentConfig, body: AgentIn) -> None:
 
 
 def _get_scoped(db: Session, user: User, agent_id: str) -> AgentConfig:
-    a = (
-        db.query(AgentConfig)
-        .filter(AgentConfig.agent_id == agent_id, AgentConfig.tenant_id == user.tenant_id)
-        .first()
-    )
+    # Super Admin addresses agents by id across tenants (platform
+    # operator); everyone else is confined to their own tenant, and a
+    # foreign agent is indistinguishable from missing.
+    query = db.query(AgentConfig).filter(AgentConfig.agent_id == agent_id)
+    if user.role != ROLE_SUPER_ADMIN:
+        query = query.filter(AgentConfig.tenant_id == user.tenant_id)
+    a = query.first()
     if a is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Agent not found")
     return a
@@ -90,34 +113,38 @@ def _get_scoped(db: Session, user: User, agent_id: str) -> AgentConfig:
 
 @router.get("", response_model=list[AgentOut])
 def list_agents(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    rows = (
-        db.query(AgentConfig)
-        .filter(AgentConfig.tenant_id == user.tenant_id)
-        .order_by(AgentConfig.created_at)
-        .all()
-    )
-    return [_out(db, a) for a in rows]
+    query = db.query(AgentConfig)
+    if user.role != ROLE_SUPER_ADMIN:
+        query = query.filter(AgentConfig.tenant_id == user.tenant_id)
+    rows = query.order_by(AgentConfig.created_at).all()
+    return [_out(db, a, user.role) for a in rows]
 
 
 @router.post("", response_model=AgentOut, status_code=status.HTTP_201_CREATED)
-def create_agent(body: AgentIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    a = AgentConfig(tenant_id=user.tenant_id)
+def create_agent(body: AgentIn, user: User = Depends(require_super_admin), db: Session = Depends(get_db)):
+    # C5: direct agent authoring is Super Admin only, and the target
+    # tenant is named on the request (a Super Admin belongs to the
+    # platform scope, so their own tenant_id is never the answer).
+    if not body.tenant_id:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            "Agent creation requires tenant_id")
+    a = AgentConfig(tenant_id=body.tenant_id)
     _apply(a, body)
     db.add(a)
     db.flush()
     _snapshot(db, user, a, note="Initial version")
     db.commit()
     db.refresh(a)
-    return _out(db, a)
+    return _out(db, a, user.role)
 
 
 @router.get("/{agent_id}", response_model=AgentOut)
 def get_agent(agent_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    return _out(db, _get_scoped(db, user, agent_id))
+    return _out(db, _get_scoped(db, user, agent_id), user.role)
 
 
 @router.put("/{agent_id}", response_model=AgentOut)
-def update_agent(agent_id: str, body: AgentIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def update_agent(agent_id: str, body: AgentIn, user: User = Depends(require_super_admin), db: Session = Depends(get_db)):
     a = _get_scoped(db, user, agent_id)
     prompt_changed = a.prompt != body.prompt
     _apply(a, body)
@@ -133,11 +160,11 @@ def update_agent(agent_id: str, body: AgentIn, user: User = Depends(get_current_
         _snapshot(db, user, a, note="Edit")
     db.commit()
     db.refresh(a)
-    return _out(db, a)
+    return _out(db, a, user.role)
 
 
 @router.delete("/{agent_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_agent(agent_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def delete_agent(agent_id: str, user: User = Depends(require_super_admin), db: Session = Depends(get_db)):
     a = _get_scoped(db, user, agent_id)
     db.query(PromptVersion).filter(PromptVersion.agent_id == a.agent_id).delete()
     db.delete(a)
@@ -156,11 +183,15 @@ def _version_out(v: PromptVersion) -> PromptVersionOut:
 
 
 @router.get("/{agent_id}/prompt-versions", response_model=list[PromptVersionOut])
-def list_prompt_versions(agent_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    _get_scoped(db, user, agent_id)  # 404 if not ours
+def list_prompt_versions(agent_id: str, user: User = Depends(require_tenant_admin_or_super), db: Session = Depends(get_db)):
+    # C5: prompt history is prompt text — Super Admin + Tenant Admin
+    # only. Access is enforced by _get_scoped (super: any tenant's
+    # agent; tenant admin: own tenant's), so no second tenant filter
+    # here — it would wrongly hide a tenant's versions from Super Admin.
+    _get_scoped(db, user, agent_id)  # 404 if not visible to this role
     rows = (
         db.query(PromptVersion)
-        .filter(PromptVersion.agent_id == agent_id, PromptVersion.tenant_id == user.tenant_id)
+        .filter(PromptVersion.agent_id == agent_id)
         .order_by(PromptVersion.version.desc())
         .all()
     )
@@ -168,12 +199,11 @@ def list_prompt_versions(agent_id: str, user: User = Depends(get_current_user), 
 
 
 @router.get("/{agent_id}/prompt-versions/{version}", response_model=PromptVersionOut)
-def get_prompt_version(agent_id: str, version: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def get_prompt_version(agent_id: str, version: int, user: User = Depends(require_tenant_admin_or_super), db: Session = Depends(get_db)):
     _get_scoped(db, user, agent_id)
     v = (
         db.query(PromptVersion)
-        .filter(PromptVersion.agent_id == agent_id, PromptVersion.version == version,
-                PromptVersion.tenant_id == user.tenant_id)
+        .filter(PromptVersion.agent_id == agent_id, PromptVersion.version == version)
         .first()
     )
     if v is None:
@@ -182,13 +212,13 @@ def get_prompt_version(agent_id: str, version: int, user: User = Depends(get_cur
 
 
 @router.post("/{agent_id}/prompt-versions/{version}/rollback", response_model=AgentOut)
-def rollback_prompt(agent_id: str, version: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Make an older prompt version live again — as a NEW version (append-only)."""
+def rollback_prompt(agent_id: str, version: int, user: User = Depends(require_super_admin), db: Session = Depends(get_db)):
+    """Make an older prompt version live again — as a NEW version (append-only).
+    Rollback rewrites the live prompt, so it is a Super Admin write (C5)."""
     a = _get_scoped(db, user, agent_id)
     v = (
         db.query(PromptVersion)
-        .filter(PromptVersion.agent_id == agent_id, PromptVersion.version == version,
-                PromptVersion.tenant_id == user.tenant_id)
+        .filter(PromptVersion.agent_id == agent_id, PromptVersion.version == version)
         .first()
     )
     if v is None:
@@ -198,4 +228,4 @@ def rollback_prompt(agent_id: str, version: int, user: User = Depends(get_curren
     _snapshot(db, user, a, note=f"Rollback to v{version}")
     db.commit()
     db.refresh(a)
-    return _out(db, a)
+    return _out(db, a, user.role)

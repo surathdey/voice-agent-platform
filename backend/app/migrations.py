@@ -318,6 +318,41 @@ def _apply_013(conn, insp, dialect):
     _ensure_column(conn, "campaigns", "pinned_catalog_version INTEGER")
 
 
+def _marker_014(insp, dialect):
+    return _has_columns(insp, "users", "team_id", "phone") and \
+        _has_columns(insp, "leads",
+                     "assigned_caller_id", "allocated_by", "allocated_at") and \
+        _has_columns(insp, "call_results",
+                     "disposition_updated_by", "disposition_updated_at",
+                     "approval_decision", "approved_by", "approved_at",
+                     "approval_expires_at")
+
+
+def _apply_014(conn, insp, dialect):
+    """Epic C, C5 roles + allocation + queue audit.
+
+    New TABLES (teams, user_invites) need no step: create_all makes
+    missing tables on every boot. Only the new COLUMNS on existing
+    tables need this step, plus the one DATA migration C5 cannot
+    avoid: legacy role values become C5 role names (admin ->
+    tenant_admin, operator -> caller) so enforcement can check
+    exactly four names and nothing else.
+    """
+    _ensure_column(conn, "users", "team_id VARCHAR(40)")
+    _ensure_column(conn, "users", "phone VARCHAR(30)")
+    _ensure_column(conn, "leads", "assigned_caller_id VARCHAR(40)")
+    _ensure_column(conn, "leads", "allocated_by VARCHAR(40)")
+    _ensure_column(conn, "leads", "allocated_at DATETIME")
+    _ensure_column(conn, "call_results", "disposition_updated_by VARCHAR(40)")
+    _ensure_column(conn, "call_results", "disposition_updated_at DATETIME")
+    _ensure_column(conn, "call_results", "approval_decision VARCHAR(20)")
+    _ensure_column(conn, "call_results", "approved_by VARCHAR(40)")
+    _ensure_column(conn, "call_results", "approved_at DATETIME")
+    _ensure_column(conn, "call_results", "approval_expires_at DATETIME")
+    conn.execute(text("UPDATE users SET role = 'tenant_admin' WHERE role = 'admin'"))
+    conn.execute(text("UPDATE users SET role = 'caller' WHERE role = 'operator'"))
+
+
 MIGRATIONS = [
     (1, "001_initial", _marker_001, _apply_001),
     (2, "002_a3_campaign_fields", _marker_002, _apply_002),
@@ -332,6 +367,7 @@ MIGRATIONS = [
     (11, "011_lead_done_status", _marker_011, _apply_011),
     (12, "012_s3_recording_archive", _marker_012, _apply_012),
     (13, "013_c2_catalog_pinning", _marker_013, _apply_013),
+    (14, "014_c5_roles", _marker_014, _apply_014),
 ]
 
 

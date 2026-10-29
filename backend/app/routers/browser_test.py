@@ -65,7 +65,7 @@ from sqlalchemy.orm import Session
 
 from .. import audio_codec, conversation, orchestrator, stt, transports
 from ..db import SessionLocal, get_db
-from ..deps import get_current_user
+from ..deps import get_current_user, require_tenant_admin
 from ..models import AgentConfig, CallResult, CallSession, Campaign, Lead, User
 from ..schemas import PRODUCTS, BrowserTestIn, BrowserTestOut
 from ..security import decode_token
@@ -106,7 +106,7 @@ def _tenant_campaign(db: Session, user: User, campaign_id: str) -> Campaign:
 
 @router.post("/api/browser-tests", response_model=BrowserTestOut,
              status_code=status.HTTP_201_CREATED)
-def create_browser_test(body: BrowserTestIn, user: User = Depends(get_current_user),
+def create_browser_test(body: BrowserTestIn, user: User = Depends(require_tenant_admin),
                         db: Session = Depends(get_db)):
     agent = _tenant_agent(db, user, body.agent_id)
 

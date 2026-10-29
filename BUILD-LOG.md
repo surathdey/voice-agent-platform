@@ -1615,3 +1615,252 @@ adopted agent). The seeder also takes its login email from
 VAP_EMAIL now (default demo@qgbs.example) because a
 provisioned box's seed user is admin@<slug>.example, not the
 fresh-DB demo user.
+
+## Epic C, story C5 — Roles (2026-10-29)
+
+Roles (design §16, as decided with Surath 2026-10-29: Team
+Leader is a SEPARATE login; allocation is Team Leader only;
+Tenant Admin does NOT allocate — it manages Caller accounts +
+tenant settings/adoption; account creation is Email OTP first,
+invite-based, single-use expiring setup link, user sets own
+password, SMS OTP fallback). What landed:
+
+- `backend/app/models.py`: `User.role` now documents exactly
+  four names (super_admin | tenant_admin | team_leader |
+  caller, default caller); `User` gains `team_id` (FK teams)
+  + `phone`; new `Team` (tenant, name, leader user, created);
+  new `UserInvite` (tenant, email, name, role, team, phone,
+  channel email|sms, inviter, otp_hash, setup_token_hash,
+  expires_at, used_at) — ONLY hashes stored, never plaintext
+  OTP/token; `Lead` gains `assigned_caller_id` /
+  `allocated_by` / `allocated_at`; `CallResult` gains
+  `disposition_updated_by` / `disposition_updated_at` /
+  `approval_decision` / `approved_by` / `approved_at` /
+  `approval_expires_at`.
+- `backend/app/deps.py`: role constants + `require_super_admin`
+  (strict), `require_tenant_admin` (strict — Super Admin is
+  excluded because customer-data work belongs to Tenant
+  Admin), `require_tenant_admin_or_super`,
+  `require_team_leader` (strict), `require_catalog_admin`
+  TIGHTENED to Super Admin only (the C2 seam now enforced),
+  `require_catalog_reader` (super_admin or tenant_admin);
+  `team_caller_ids` + `case_scope` (ALL for Tenant Admin,
+  own id for Caller, team ids + unallocated pool for TL,
+  403 for Super Admin).
+- `backend/app/config.py`: SUPER_ADMIN_EMAIL /
+  SUPER_ADMIN_PASSWORD (both empty = no Super Admin on this
+  box), INVITE_DEV_OTP (default false — test gate only,
+  never true in production), APPROVAL_WINDOW_HOURS
+  (default 24, env-configurable).
+- `backend/app/seed.py` (idempotent, runs on boot): seed user
+  role "admin" -> "tenant_admin"; Super Admin bootstrap —
+  only when both SUPER_ADMIN_* are set and the user does not
+  exist: creates a "Platform" tenant row + super_admin user
+  in it (platform scope, never a customer tenant).
+- Migration 014 (`backend/app/migrations.py` +
+  `backend/migrations/014_c5_roles.sql` DDL of record):
+  marker `_marker_014` (users team_id+phone; leads
+  assigned_caller_id+allocated_by+allocated_at; call_results
+  disposition/approval audit columns) via `_ensure_column` +
+  the one data migration (role 'admin' -> 'tenant_admin',
+  role 'operator' -> 'caller'). New tables (teams,
+  user_invites) need no step — `create_all` makes them.
+- `backend/app/routers/users.py` (new): GET /api/users/me;
+  GET /api/users (Super: all; Tenant Admin: own tenant; TL:
+  team's Callers; Caller: 403); POST /api/users/invites
+  (tenant_admin_or_super; role must be
+  tenant_admin|team_leader|caller — super_admin never
+  invitable, bootstrapped only; Tenant Admin invites
+  Callers only; Super Admin requires tenant_id; duplicate
+  email -> 409; 6-digit OTP via secrets + token_urlsafe(32)
+  setup token, both PBKDF2-hashed, 24h expiry; invite
+  creation is logged WITHOUT the OTP value; returns
+  InviteOut with setup_url + dev_otp only when
+  INVITE_DEV_OTP); GET /api/users/invites (no OTP/token in
+  listings); PATCH /api/users/{id} (Super: any; Tenant
+  Admin: Callers in own tenant only, name/team/is_active —
+  role never changes here; cannot deactivate own account).
+  Teams live under their own router (`/api/teams`): POST
+  (tenant_admin_or_super; leader must already be
+  team_leader in that tenant), GET (Super: all; Tenant
+  Admin: own tenant; TL: teams they lead; Caller: 403),
+  PATCH (tenant_admin_or_super; own-tenant teams only).
+  NO direct "create user with password" endpoint exists by
+  design — creation is invite-only.
+- `backend/app/routers/queue.py` (new): GET /api/queue
+  (Super: 403; Tenant Admin: all tenant review_required
+  results; TL: team's + unassigned items; Caller: own
+  only; items flag is_settlement from agent.stage ==
+  "Settlement"); POST /api/queue/{result_id}/approve
+  (decision approved|rejected|escalated else 422;
+  Caller/Super: 403; settlement-agent items -> TL ONLY;
+  TL approving outside their team -> 403; missing or
+  already-resolved -> 404; past approval_expires_at -> 410
+  GONE, item stays queued and overdue; approved/rejected
+  clear review_required, escalated keeps it).
+- `backend/app/routers/auth.py`: login UserOut now includes
+  team_id/phone; new POST /api/auth/setup {invite_id,
+  token, otp, password} (public; invite looked up by ID
+  because PBKDF2 hashes are salted — a token-hash lookup
+  can never match — then token AND otp verified with
+  verify_password; failures indistinguishable 401 whether
+  invite/token/OTP/expiry is wrong; sets password,
+  is_active, team/phone from the invite, used_at; returns
+  auto-login). The salted-hash lookup bug was found by the
+  C5 suite itself (setup 401'd until the lookup changed).
+- `backend/app/routers/catalog.py`: reads ->
+  require_catalog_reader; adopt POST -> require_tenant_admin
+  STRICT (Super Admin does not adopt — adoption records
+  the adopting tenant, and Super Admin belongs to platform
+  scope, not any tenant); adoptions list ->
+  require_tenant_admin; adoption-log ->
+  require_tenant_admin_or_super (Tenant Admin filtered to
+  own tenant, Super sees all).
+- `backend/app/routers/agents.py`: `_out` redacts prompt to
+  "" for team_leader/caller; `_get_scoped` — Super Admin
+  by id across tenants, others tenant-filtered (foreign =
+  404); list — Super: all, others own tenant + redaction;
+  create -> require_super_admin with body.tenant_id
+  REQUIRED (422 if absent — the Super Admin's own
+  tenant_id is the platform tenant, never the answer);
+  get -> any role + redaction; update/delete/rollback ->
+  require_super_admin; prompt-versions list/get ->
+  require_tenant_admin_or_super (the old tenant filter on
+  versions queries was dropped — it wrongly hid a tenant's
+  versions from Super Admin; access is enforced by
+  _get_scoped).
+- `backend/app/routers/campaigns.py`: `_get_scoped` gains
+  C5 visibility (Super -> 404; Caller -> only campaigns
+  holding >=1 own allocated lead; Tenant Admin/TL -> any
+  tenant campaign); list — Super: 403; Caller: only
+  campaigns with own leads; TL/Tenant Admin: all tenant;
+  create/update/delete/status -> require_tenant_admin;
+  `_lead_out` includes allocation fields; list_leads scoped
+  via case_scope; NEW POST
+  `/{campaign_id}/leads/{lead_id}/allocate`
+  (require_team_leader; lead in campaign+tenant; caller
+  must be role=caller, same tenant, on the Leader's team
+  else 422; null = unallocate; sets assigned_caller_id /
+  allocated_by / allocated_at); export ->
+  require_tenant_admin; preview/upload ->
+  require_tenant_admin; upload mapping gains "caller"
+  target (value = Caller email else exact name; email
+  match wins; name match requires exactly 1, else
+  unresolved; unresolved values collected once each into
+  unresolved_callers; assigned leads get allocated_by =
+  uploader + allocated_at = now). Deliberate distinction,
+  documented: upload-time assignment honors the FILE's
+  allocation data (plan step 2 / Q3), while MANUAL
+  allocation is TL-only.
+- `backend/app/routers/calls.py`: `_campaign_scoped` same
+  C5 visibility; NEW `_scope_sessions` (Tenant Admin
+  unchanged; TL: team's cases + unallocated cases; Caller:
+  own cases only; lead-less browser-test sessions drop
+  out of scoped views); dispatch -> require_tenant_admin;
+  campaign_calls + campaign_results scoped (sessions +
+  counts both scoped); dashboard — Super: 403, campaign
+  counts tenant-wide for TL, own-campaigns-only for
+  Caller, calls/results/review/costs scoped via session
+  ids; list_calls — Super: 403, and a campaign_id filter
+  returns EMPTY for a foreign campaign (lists return
+  empty, not 404 — the tenant filter already excludes
+  foreign sessions; the first C5 cut 404'd here and broke
+  the cross-tenant fuzz, which asserts total 0);
+  call_recording scope check (Super: 404; Caller: own lead
+  only; TL: team's or unassigned; foreign = 404); NEW
+  PATCH `/api/calls/{session_id}/disposition` (Super:
+  403; Caller: own only; TL: team's; Tenant Admin: any
+  tenant case; foreign = 404; no result = 404; disposition
+  must be one of the campaign agent's own buckets via
+  disposition_buckets(campaign_prompt(...)) else 422;
+  sets disposition + disposition_updated_by/at).
+  post_result (/api/results, internal receiver)
+  deliberately UNCHANGED — gating it could break finalize
+  flows.
+- `backend/app/routers/tenants.py`: POST "" ->
+  require_super_admin + invite-based admin (creates tenant
+  + pending tenant_admin User + UserInvite; returns
+  {tenant, admin_email, invite_id, setup_url, dev_otp only
+  when INVITE_DEV_OTP} — NO password generated or
+  returned; replaces the old open endpoint that returned
+  admin_password "demo-password"); GET /{tenant_id} —
+  Super Admin may read any tenant's metadata (not customer
+  data), others own-only else 404; NEW PUT /me ->
+  require_tenant_admin (timezone, from_numbers).
+- `backend/app/routers/settings.py`: all 5 providers
+  endpoints -> require_tenant_admin (Super Admin provider
+  management is a C4 follow-up with explicit tenant
+  scoping — their user.tenant_id is the platform tenant,
+  so provider_view would silently address the wrong
+  tenant's row).
+- `backend/app/routers/browser_test.py`: create ->
+  require_tenant_admin. `telephony.py` UNTOUCHED (all
+  webhook/answer/stream endpoints are provider-facing, no
+  get_current_user — gating them would break provider
+  callbacks).
+- `backend/app/main.py`: registered `users.router` +
+  `users.teams_router` + `queue.router`.
+- `backend/app/orchestrator.py`: approval clock stamping
+  in all three finalize paths (merge-upgrade with new
+  disposition; review-flag upgrade branch; fresh creation
+  incl. hangup-first rule): when review_required becomes
+  True and approval_expires_at is None, set now +
+  APPROVAL_WINDOW_HOURS.
+- `scripts/provision_tenant_box.py`: no role references —
+  backend seed handles roles; no change needed.
+
+Role-matrix test (`scripts/test_roles.py`, runner
+`~/workspace/run_c5_test.sh`): 110 passed, 0 failed on a
+fresh SQLite backend (Super Admin bootstrapped via env +
+INVITE_DEV_OTP). Covers: seed user is tenant_admin after
+migration; Super Admin catalog writes + tenant creation
+(invite shape, no password) + 403/404 on all customer-data
+surfaces; Tenant Admin 403 on catalog/agents/tenants writes
++ settings PUT; invite flow for Caller, Team Leader (via
+Super Admin — Tenant Admin invites Callers only),
+SMS-channel invite; wrong token / wrong OTP / re-use all
+401; team creation + Caller moved into the TL's team; TL
+lists only teams they lead; allocation TL-only (Tenant
+Admin + Caller 403; TL to an off-team Caller 422; audit
+fields set); Caller sees only own leads/calls; upload
+caller column resolves by name, reports unknown;
+dispatch + queue approvals (Tenant Admin approves the
+RPI item; settlement item Tenant Admin 403, TL 200;
+expired approval 410); disposition PATCH audit (own
+200, other's 404, bad bucket 422); prompt redaction for
+TL/Caller on agent reads; Tenant Admin still reads prompt
+history.
+
+Smoke-script maintenance in this story (test-only): boot
+env gains SUPER_ADMIN_* + INVITE_DEV_OTP (exported in
+`run_smoke.sh` so start_app6 instances inherit them — the
+first C5 smoke run failed super login on 6-instances
+because the vars were uvicorn-prefix-only); migration
+count assertions 1-13 -> 1-14; tenant-creation sites (1
+main + 4 six-section) use the invite flow via
+create_tenant_main / create_tenant6; agent-write sites
+(1 main + 12 six-section) use the Super token +
+explicit tenant_id via create_agent6 (the Concurrency Co
+agent resolves against tokenK, its owning tenant, not
+the seed token); list_calls keeps the list contract
+(empty, not 404) for foreign campaign filters. C2 suite
+also updated (catalog writes + agent PUT on the Super
+token; reads/adoptions stay Tenant Admin): 64 passed, 0
+failed. Full smoke after C5: 791 PASS, 5 FAIL — exactly
+the known stale transcriber assertions — then the known
+typing-bed crash at smoke_test.py:5272 (pre-existing
+test-script bug, same as C1/C2 runs). No C5 regressions.
+No stray uvicorn processes after any run.
+
+Known limitations carried forward (not silently fixed):
+invite delivery is log-mode — no Email/SMS provider is
+wired, so the setup link is returned to the CREATOR who
+forwards it (standard "copy invite link" pattern); the
+OTP travels only over its channel + the INVITE_DEV_OTP
+test gate. Without a provider AND without the dev gate,
+invites cannot complete in production — provider wiring
+is follow-up work. Approval window is env-configurable,
+not yet a settings-UI control. Frontend role-gating
+(hiding editor/catalog UI per role, handling 403s) is
+NOT in C5 backend scope. Super Admin provider management
+is a C4 follow-up (explicit tenant scoping needed).

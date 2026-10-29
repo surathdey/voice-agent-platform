@@ -64,9 +64,65 @@ class User(Base):
     tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.tenant_id"), nullable=False, index=True)
     email: Mapped[str] = mapped_column(String(200), unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String(200), default="")
-    role: Mapped[str] = mapped_column(String(40), default="operator")  # admin | operator
+    # Epic C, C5 (design §16): exactly one role per user —
+    # super_admin (platform scope) | tenant_admin | team_leader | caller.
+    # Legacy values "admin" / "operator" are mapped by migration 014
+    # (admin -> tenant_admin, operator -> caller); the code below only
+    # ever checks the four C5 names.
+    role: Mapped[str] = mapped_column(String(40), default="caller")
     password_hash: Mapped[str] = mapped_column(String(300), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # C5: a Caller's team (nullable for all other roles). A Team Leader
+    # supervises the Callers whose team_id points at a team they lead.
+    team_id: Mapped[str | None] = mapped_column(ForeignKey("teams.team_id"), nullable=True, index=True)
+    phone: Mapped[str] = mapped_column(String(30), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class Team(Base):
+    """A Team Leader's team inside one tenant (C5).
+
+    One team has exactly one leader; a Caller belongs to at most one
+    team. Allocation, supervision, and team-scoped queue approval all
+    resolve through this row — never through a name match.
+    """
+
+    __tablename__ = "teams"
+
+    team_id: Mapped[str] = mapped_column(String(40), primary_key=True, default=lambda: new_id("tem"))
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.tenant_id"), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    leader_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.user_id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class UserInvite(Base):
+    """A pending account invitation (C5).
+
+    Invite-based account creation, decided 2026-10-29: Email OTP
+    first, single-use expiring setup link, the user sets their own
+    password, SMS OTP as fallback. Only HASHES are stored — the OTP
+    and the setup token are never persisted in cleartext, and the
+    OTP is never returned by the API (it travels only over its
+    channel, log-mode until a provider is wired; the INVITE_DEV_OTP
+    test gate is the sole exception, off by default).
+    """
+
+    __tablename__ = "user_invites"
+
+    invite_id: Mapped[str] = mapped_column(String(40), primary_key=True, default=lambda: new_id("inv"))
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.tenant_id"), nullable=False, index=True)
+    email: Mapped[str] = mapped_column(String(200), nullable=False)
+    name: Mapped[str] = mapped_column(String(200), default="")
+    role: Mapped[str] = mapped_column(String(40), nullable=False)  # tenant_admin | team_leader | caller
+    team_id: Mapped[str | None] = mapped_column(ForeignKey("teams.team_id"), nullable=True)
+    phone: Mapped[str] = mapped_column(String(30), default="")
+    channel: Mapped[str] = mapped_column(String(10), default="email")  # email | sms
+    invited_by: Mapped[str] = mapped_column(String(40), nullable=False)
+    otp_hash: Mapped[str] = mapped_column(String(300), nullable=False)
+    setup_token_hash: Mapped[str] = mapped_column(String(300), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -322,6 +378,12 @@ class Lead(Base):
     # shift applied in market-local time when configured. NULL = due now
     # (fresh lead) or not awaiting a retry (final state reached).
     next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, default=None)
+    # C5: case allocation. NULL = unallocated (a Team Leader can still
+    # see it — allocation starts from the unallocated pool). allocated_by
+    # / allocated_at are the audit: who assigned this case, and when.
+    assigned_caller_id: Mapped[str | None] = mapped_column(ForeignKey("users.user_id"), nullable=True, index=True)
+    allocated_by: Mapped[str | None] = mapped_column(ForeignKey("users.user_id"), nullable=True)
+    allocated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -438,4 +500,15 @@ class CallResult(Base):
     captured_fields: Mapped[dict] = mapped_column(JSON, default=dict)
     duration_s: Mapped[int] = mapped_column(Integer, default=0)
     cost_breakdown: Mapped[dict] = mapped_column(JSON, default=dict)  # {telephony, stt, llm, tts, total, currency}
+    # C5 audit: every manual disposition update carries who + when, and
+    # every Human Queue approval carries who + when + decision. The
+    # approval deadline is stamped when the item enters the queue
+    # (created with review_required); approving past it is refused
+    # (410) — the item stays queued and overdue, never silently dropped.
+    disposition_updated_by: Mapped[str | None] = mapped_column(ForeignKey("users.user_id"), nullable=True)
+    disposition_updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    approval_decision: Mapped[str | None] = mapped_column(String(20), nullable=True)  # approved | rejected | escalated
+    approved_by: Mapped[str | None] = mapped_column(ForeignKey("users.user_id"), nullable=True)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    approval_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

@@ -15,6 +15,87 @@ class UserOut(BaseModel):
     email: str
     name: str
     role: str
+    team_id: Optional[str] = None
+    phone: str = ""
+
+
+# ── Epic C, C5: roles, invites, allocation, queue approval ──────────
+
+class TeamIn(BaseModel):
+    name: str
+    leader_user_id: Optional[str] = None
+    tenant_id: Optional[str] = None      # Super Admin only; ignored otherwise
+
+
+class TeamOut(BaseModel):
+    team_id: str
+    tenant_id: str
+    name: str
+    leader_user_id: Optional[str] = None
+    member_count: int = 0
+
+
+class InviteIn(BaseModel):
+    email: str
+    name: str = ""
+    # tenant_admin | team_leader | caller. Super Admin may invite any
+    # of the three (with an explicit tenant_id); Tenant Admin may
+    # invite Callers into their own tenant only. Super Admin accounts
+    # themselves are never created through invites — they are
+    # bootstrapped from the platform environment (see seed.py).
+    role: str
+    team_id: Optional[str] = None
+    phone: str = ""
+    channel: str = "email"               # email | sms (SMS = fallback)
+    tenant_id: Optional[str] = None      # Super Admin only; ignored otherwise
+
+
+class InviteOut(BaseModel):
+    invite_id: str
+    tenant_id: str
+    email: str
+    name: str
+    role: str
+    team_id: Optional[str] = None
+    channel: str
+    setup_url: str
+    expires_at: Optional[str] = None
+    # Returned ONLY when INVITE_DEV_OTP=true (tests). In production
+    # the OTP travels only over its channel (log-mode until wired).
+    dev_otp: Optional[str] = None
+
+
+class SetupIn(BaseModel):
+    invite_id: str                       # from the invite link (hashes are
+                                         # salted, so the token itself is never
+                                         # a lookup key — it is verified, not matched)
+    token: str                           # single-use setup token from the invite link
+    otp: str                             # the Email/SMS OTP from the invite channel
+    password: str
+
+
+class UserPatchIn(BaseModel):
+    name: Optional[str] = None
+    team_id: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+class AllocateIn(BaseModel):
+    caller_id: Optional[str] = None      # None = unallocate
+
+
+class DispositionPatchIn(BaseModel):
+    disposition: str
+
+
+class ApproveIn(BaseModel):
+    decision: str                        # approved | rejected | escalated
+    note: str = ""
+
+
+class TenantPatchIn(BaseModel):
+    timezone: Optional[str] = None
+    from_numbers: Optional[List[str]] = None
 
 
 class LoginOut(BaseModel):
@@ -55,6 +136,10 @@ class AgentIn(BaseModel):
     stage: str = ""
     purpose: str = ""
     is_reference: bool = False
+    # C5, create-only: the tenant the agent lands in. Required when a
+    # Super Admin creates an agent (their own tenant_id is the
+    # platform tenant, never the answer); ignored on update.
+    tenant_id: Optional[str] = None
     # THE single prompt — behaviour + dialogue + disposition logic, one text.
     prompt: str = ""
     # Structured config only:
@@ -272,6 +357,10 @@ class LeadOut(BaseModel):
     # A10: when a re-queued lead's next attempt becomes due (ISO, UTC);
     # None when the lead is due now or has reached a final state.
     next_attempt_at: Optional[str] = None
+    # C5: case allocation (None = unallocated pool).
+    assigned_caller_id: Optional[str] = None
+    allocated_by: Optional[str] = None
+    allocated_at: Optional[str] = None
     created_at: Optional[str] = None
 
 
@@ -284,6 +373,9 @@ class UploadResultOut(BaseModel):
     total_rows: int
     created: int
     duplicates_skipped: int
+    # C5: caller values from a caller-mapped column that matched no
+    # Caller (or matched ambiguously) — those leads stay unallocated.
+    unresolved_callers: List[str] = []
     invalid_skipped: int
 
 

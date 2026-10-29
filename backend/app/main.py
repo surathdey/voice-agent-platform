@@ -37,7 +37,7 @@ from . import providers as prov
 from . import seed as seed_module
 from .config import settings
 from .db import SessionLocal, init_db
-from .routers import agents, auth, browser_test, calls, campaigns, catalog, settings as settings_router, telephony, tenants
+from .routers import agents, auth, browser_test, calls, campaigns, catalog, queue, settings as settings_router, telephony, tenants, users
 
 # Turn-loop tracing (stall fix, Oct 26, 2026) logs at INFO through the
 # "app" namespace — but the process has no handler at INFO for that
@@ -107,3 +107,6 @@ app.include_router(settings_router.router)
 app.include_router(calls.router)
 app.include_router(telephony.router)
 app.include_router(browser_test.router)
+app.include_router(users.router)
+app.include_router(users.teams_router)
+app.include_router(queue.router)

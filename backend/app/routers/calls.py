@@ -37,7 +37,15 @@ from sqlalchemy.orm import Session
 from .. import market_time as mt
 from .. import providers as prov
 from ..db import get_db
-from ..deps import get_current_user
+from ..deps import (
+    case_scope,
+    get_current_user,
+    require_tenant_admin,
+    team_caller_ids,
+    ROLE_CALLER,
+    ROLE_SUPER_ADMIN,
+    ROLE_TEAM_LEADER,
+)
 from .. import stt as stt_module
 from ..models import AgentConfig, CallResult, CallSession, Campaign, Lead, Tenant, User
 from ..orchestrator import Dispatcher, campaign_prompt, disposition_buckets, receive_result
@@ -47,6 +55,7 @@ from ..schemas import (
     CampaignResultsOut,
     DashboardOut,
     DispatchOut,
+    DispositionPatchIn,
     ResultIn,
     ResultOut,
 )
@@ -55,15 +64,45 @@ router = APIRouter(tags=["calls"])
 
 
 def _campaign_scoped(db: Session, user: User, campaign_id: str) -> Campaign:
+    """Tenant-scoped campaign + C5 visibility (same rule as
+    campaigns._get_scoped): Super Admin sees no tenant customer data;
+    a Caller sees only campaigns holding their own cases; Tenant
+    Admin and Team Leader see any campaign of the tenant."""
     c = (
         db.query(Campaign)
         .filter(Campaign.campaign_id == campaign_id,
                 Campaign.tenant_id == user.tenant_id)
         .first()
     )
-    if c is None:
+    if c is None or user.role == ROLE_SUPER_ADMIN:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Campaign not found")
+    if user.role == ROLE_CALLER:
+        own = (
+            db.query(Lead)
+            .filter(Lead.campaign_id == c.campaign_id,
+                    Lead.assigned_caller_id == user.user_id)
+            .first()
+        )
+        if own is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Campaign not found")
     return c
+
+
+def _scope_sessions(user: User, db: Session, query):
+    """Apply C5 case scoping to a CallSession query. Tenant Admin:
+    unchanged. Team Leader: sessions on their team's cases plus
+    sessions on unallocated cases (the pool they allocate from).
+    Caller: sessions on their own cases only. Sessions without a
+    lead (browser tests) are not cases and drop out of scoped views.
+    Super Admin never reaches here (403 at the endpoint)."""
+    scope = case_scope(user, db)
+    if scope == "ALL":
+        return query
+    query = query.join(Lead, CallSession.lead_id == Lead.lead_id)
+    if user.role == ROLE_TEAM_LEADER:
+        return query.filter((Lead.assigned_caller_id.in_(scope)) |
+                            (Lead.assigned_caller_id.is_(None)))
+    return query.filter(Lead.assigned_caller_id == user.user_id)
 
 
 def _transcript_view(s: CallSession, result: CallResult | None) -> list:
@@ -187,7 +226,7 @@ def _cost_summary(pairs) -> list:
 
 
 @router.post("/api/campaigns/{campaign_id}/dispatch", response_model=DispatchOut)
-def run_dispatch(campaign_id: str, user: User = Depends(get_current_user),
+def run_dispatch(campaign_id: str, user: User = Depends(require_tenant_admin),
                  db: Session = Depends(get_db)):
     c = _campaign_scoped(db, user, campaign_id)
     if c.status != "active":
@@ -207,10 +246,10 @@ def campaign_calls(campaign_id: str, limit: int = 500, offset: int = 0,
                    user: User = Depends(get_current_user),
                    db: Session = Depends(get_db)):
     c = _campaign_scoped(db, user, campaign_id)
-    q = db.query(CallSession).filter(CallSession.campaign_id == c.campaign_id)
+    q = _scope_sessions(user, db, db.query(CallSession)
+                        .filter(CallSession.campaign_id == c.campaign_id))
     total = q.count()
-    states = _counts(db, db.query(CallSession.state)
-                     .filter(CallSession.campaign_id == c.campaign_id))
+    states = _counts(db, q.with_entities(CallSession.state))
     rows = (q.order_by(CallSession.started_at, CallSession.session_id)
              .offset(offset).limit(limit).all())
     return CallListOut(total=total, counts_by_state=states,
@@ -232,11 +271,15 @@ def campaign_results(campaign_id: str, user: User = Depends(get_current_user),
     # must appear in its own summary even after a later adoption.
     buckets = disposition_buckets(campaign_prompt(c, agent) if agent else "")
 
-    sessions = (db.query(CallSession)
-                .filter(CallSession.campaign_id == c.campaign_id).all())
+    # C5: the summary aggregates only the viewer's cases (Tenant
+    # Admin: the whole campaign; Team Leader: team's + unallocated;
+    # Caller: own). The session set drives everything below — results
+    # join to these sessions, never to the whole campaign.
+    sessions = _scope_sessions(user, db, db.query(CallSession)
+                               .filter(CallSession.campaign_id == c.campaign_id)).all()
+    session_ids = [s.session_id for s in sessions]
     results = (db.query(CallResult)
-               .join(CallSession, CallResult.session_id == CallSession.session_id)
-               .filter(CallSession.campaign_id == c.campaign_id).all())
+               .filter(CallResult.session_id.in_(session_ids)).all()) if session_ids else []
     session_state = {s.session_id: s.state for s in sessions}
 
     counts = {b: 0 for b in buckets}
@@ -251,15 +294,21 @@ def campaign_results(campaign_id: str, user: User = Depends(get_current_user),
             review += 1
         total_duration += r.duration_s or 0
 
-    lead_rows = (db.query(Lead.status)
-                 .filter(Lead.campaign_id == c.campaign_id).all())
+    lead_query = db.query(Lead).filter(Lead.campaign_id == c.campaign_id)
+    scope = case_scope(user, db)
+    if scope != "ALL":
+        if user.role == ROLE_CALLER:
+            lead_query = lead_query.filter(Lead.assigned_caller_id == user.user_id)
+        else:  # Team Leader: team's + unallocated
+            lead_query = lead_query.filter((Lead.assigned_caller_id.in_(scope)) |
+                                           (Lead.assigned_caller_id.is_(None)))
+    lead_rows = [(l.status,) for l in lead_query.all()]
     leads_by_state: dict[str, int] = {}
     for (st,) in lead_rows:
         leads_by_state[st] = leads_by_state.get(st, 0) + 1
     now = datetime.utcnow()
-    awaiting = (db.query(Lead)
-                .filter(Lead.campaign_id == c.campaign_id,
-                        Lead.status == "pending",
+    awaiting = (lead_query
+                .filter(Lead.status == "pending",
                         Lead.next_attempt_at.isnot(None),
                         Lead.next_attempt_at > now)
                 .count())
@@ -288,26 +337,40 @@ def dashboard(user: User = Depends(get_current_user),
               db: Session = Depends(get_db)):
     """Tenant home (A10): the day at a glance, from the same §8.2
     records every mode produces. "Today" is the tenant's market-local
-    day; dispositions are tenant-wide totals across campaigns."""
+    day; dispositions are tenant-wide totals across campaigns.
+
+    C5: Super Admin gets no dashboard (no tenant customer data).
+    Campaign counts stay tenant-wide for Team Leaders (supervision
+    metadata) but shrink to own campaigns for Callers; every call /
+    result / review number is scoped to the viewer's cases."""
+    if user.role == ROLE_SUPER_ADMIN:
+        raise HTTPException(status.HTTP_403_FORBIDDEN,
+                            "Super Admin sees no tenant customer data")
     tenant = db.get(Tenant, user.tenant_id)
     zone = mt.tenant_zone(tenant)
     today_local = mt.to_local(datetime.utcnow(), zone).date()
     day_start_utc = mt.local_day_start_utc(today_local, zone)
 
-    campaigns = (db.query(Campaign)
-                 .filter(Campaign.tenant_id == user.tenant_id).all())
+    campaign_query = db.query(Campaign).filter(Campaign.tenant_id == user.tenant_id)
+    if user.role == ROLE_CALLER:
+        own_campaigns = (db.query(Lead.campaign_id)
+                         .filter(Lead.assigned_caller_id == user.user_id))
+        campaign_query = campaign_query.filter(Campaign.campaign_id.in_(own_campaigns))
+    campaigns = campaign_query.all()
     by_status: dict[str, int] = {}
     for c in campaigns:
         by_status[c.status] = by_status.get(c.status, 0) + 1
 
-    calls_total = (db.query(CallSession)
-                   .filter(CallSession.tenant_id == user.tenant_id).count())
+    scoped_sessions = _scope_sessions(
+        user, db, db.query(CallSession).filter(CallSession.tenant_id == user.tenant_id))
+    scoped_ids = [s.session_id for s in scoped_sessions.all()]
+    calls_total = len(scoped_ids)
     calls_today = (db.query(CallSession)
-                   .filter(CallSession.tenant_id == user.tenant_id,
-                           CallSession.started_at >= day_start_utc).count())
+                   .filter(CallSession.session_id.in_(scoped_ids),
+                           CallSession.started_at >= day_start_utc).count()) if scoped_ids else 0
 
     results = (db.query(CallResult)
-               .filter(CallResult.tenant_id == user.tenant_id).all())
+               .filter(CallResult.session_id.in_(scoped_ids)).all()) if scoped_ids else []
     dispositions: dict[str, int] = {}
     review = 0
     for r in results:
@@ -318,8 +381,8 @@ def dashboard(user: User = Depends(get_current_user),
     result_states = {
         s.session_id: s.state
         for s in db.query(CallSession)
-        .filter(CallSession.tenant_id == user.tenant_id).all()
-    }
+        .filter(CallSession.session_id.in_(scoped_ids)).all()
+    } if scoped_ids else {}
 
     return DashboardOut(
         timezone=mt.tenant_timezone_name(tenant),
@@ -341,9 +404,16 @@ def list_calls(campaign_id: str = "", disposition: str = "",
                limit: int = 500, offset: int = 0,
                user: User = Depends(get_current_user),
                db: Session = Depends(get_db)):
+    if user.role == ROLE_SUPER_ADMIN:
+        raise HTTPException(status.HTTP_403_FORBIDDEN,
+                            "Super Admin sees no tenant customer data")
     q = db.query(CallSession).filter(CallSession.tenant_id == user.tenant_id)
     if campaign_id:
+        # Lists return empty, not 404: the tenant filter above already
+        # excludes a foreign campaign's sessions (cross-tenant fuzz
+        # asserts total 0 here). Single-item access 404s elsewhere.
         q = q.filter(CallSession.campaign_id == campaign_id)
+    q = _scope_sessions(user, db, q)
     if disposition or review_required is not None:
         # Result-bearing filters: sessions without a §8.2 result cannot
         # match a disposition / review filter by definition.
@@ -385,6 +455,19 @@ def call_recording(session_id: str, download: int = 0,
                  CallSession.tenant_id == user.tenant_id).first())
     if s is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Call not found")
+    # C5: a recording is customer data — Super Admin never streams
+    # one, and a Team Leader / Caller streams only their cases'
+    # recordings (a foreign call is indistinguishable from missing).
+    if user.role == ROLE_SUPER_ADMIN:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Call not found")
+    if user.role in (ROLE_TEAM_LEADER, ROLE_CALLER):
+        lead = db.get(Lead, s.lead_id) if s.lead_id else None
+        assigned = lead.assigned_caller_id if lead else None
+        if user.role == ROLE_CALLER and assigned != user.user_id:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Call not found")
+        if user.role == ROLE_TEAM_LEADER:
+            if assigned is not None and assigned not in team_caller_ids(user, db):
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "Call not found")
     if not s.provider_call_id or s.provider_call_id.startswith("stub_"):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "No recording for this call")
     camp = db.get(Campaign, s.campaign_id) if s.campaign_id else None
@@ -456,6 +539,52 @@ def call_recording(session_id: str, download: int = 0,
 
     return StreamingResponse(_stream(), media_type="audio/wav",
                              headers={"Content-Disposition": disp})
+
+
+@router.patch("/api/calls/{session_id}/disposition", response_model=CallOut)
+def update_disposition(session_id: str, body: DispositionPatchIn,
+                       user: User = Depends(get_current_user),
+                       db: Session = Depends(get_db)):
+    """Manually correct a call's disposition (C5). Who may correct
+    what: Tenant Admin any case in the tenant; Team Leader their
+    team's cases; Caller their own cases only; Super Admin never
+    (no tenant customer data). The correction is audited (who +
+    when on the result row), and the new disposition must be one of
+    the campaign agent's own buckets — an unknown bucket is NEVER
+    stored as a disposition (the same rule the classifier obeys).
+    """
+    if user.role == ROLE_SUPER_ADMIN:
+        raise HTTPException(status.HTTP_403_FORBIDDEN,
+                            "Super Admin sees no tenant customer data")
+    s = (db.query(CallSession)
+         .filter(CallSession.session_id == session_id,
+                 CallSession.tenant_id == user.tenant_id).first())
+    if s is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Call not found")
+    lead = db.get(Lead, s.lead_id) if s.lead_id else None
+    assigned = lead.assigned_caller_id if lead else None
+    if user.role == ROLE_CALLER and assigned != user.user_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Call not found")
+    if user.role == ROLE_TEAM_LEADER and assigned is not None \
+            and assigned not in team_caller_ids(user, db):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Call not found")
+    r = (db.query(CallResult)
+         .filter(CallResult.session_id == s.session_id).first())
+    if r is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND,
+                            "No result to correct for this call")
+    campaign = db.get(Campaign, s.campaign_id) if s.campaign_id else None
+    agent = db.get(AgentConfig, campaign.agent_id) if campaign else None
+    buckets = disposition_buckets(campaign_prompt(campaign, agent) if agent else "")
+    if buckets and body.disposition not in buckets:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            f"disposition must be one of the agent's buckets: {sorted(buckets)}")
+    r.disposition = body.disposition
+    r.disposition_updated_by = user.user_id
+    r.disposition_updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(r)
+    return _call_out(db, s)
 
 
 @router.post("/api/results", response_model=ResultOut)

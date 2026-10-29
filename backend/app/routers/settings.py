@@ -6,13 +6,20 @@ forms (app.providers.provider_view), and no response ever contains a full
 secret — enforced by smoke tests using sentinel keys. Tenant settings
 override the platform .env; TELEPHONY_MODE=stub is the global fallback
 when nothing is configured (see app.providers).
+
+Roles (C5): Tenant Admin only. Provider keys are tenant configuration,
+and a Super Admin's user.tenant_id is the platform tenant — letting a
+Super Admin read/write here would silently address the wrong tenant's
+row. Super Admin provider management arrives with C4's explicit
+per-tenant secrets scoping; until then, tenant provider keys belong
+to the Tenant Admin.
 """
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from .. import providers as prov
 from ..db import get_db
-from ..deps import get_current_user
+from ..deps import require_tenant_admin
 from ..models import ProviderSetting, User
 from ..schemas import ProviderOut, ProviderSettingIn, ProviderTestOut
 
@@ -27,20 +34,20 @@ def _spec(provider: str) -> dict:
 
 
 @router.get("/providers", response_model=list[ProviderOut])
-def list_providers(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def list_providers(user: User = Depends(require_tenant_admin), db: Session = Depends(get_db)):
     """All providers, both modes, for the caller's tenant — masked view."""
     return [prov.provider_view(db, user.tenant_id, key) for key in prov.PROVIDERS]
 
 
 @router.get("/providers/{provider}", response_model=ProviderOut)
-def get_provider(provider: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def get_provider(provider: str, user: User = Depends(require_tenant_admin), db: Session = Depends(get_db)):
     _spec(provider)
     return prov.provider_view(db, user.tenant_id, provider)
 
 
 @router.put("/providers/{provider}", response_model=ProviderOut)
 def save_provider(provider: str, body: ProviderSettingIn,
-                  user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+                  user: User = Depends(require_tenant_admin), db: Session = Depends(get_db)):
     spec = _spec(provider)
     known = {f["name"]: f for f in spec["fields"]}
     unknown = sorted(set(body.fields) - set(known))
@@ -76,7 +83,7 @@ def save_provider(provider: str, body: ProviderSettingIn,
 
 
 @router.delete("/providers/{provider}", response_model=ProviderOut)
-def delete_provider(provider: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def delete_provider(provider: str, user: User = Depends(require_tenant_admin), db: Session = Depends(get_db)):
     """Remove the tenant's own settings for a provider (falls back to .env / stub)."""
     _spec(provider)
     row = prov.get_row(db, user.tenant_id, provider)
@@ -87,7 +94,7 @@ def delete_provider(provider: str, user: User = Depends(get_current_user), db: S
 
 
 @router.post("/providers/{provider}/test", response_model=ProviderTestOut)
-def test_provider(provider: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def test_provider(provider: str, user: User = Depends(require_tenant_admin), db: Session = Depends(get_db)):
     """Test connection: an honest lightweight real check when credentials
     exist; a clear stub report when none are configured."""
     _spec(provider)

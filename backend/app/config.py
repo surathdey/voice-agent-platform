@@ -166,5 +166,21 @@ class Settings:
     SEED_USER_PASSWORD: str = os.getenv("SEED_USER_PASSWORD", "demo-password")
     SEED_USER_NAME: str = os.getenv("SEED_USER_NAME", "Demo Operator")
 
+    # Epic C (C5) — platform Super Admin bootstrap (created on first
+    # boot if absent, in a "Platform" tenant row of its own — a Super
+    # Admin belongs to the platform scope, never to a customer tenant).
+    # Empty = no Super Admin on this box (tenant boxes do not need
+    # one until the platform box exists; catalog authoring lives there).
+    SUPER_ADMIN_EMAIL: str = os.getenv("SUPER_ADMIN_EMAIL", "")
+    SUPER_ADMIN_PASSWORD: str = os.getenv("SUPER_ADMIN_PASSWORD", "")
+    # C5 invite flow: when true, the invite-creation response includes
+    # the OTP so tests can complete setup without an email/SMS
+    # provider. NEVER true in production — the OTP then travels only
+    # over its channel (log-mode until a provider is wired).
+    INVITE_DEV_OTP: bool = os.getenv("INVITE_DEV_OTP", "false").lower() == "true"
+    # C5 Human Queue: hours from queueing until an approval expires.
+    # Env-configurable now; a settings-UI control is follow-up work.
+    APPROVAL_WINDOW_HOURS: int = int(os.getenv("APPROVAL_WINDOW_HOURS", "24"))
+
 
 settings = Settings()

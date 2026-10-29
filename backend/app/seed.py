@@ -1224,9 +1224,33 @@ def seed(db: Session) -> None:
     if user is None:
         db.add(User(
             tenant_id=tenant.tenant_id, email=settings.SEED_USER_EMAIL,
-            name=settings.SEED_USER_NAME, role="admin",
+            name=settings.SEED_USER_NAME, role="tenant_admin",
             password_hash=hash_password(settings.SEED_USER_PASSWORD),
         ))
+
+    # C5: platform Super Admin bootstrap — only when the platform
+    # environment names one, and only if that user does not exist yet.
+    # The Super Admin lives in a "Platform" tenant row of its own:
+    # platform scope, never a customer tenant, so no tenant-scoped
+    # query can ever mistake it for a tenant operator.
+    if settings.SUPER_ADMIN_EMAIL and settings.SUPER_ADMIN_PASSWORD:
+        platform_tenant = db.query(Tenant).filter(Tenant.name == "Platform").first()
+        if platform_tenant is None:
+            platform_tenant = Tenant(
+                name="Platform", market="IN", timezone="Asia/Kolkata",
+                provider_mode_default="managed", concurrency_limit=20,
+            )
+            db.add(platform_tenant)
+            db.flush()
+        super_user = db.query(User).filter(
+            User.email == settings.SUPER_ADMIN_EMAIL).first()
+        if super_user is None:
+            db.add(User(
+                tenant_id=platform_tenant.tenant_id,
+                email=settings.SUPER_ADMIN_EMAIL, name="Platform Super Admin",
+                role="super_admin",
+                password_hash=hash_password(settings.SUPER_ADMIN_PASSWORD),
+            ))
 
     existing = (
         db.query(AgentConfig)

@@ -359,6 +359,10 @@ def finalize_attempt(db: Session, session: CallSession, outcome: dict):
             existing.captured_fields = outcome.get("captured_fields") or {}
             existing.review_required = bool(
                 outcome.get("review_required") or False)
+            # C5: entering the queue starts the approval clock.
+            if existing.review_required and existing.approval_expires_at is None:
+                existing.approval_expires_at = (
+                    datetime.utcnow() + timedelta(hours=settings.APPROVAL_WINDOW_HOURS))
             metrics = outcome.get("cost_metrics") or {}
             old_cost = existing.cost_breakdown or {}
             if old_cost.get("cost_source") == "rate_card" and int(
@@ -378,6 +382,10 @@ def finalize_attempt(db: Session, session: CallSession, outcome: dict):
         elif not (existing.disposition or "") and session.transcript \
                 and not existing.review_required:
             existing.review_required = True
+            # C5: entering the queue starts the approval clock.
+            if existing.approval_expires_at is None:
+                existing.approval_expires_at = (
+                    datetime.utcnow() + timedelta(hours=settings.APPROVAL_WINDOW_HOURS))
             try:
                 db.commit()
             except Exception:
@@ -432,6 +440,10 @@ def finalize_attempt(db: Session, session: CallSession, outcome: dict):
     # classifier-failed path already sets review_required itself.
     if not result.disposition and session.transcript:
         result.review_required = True
+    # C5: entering the queue starts the approval clock.
+    if result.review_required:
+        result.approval_expires_at = (
+            datetime.utcnow() + timedelta(hours=settings.APPROVAL_WINDOW_HOURS))
     db.add(result)
 
     # S3 archival (012): best-effort durable copy of the provider

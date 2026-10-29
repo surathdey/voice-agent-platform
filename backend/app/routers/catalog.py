@@ -26,10 +26,15 @@ databases, the tenant box imports via the export endpoint: GET a version's
 full payload from the platform box and POST it as AdoptionIn.payload —
 no code path ever reads across databases.
 
-Roles: catalog WRITES use require_catalog_admin (deps), which C2 ships
-as "any authenticated operator" and C5 tightens to Super Admin only.
-The adoption log read is likewise restricted by C5; until then it is
-documented as platform-only.
+Roles (C5): catalog WRITES use require_catalog_admin (deps), which is
+Super Admin only — the prompt editor lives on the platform side and
+nowhere else. Catalog READS are Super Admin + Tenant Admin (the
+adoption side). Adoption itself is Tenant Admin only: adoption
+records the adopting tenant, and a Super Admin belongs to the
+platform scope, not to any tenant — at setup the Super Admin
+creates the Tenant Admin account, and the Tenant Admin adopts.
+The adoption log is the platform view: Super Admin sees all
+tenants, Tenant Admin sees only their own tenant.
 """
 import re
 
@@ -39,7 +44,13 @@ from sqlalchemy.orm import Session
 from ..box import box_tenant_slug
 from ..config import settings
 from ..db import get_db
-from ..deps import get_current_user, require_catalog_admin
+from ..deps import (
+    get_current_user,
+    require_catalog_admin,
+    require_catalog_reader,
+    require_tenant_admin,
+    require_tenant_admin_or_super,
+)
 from ..models import (
     AdoptionLog,
     AgentConfig,
@@ -157,7 +168,7 @@ def _latest_version(db: Session, agent_id: str) -> int:
 
 
 @router.get("/agents", response_model=list[CatalogAgentOut])
-def list_catalog_agents(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def list_catalog_agents(user: User = Depends(require_catalog_reader), db: Session = Depends(get_db)):
     rows = db.query(CatalogAgent).order_by(CatalogAgent.created_at).all()
     return [_agent_out(db, user, ca) for ca in rows]
 
@@ -196,7 +207,7 @@ def create_catalog_agent(body: CatalogAgentIn, user: User = Depends(require_cata
 
 
 @router.get("/agents/{slug_or_id}", response_model=CatalogAgentOut)
-def get_catalog_agent(slug_or_id: str, user: User = Depends(get_current_user),
+def get_catalog_agent(slug_or_id: str, user: User = Depends(require_catalog_reader),
                       db: Session = Depends(get_db)):
     return _agent_out(db, user, _resolve_agent(db, slug_or_id))
 
@@ -230,7 +241,7 @@ def publish_version(slug_or_id: str, body: CatalogVersionIn,
 
 
 @router.get("/agents/{slug_or_id}/versions/{version}/export")
-def export_version(slug_or_id: str, version: int, user: User = Depends(get_current_user),
+def export_version(slug_or_id: str, version: int, user: User = Depends(require_catalog_reader),
                    db: Session = Depends(get_db)):
     """Full version payload for cross-box adoption import (POST it as
     AdoptionIn.payload on the tenant box). No customer data — prompt
@@ -261,7 +272,7 @@ def export_version(slug_or_id: str, version: int, user: User = Depends(get_curre
 
 
 @router.post("/adoptions", response_model=AdoptionOut, status_code=status.HTTP_201_CREATED)
-def adopt_version(body: AdoptionIn, user: User = Depends(get_current_user),
+def adopt_version(body: AdoptionIn, user: User = Depends(require_tenant_admin),
                   db: Session = Depends(get_db)):
     """Adopt a catalog version into this tenant's own database.
 
@@ -412,7 +423,7 @@ def adopt_version(body: AdoptionIn, user: User = Depends(get_current_user),
 
 
 @router.get("/adoptions", response_model=list[AdoptionOut])
-def list_adoptions(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def list_adoptions(user: User = Depends(require_tenant_admin), db: Session = Depends(get_db)):
     rows = (
         db.query(TenantAdoption)
         .filter(TenantAdoption.tenant_id == user.tenant_id)
@@ -433,16 +444,16 @@ def list_adoptions(user: User = Depends(get_current_user), db: Session = Depends
 
 
 @router.get("/adoption-log", response_model=list[AdoptionLogOut])
-def list_adoption_log(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def list_adoption_log(user: User = Depends(require_tenant_admin_or_super),
+                      db: Session = Depends(get_db)):
     """Platform view: exactly which tenant runs which version. No
-    customer data — tenant slug, agent, version, who, when. (C5
-    restricts this to Super Admin; until then it is documented as
-    platform-only.)"""
-    rows = (
-        db.query(AdoptionLog)
-        .order_by(AdoptionLog.adopted_at.desc())
-        .all()
-    )
+    customer data — tenant slug, agent, version, who, when.
+    Super Admin sees all tenants; Tenant Admin sees only their own
+    tenant's rows."""
+    query = db.query(AdoptionLog)
+    if user.role == "tenant_admin":
+        query = query.filter(AdoptionLog.tenant_id == user.tenant_id)
+    rows = query.order_by(AdoptionLog.adopted_at.desc()).all()
     return [
         AdoptionLogOut(
             tenant_id=r.tenant_id, tenant_slug=r.tenant_slug or "",

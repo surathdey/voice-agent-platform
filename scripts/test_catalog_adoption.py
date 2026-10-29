@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import os
 """Epic C, story C2 acceptance tests: catalog + adoption + campaign pinning.
 
 Usage:  python3 scripts/test_catalog_adoption.py [base_url]  (default http://localhost:8000)
@@ -101,6 +102,12 @@ _, login = call("POST", "/api/auth/login",
                 {"email": "demo@qgbs.example", "password": "demo-password"}, expect=200)
 TOKEN = login["access_token"]
 
+# C5: catalog writes + agent PUT are Super Admin only.
+_, super_login = call("POST", "/api/auth/login",
+                     {"email": os.environ.get("SUPER_ADMIN_EMAIL", "super@platform.example"),
+                      "password": os.environ.get("SUPER_ADMIN_PASSWORD", "super-password")})
+SUPER = super_login["access_token"]
+
 print("── catalog starts empty ────────────────────────")
 _, cat = call("GET", "/api/catalog/agents", token=TOKEN, expect=200)
 check("catalog empty on fresh DB", cat == [], f"got={cat}")
@@ -109,17 +116,17 @@ print("── publish v1 + v2 (immutable) ────────────�
 _, ca = call("POST", "/api/catalog/agents", {
     "slug": "test-rpi", "name": "Test RPI", "stage": "RPI",
     "purpose": "C2 test catalog agent",
-}, token=TOKEN, expect=201)
+}, **{"token": SUPER}, expect=201)
 check("catalog slug test-rpi", ca["slug"] == "test-rpi", f"got={ca}")
 _, v1 = call("POST", "/api/catalog/agents/test-rpi/versions", {
     "prompt": V1, "note": "v1", "suitable_for": "managed",
     "model": "gpt-4o", "validated_on": "Vapi managed",
-}, token=TOKEN, expect=201)
+}, **{"token": SUPER}, expect=201)
 check("v1 published as version 1", v1["version"] == 1, f"got={v1}")
 _, v2 = call("POST", "/api/catalog/agents/test-rpi/versions", {
     "prompt": V2, "note": "v2", "suitable_for": "self_hosted",
     "model": "sarvam-105b", "validated_on": "",
-}, token=TOKEN, expect=201)
+}, **{"token": SUPER}, expect=201)
 check("v2 published as version 2", v2["version"] == 2, f"got={v2}")
 _, ca = call("GET", "/api/catalog/agents/test-rpi", token=TOKEN, expect=200)
 check("v1 text unchanged after v2 publish",
@@ -195,7 +202,7 @@ print("── publish + adopt v3, old campaign unaffected ─")
 _, v3 = call("POST", "/api/catalog/agents/test-rpi/versions", {
     "prompt": V3, "note": "v3", "suitable_for": "managed",
     "model": "gpt-4o", "validated_on": "Vapi managed",
-}, token=TOKEN, expect=201)
+}, **{"token": SUPER}, expect=201)
 check("v3 published as version 3", v3["version"] == 3, f"got={v3}")
 _, ad3 = call("POST", "/api/catalog/adoptions",
               {"catalog_agent_id": "test-rpi", "version": 3}, token=TOKEN, expect=201)
@@ -240,7 +247,7 @@ print("── manual edit diverges from catalog ──────────�
 _, agent_now = call("GET", f"/api/agents/{agent_id}", token=TOKEN, expect=200)
 edited = dict(agent_now)
 edited["prompt"] = V3.replace("PINNED_EPSILON", "PINNED_EPSILON") + "\nEDITED LINE\n"
-_, upd = call("PUT", f"/api/agents/{agent_id}", edited, token=TOKEN, expect=200)
+_, upd = call("PUT", f"/api/agents/{agent_id}", edited, **{"token": SUPER}, expect=200)
 _, camp3 = call("POST", "/api/campaigns", {
     "agent_id": agent_id, "name": "C2 diverged", "product": "vehicle_loan",
     "provider_mode": "managed",
@@ -253,11 +260,11 @@ check("diverged agent: campaign pins no catalog version",
 print("── cross-box import mode ───────────────────────")
 _, ca_imp = call("POST", "/api/catalog/agents", {
     "slug": "test-imp", "name": "Test Imp", "stage": "RPI",
-}, token=TOKEN, expect=201)
+}, **{"token": SUPER}, expect=201)
 _, v_imp = call("POST", "/api/catalog/agents/test-imp/versions", {
     "prompt": V2, "note": "imp v1", "suitable_for": "both",
     "model": "gpt-4o", "validated_on": "Vapi managed",
-}, token=TOKEN, expect=201)
+}, **{"token": SUPER}, expect=201)
 _, payload = call("GET", "/api/catalog/agents/test-imp/versions/1/export",
                   token=TOKEN, expect=200)
 check("export payload carries prompt + version",

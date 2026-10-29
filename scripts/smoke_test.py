@@ -156,6 +156,22 @@ _, login = call("POST", "/api/auth/login",
                 {"email": "demo@qgbs.example", "password": "demo-password"})
 token = login["access_token"]
 assert login["tenant_name"] == "QGBS", login
+
+# C5: agent writes + tenant creation are Super Admin only.
+_, super_login = call("POST", "/api/auth/login",
+                {"email": _os.environ.get("SUPER_ADMIN_EMAIL", "super@platform.example"),
+                 "password": _os.environ.get("SUPER_ADMIN_PASSWORD", "super-password")})
+STOKEN = super_login["access_token"]
+
+
+def create_tenant_main(body):
+    """C5: tenant creation is Super Admin only and invite-based."""
+    _, t = call("POST", "/api/tenants", body, **{"token": STOKEN})
+    _, st = call("POST", "/api/auth/setup",
+                 {"invite_id": t["invite_id"],
+                  "token": t["setup_url"].split("token=")[1],
+                  "otp": t["dev_otp"], "password": "smoke-password"})
+    return t, st["access_token"]
 call("POST", "/api/auth/login", {"email": "demo@qgbs.example", "password": "wrong"}, expect=401)
 
 print("── A1: tenancy ───────────────────────────────")
@@ -178,29 +194,27 @@ _, created = call("POST", "/api/agents", {
     "prompt": "ROLE\nYou remind.\n\nFLOW\n1. Remind.\n\nDISPOSITIONS\n- REMINDER_ACKED\n\nCLOSINGS\nBye.",
     "llm_model": "sarvam-105b",
     "captured_fields": [{"name": "payment_date", "type": "date", "description": "Date stated"}],
-}, token=token, expect=201)
+    "tenant_id": qgbs_id,
+}, **{"token": STOKEN}, expect=201)
 aid = created["agent_id"]
 assert created["prompt_version"] == 1
 v1_prompt = created["prompt"]
 
 _, updated = call("PUT", f"/api/agents/{aid}", {
     **created, "prompt": v1_prompt + "\nExtra line in v2.",
-}, token=token)
+}, **{"token": STOKEN})
 assert updated["prompt_version"] == 2, updated
 _, versions = call("GET", f"/api/agents/{aid}/prompt-versions", token=token)
 assert [v["version"] for v in versions] == [2, 1], versions
 
-_, rolled = call("POST", f"/api/agents/{aid}/prompt-versions/1/rollback", token=token)
+_, rolled = call("POST", f"/api/agents/{aid}/prompt-versions/1/rollback", **{"token": STOKEN})
 assert rolled["prompt"] == v1_prompt and rolled["prompt_version"] == 3, rolled
 _, versions = call("GET", f"/api/agents/{aid}/prompt-versions", token=token)
 assert [v["version"] for v in versions] == [3, 2, 1], versions
 assert versions[0]["note"].startswith("Rollback to v1"), versions[0]
 
 print("── A1 acceptance: tenant isolation ───────────")
-_, t2 = call("POST", "/api/tenants", {"name": "OtherCo", "market": "IN"})
-_, login2 = call("POST", "/api/auth/login",
-                 {"email": t2["admin_email"], "password": t2["admin_password"]})
-token2 = login2["access_token"]
+t2, token2 = create_tenant_main({"name": "OtherCo", "market": "IN"})
 _, agents2 = call("GET", "/api/agents", token=token2)
 assert agents2 == [], f"other tenant sees agents: {agents2}"
 call("GET", f"/api/agents/{aid}", token=token2, expect=404)
@@ -720,6 +734,37 @@ def call6(base, method, path, body=None, token=None, expect=None,
     return status, parsed
 
 
+
+
+def super6(base):
+    """Super Admin token for a 6-section instance (boot env creds)."""
+    _s, lg = call6(base, "POST", "/api/auth/login",
+                   {"email": _os.environ.get("SUPER_ADMIN_EMAIL", "super@platform.example"),
+                    "password": _os.environ.get("SUPER_ADMIN_PASSWORD", "super-password")})
+    return lg["access_token"]
+
+
+def tenant6(base, tok):
+    _s, me = call6(base, "GET", "/api/tenants/me", **{"token": tok})
+    return me["tenant_id"]
+
+
+def create_agent6(base, body, demo_tok):
+    """C5: agent writes are Super Admin only, explicit tenant."""
+    _s, ag = call6(base, "POST", "/api/agents",
+                   {**body, "tenant_id": tenant6(base, demo_tok)},
+                   **{"token": super6(base)}, expect=201)
+    return _s, ag
+
+
+def create_tenant6(base, body):
+    """C5: tenant creation is Super Admin only and invite-based."""
+    _s, t = call6(base, "POST", "/api/tenants", body, **{"token": super6(base)})
+    _s, st = call6(base, "POST", "/api/auth/setup",
+                   {"invite_id": t["invite_id"],
+                    "token": t["setup_url"].split("token=")[1],
+                    "otp": t["dev_otp"], "password": "smoke-password"})
+    return t, st["access_token"]
 def upload6(base, path, csv_text, token, mapping):
     boundary = "----smoke6" + uuid.uuid4().hex
     parts = [
@@ -1064,11 +1109,11 @@ try:
            and cf2["bn_transcriber_provider"]["source"] == "default", cf2.get("bn_transcriber_model"))
 
     print("── A6: agent voice gender picks the profile's male voice ──")
-    _, male_agent = call6(baseM, "POST", "/api/agents", {
+    _, male_agent = create_agent6(baseM, {
         "name": "A6 Male Voice Agent", "voice_gender": "male",
         "prompt": rpiM["prompt"], "language_rule": rpiM["language_rule"],
         "captured_fields": rpiM["captured_fields"],
-    }, token=tokenM, expect=201)
+    }, tokenM)
     check6("agent stores voice_gender = male", male_agent["voice_gender"] == "male", male_agent)
     before = len([r for r in FAKE["requests"] if r["path"] == "/call/phone"])
     cidG = campaign6(baseM, tokenM, male_agent["agent_id"], "A6 — Male Voice Batch",
@@ -1794,7 +1839,7 @@ try:
         "SARVAM_WS_URL": MOCK_STT8_URL, "SARVAM_BASE_URL": MOCK_AI_URL,
     })
     tokenA8 = login6(baseA8)
-    _, scripted = call6(baseA8, "POST", "/api/agents", {
+    _, scripted = create_agent6(baseA8, {
         "name": "A8 Scripted Survey Agent",
         "purpose": "Generic scripted test agent (design A8 acceptance)",
         "prompt": _SCRIPTED_PROMPT_8,
@@ -1803,7 +1848,7 @@ try:
         "language_rule": {"default": "hi-IN", "by_state": {"West Bengal": "bn-IN"}},
         "captured_fields": [{"name": "favourite_colour", "type": "string",
                              "description": "The callee's favourite colour"}],
-    }, token=tokenA8, expect=201)
+    }, tokenA8)
     check6("A8: scripted test agent created with its single prompt + captured field",
            scripted["name"] == "A8 Scripted Survey Agent"
            and scripted["max_turns"] == 50, scripted.get("name"))
@@ -1930,13 +1975,13 @@ try:
     MOCK_AI["classify_mode"] = "ok"
 
     # ── guards: max_turns and max_duration end the loop honestly ────
-    _, agent_mt = call6(baseA8, "POST", "/api/agents", {
+    _, agent_mt = create_agent6(baseA8, {
         "name": "A8 Max Turns Agent", "prompt": _SCRIPTED_PROMPT_8,
         "tts_voice_id": "bulbul-bn-female-1", "max_turns": 1,
         "language_rule": {"default": "hi-IN", "by_state": {"West Bengal": "bn-IN"}},
         "captured_fields": [{"name": "favourite_colour", "type": "string",
                              "description": "The callee's favourite colour"}],
-    }, token=tokenA8, expect=201)
+    }, tokenA8)
     cidMT = campaign6(baseA8, tokenA8, agent_mt["agent_id"], "A8 — Max Turns Batch",
                       "self_hosted",
                       "callee_name,phone_number,bank_name,state\n"
@@ -1961,13 +2006,13 @@ try:
            and [t["speaker"] for t in doneMT["transcript"]] == ["agent", "customer"],
            doneMT and doneMT["end_reason"])
 
-    _, agent_md = call6(baseA8, "POST", "/api/agents", {
+    _, agent_md = create_agent6(baseA8, {
         "name": "A8 Max Duration Agent", "prompt": _SCRIPTED_PROMPT_8,
         "tts_voice_id": "bulbul-bn-female-1", "max_duration_s": 1,
         "language_rule": {"default": "hi-IN", "by_state": {"West Bengal": "bn-IN"}},
         "captured_fields": [{"name": "favourite_colour", "type": "string",
                              "description": "The callee's favourite colour"}],
-    }, token=tokenA8, expect=201)
+    }, tokenA8)
     cidMD = campaign6(baseA8, tokenA8, agent_md["agent_id"], "A8 — Max Duration Batch",
                       "self_hosted",
                       "callee_name,phone_number,bank_name,state\n"
@@ -2257,24 +2302,24 @@ try:
     tokenA9 = login6(baseA9)
 
     # ── config surface: the silence knobs exist with design defaults ──
-    _, agB9 = call6(baseA9, "POST", "/api/agents", {
+    _, agB9 = create_agent6(baseA9, {
         "name": "A9 Barge Agent", "prompt": _PROMPT_B_9,
         "tts_voice_id": "bulbul-bn-female-1",
         "language_rule": {"default": "hi-IN", "by_state": {"West Bengal": "bn-IN"}},
         "captured_fields": [{"name": "account_holder", "type": "boolean",
                              "description": "Whether the callee is the account holder"}],
-    }, token=tokenA9, expect=201)
+    }, tokenA9)
     check6("A9: silence config defaults — prompt after 8s, 1 prompt before the close (§5.2)",
            agB9["silence_prompt_after_s"] == 8 and agB9["silence_max_prompts"] == 1,
            {k: agB9.get(k) for k in ("silence_prompt_after_s", "silence_max_prompts")})
-    _, agS9 = call6(baseA9, "POST", "/api/agents", {
+    _, agS9 = create_agent6(baseA9, {
         "name": "A9 Silence Agent", "prompt": _PROMPT_S_9,
         "tts_voice_id": "bulbul-bn-female-1",
         "silence_prompt_after_s": 1, "silence_max_prompts": 1,
         "language_rule": {"default": "hi-IN", "by_state": {"West Bengal": "bn-IN"}},
         "captured_fields": [{"name": "account_holder", "type": "boolean",
                              "description": "Whether the callee is the account holder"}],
-    }, token=tokenA9, expect=201)
+    }, tokenA9)
     check6("A9: silence knobs are agent-configurable (1s / 1 prompt for the test agent)",
            agS9["silence_prompt_after_s"] == 1 and agS9["silence_max_prompts"] == 1,
            {k: agS9.get(k) for k in ("silence_prompt_after_s", "silence_max_prompts")})
@@ -2977,7 +3022,7 @@ try:
         "SARVAM_WS_URL": MOCK_STT11_URL, "SARVAM_BASE_URL": MOCK_AI11_URL,
     })
     tokenB = login6(baseB)
-    _, survey = call6(baseB, "POST", "/api/agents", {
+    _, survey = create_agent6(baseB, {
         "name": "A11 Scripted Survey Agent",
         "purpose": "Browser-harness twin of the A8 scripted agent",
         "prompt": _SCRIPTED_PROMPT_8,
@@ -2986,7 +3031,7 @@ try:
         "language_rule": {"default": "hi-IN", "by_state": {"West Bengal": "bn-IN"}},
         "captured_fields": [{"name": "favourite_colour", "type": "string",
                              "description": "The callee's favourite colour"}],
-    }, token=tokenB, expect=201)
+    }, tokenB)
     cidB = campaign6(baseB, tokenB, survey["agent_id"], "A11 — Context Batch",
                      "self_hosted",
                      "callee_name,phone_number,bank_name,state\n"
@@ -3011,10 +3056,7 @@ try:
            (campsB2["total"], leadsB2["leads"][0]))
 
     print("── A11: tenant isolation on create + stream ──")
-    _, t2B = call6(baseB, "POST", "/api/tenants", {"name": "OtherBrowser", "market": "IN"})
-    _, loginB2 = call6(baseB, "POST", "/api/auth/login",
-                       {"email": t2B["admin_email"], "password": t2B["admin_password"]})
-    tokenB2 = loginB2["access_token"]
+    t2B, tokenB2 = create_tenant6(baseB, {"name": "OtherBrowser", "market": "IN"})
     call6(baseB, "POST", "/api/browser-tests", {"agent_id": survey["agent_id"]},
           token=tokenB2, expect=404)
     call6(baseB, "POST", "/api/browser-tests",
@@ -3124,12 +3166,12 @@ try:
         "SARVAM_WS_URL": MOCK_STT11_URL, "SARVAM_BASE_URL": MOCK_AI11_URL,
     })
     tokenB9 = login6(baseB9)
-    _, barge_agent = call6(baseB9, "POST", "/api/agents", {
+    _, barge_agent = create_agent6(baseB9, {
         "name": "A11 Barge Agent", "prompt": _PROMPT_B_9,
         "tts_voice_id": "bulbul-hi-female-1",
         "language_rule": {"default": "hi-IN"},
         "captured_fields": [],
-    }, token=tokenB9, expect=201)
+    }, tokenB9)
     _, bt9 = call6(baseB9, "POST", "/api/browser-tests", {
         "agent_id": barge_agent["agent_id"],
         "lead": {"name": "Barge Tester", "state": "Bihar"},
@@ -3259,19 +3301,15 @@ try:
 
     # ── load: 500 stub leads to completion + a zero-lead no-op ──────
     baseL = start_app6(18115, "load", {})
-    _s, tenantL = call6(baseL, "POST", "/api/tenants", {
-        "name": "A12 Load Co", "market": "IN", "concurrency_limit": 1000})
-    _s, loginL = call6(baseL, "POST", "/api/auth/login", {
-        "email": tenantL["admin_email"], "password": tenantL["admin_password"]})
-    tokenL = loginL["access_token"]
-    _s, agentL = call6(baseL, "POST", "/api/agents", {
+    tenantL, tokenL = create_tenant6(baseL, {"name": "A12 Load Co", "market": "IN", "concurrency_limit": 1000})
+    _s, agentL = create_agent6(baseL, {
         "name": "A12 Load Agent",
         "prompt": "ROLE\nYou verify identity for the lender.\n\nFLOW\n"
                   "1. Greet and ask.\n\nDISPOSITIONS\n"
                   "- CONFIRMED: the right party confirmed.\n"
                   "- DENIED: the callee denied knowledge.\n"
                   "- CALLBACK: a callback was requested.\n\n"
-                  "CLOSINGS\nClose politely.\n"}, token=tokenL, expect=201)
+                  "CLOSINGS\nClose politely.\n"}, tokenL)
     csvL = ("callee_name,phone_number,bank_name,state\n" + "\n".join(
         f"Load Person {i},9600{i:06d},Tata Capital,West Bengal"
         for i in range(1, 501)) + "\n")
@@ -3441,14 +3479,14 @@ try:
            and fs12["rate_llm_per_min"]["value"] == "5"
            and fs12["rate_tts_per_min"]["value"] == "7",
            (fp12["rate_telephony_per_min"], fs12["rate_tts_per_min"]))
-    _s, agentC = call6(baseC, "POST", "/api/agents", {
+    _s, agentC = create_agent6(baseC, {
         "name": "A12 Cost Survey Agent", "prompt": _SCRIPTED_PROMPT_8,
         "llm_model": "sarvam-105b", "tts_voice_id": "bulbul-bn-female-1",
         "language_rule": {"default": "hi-IN",
                           "by_state": {"West Bengal": "bn-IN"}},
         "captured_fields": [{"name": "favourite_colour", "type": "string",
                              "description": "The callee's favourite colour"}]},
-        token=tokenC, expect=201)
+        tokenC)
     cidC = campaign6(baseC, tokenC, agentC["agent_id"], "A12 — Costed Batch",
                      "self_hosted",
                      "callee_name,phone_number,bank_name,state\n"
@@ -3565,7 +3603,7 @@ try:
            (durB, framesB, cbB))
 
     # ── edge: a very long transcript still classifies ────────────────
-    _s, agentLong = call6(baseC, "POST", "/api/agents", {
+    _s, agentLong = create_agent6(baseC, {
         "name": "A12 Long Survey Agent",
         "prompt": _SCRIPTED_PROMPT_8 + "\nA12 LONG SURVEY\n",
         "llm_model": "sarvam-105b", "tts_voice_id": "bulbul-bn-female-1",
@@ -3573,7 +3611,7 @@ try:
                           "by_state": {"West Bengal": "bn-IN"}},
         "captured_fields": [{"name": "favourite_colour", "type": "string",
                              "description": "The callee's favourite colour"}]},
-        token=tokenC, expect=201)
+        tokenC)
     cls0L = len(MOCK_AI12["classify"])
     _s, btL = call6(baseC, "POST", "/api/browser-tests", {
         "agent_id": agentLong["agent_id"],
@@ -3626,11 +3664,7 @@ try:
            dashC["costs"])
 
     # ── cross-tenant fuzz on every surface ───────────────────────────
-    _s, tenant2 = call6(baseC, "POST", "/api/tenants",
-                        {"name": "A12 Other Co", "market": "IN"})
-    _s, login2 = call6(baseC, "POST", "/api/auth/login", {
-        "email": tenant2["admin_email"], "password": tenant2["admin_password"]})
-    token2 = login2["access_token"]
+    tenant2, token2 = create_tenant6(baseC, {"name": "A12 Other Co", "market": "IN"})
     call6(baseC, "GET", f"/api/campaigns/{cidC}/results", token=token2, expect=404)
     call6(baseC, "GET", f"/api/campaigns/{cidC}/calls", token=token2, expect=404)
     call6(baseC, "POST", f"/api/campaigns/{cidC}/dispatch", token=token2, expect=404)
@@ -3814,14 +3848,10 @@ try:
            (callsF["total"], campF["status"]))
 
     # ── edge: the tenant concurrency cap binds across campaigns ────
-    _s, tenantK = call6(baseE, "POST", "/api/tenants", {
-        "name": "A12 Concurrency Co", "market": "IN", "concurrency_limit": 2})
-    _s, loginK = call6(baseE, "POST", "/api/auth/login", {
-        "email": tenantK["admin_email"], "password": tenantK["admin_password"]})
-    tokenK = loginK["access_token"]
-    _s, agentK = call6(baseE, "POST", "/api/agents", {
+    tenantK, tokenK = create_tenant6(baseE, {"name": "A12 Concurrency Co", "market": "IN", "concurrency_limit": 2})
+    _s, agentK = create_agent6(baseE, {
         "name": "A12 Concurrency Agent", "prompt": _SCRIPTED_PROMPT_8},
-        token=tokenK, expect=201)
+        tokenK)
     cidKA = campaign6(baseE, tokenK, agentK["agent_id"], "A12 — Concurrency A",
                       "managed",
                       "callee_name,phone_number,bank_name,state\n"
@@ -3973,11 +4003,11 @@ try:
                    <= _db_cols(_legacy_path, "agent_configs")
                and {"stt_status", "llm_status", "tts_status"} <= _sess_cols
                and "review_required" in _db_cols(_legacy_path, "call_results"))
-        check6("FIX: schema_migrations records exactly versions 1-13",
+        check6("FIX: schema_migrations records exactly versions 1-14",
                [r[0] for r in _db_query(
                    _legacy_path,
                    "SELECT version FROM schema_migrations ORDER BY version")]
-               == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13])
+               == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14])
         _recorded_before = _db_query(
             _legacy_path,
             "SELECT version, name, applied_at FROM schema_migrations "
@@ -4020,7 +4050,7 @@ try:
     baseF = start_app6(18120, "freshmig", {})
     _fresh_path = os.path.join(TMP6, "freshmig.db")
     check6("FIX: a fresh database boots to the identical final schema "
-           "with a complete 1-13 migration record",
+           "with a complete 1-14 migration record",
            "timezone" in _db_cols(_fresh_path, "tenants")
            and "channel" in _db_cols(_fresh_path, "call_sessions")
            and "recording_s3_key" in _db_cols(_fresh_path, "call_sessions")
@@ -4028,7 +4058,7 @@ try:
            and [r[0] for r in _db_query(
                _fresh_path,
                "SELECT version FROM schema_migrations ORDER BY version")]
-           == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13])
+           == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14])
 
     # ── B2: the second seeded agent — Payment Reminder ─────────────
     # Runs after the A1–A10 sections: the BASE (stub-mode) parts add

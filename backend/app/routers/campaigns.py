@@ -26,10 +26,19 @@ from sqlalchemy.orm import Session
 
 from .. import providers as prov
 from ..db import get_db
-from ..deps import get_current_user
+from ..deps import (
+    case_scope,
+    get_current_user,
+    require_tenant_admin,
+    require_team_leader,
+    team_caller_ids,
+    ROLE_CALLER,
+    ROLE_SUPER_ADMIN,
+)
 from ..models import AgentConfig, CallResult, CallSession, Campaign, Lead, PromptVersion, User
 from ..schemas import (
     PRODUCTS,
+    AllocateIn,
     CampaignIn,
     CampaignOut,
     CampaignStatusIn,
@@ -49,7 +58,11 @@ TRANSITIONS = {
 }
 
 CORE_TARGETS = {"name", "phone_number", "bank_name", "state", "product_identifier"}
-ALL_TARGETS = CORE_TARGETS | {"agent_field", "ignore"}
+# C5: "caller" maps a column to the case's Caller (by email, else by
+# exact name) — the plan's Q3 lead-file shape ("as-is, or with
+# allocation data + caller name"). Unresolved or ambiguous caller
+# values leave the lead unallocated and are reported, never guessed.
+ALL_TARGETS = CORE_TARGETS | {"agent_field", "ignore", "caller"}
 
 # Header aliases used to SUGGEST a mapping in the preview (operator confirms).
 ALIASES = {
@@ -107,13 +120,29 @@ def _read_csv(raw: bytes) -> tuple[list[str], list[dict]]:
 
 
 def _get_scoped(db: Session, user: User, campaign_id: str) -> Campaign:
+    """Tenant-scoped campaign, plus C5 visibility: Super Admin sees
+    no tenant customer data (404, indistinguishable from missing);
+    a Caller sees only campaigns holding at least one of their own
+    allocated cases; Tenant Admin and Team Leader see any campaign
+    of the tenant (the Leader allocates from, and supervises, the
+    tenant's campaigns — their lead/call/queue lists are what is
+    scoped, not campaign metadata)."""
     c = (
         db.query(Campaign)
         .filter(Campaign.campaign_id == campaign_id, Campaign.tenant_id == user.tenant_id)
         .first()
     )
-    if c is None:
+    if c is None or user.role == ROLE_SUPER_ADMIN:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Campaign not found")
+    if user.role == ROLE_CALLER:
+        own = (
+            db.query(Lead)
+            .filter(Lead.campaign_id == c.campaign_id,
+                    Lead.assigned_caller_id == user.user_id)
+            .first()
+        )
+        if own is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Campaign not found")
     return c
 
 
@@ -207,17 +236,22 @@ def _validate(body: CampaignIn) -> None:
 
 @router.get("", response_model=list[CampaignOut])
 def list_campaigns(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    rows = (
-        db.query(Campaign)
-        .filter(Campaign.tenant_id == user.tenant_id)
-        .order_by(Campaign.created_at)
-        .all()
-    )
+    # C5: Super Admin lists no tenant campaigns (no customer data);
+    # a Caller lists only campaigns holding their own cases.
+    if user.role == ROLE_SUPER_ADMIN:
+        raise HTTPException(status.HTTP_403_FORBIDDEN,
+                            "Super Admin sees no tenant customer data")
+    query = db.query(Campaign).filter(Campaign.tenant_id == user.tenant_id)
+    if user.role == ROLE_CALLER:
+        own_campaigns = (db.query(Lead.campaign_id)
+                         .filter(Lead.assigned_caller_id == user.user_id))
+        query = query.filter(Campaign.campaign_id.in_(own_campaigns))
+    rows = query.order_by(Campaign.created_at).all()
     return [_out(db, c) for c in rows]
 
 
 @router.post("", response_model=CampaignOut, status_code=status.HTTP_201_CREATED)
-def create_campaign(body: CampaignIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def create_campaign(body: CampaignIn, user: User = Depends(require_tenant_admin), db: Session = Depends(get_db)):
     _validate(body)
     agent = _agent_scoped(db, user, body.agent_id)  # bound agent must be this tenant's
     c = Campaign(tenant_id=user.tenant_id, status="draft")
@@ -235,7 +269,7 @@ def get_campaign(campaign_id: str, user: User = Depends(get_current_user), db: S
 
 
 @router.put("/{campaign_id}", response_model=CampaignOut)
-def update_campaign(campaign_id: str, body: CampaignIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def update_campaign(campaign_id: str, body: CampaignIn, user: User = Depends(require_tenant_admin), db: Session = Depends(get_db)):
     c = _get_scoped(db, user, campaign_id)
     _validate(body)
     agent = _agent_scoped(db, user, body.agent_id)
@@ -255,7 +289,7 @@ def update_campaign(campaign_id: str, body: CampaignIn, user: User = Depends(get
 
 
 @router.delete("/{campaign_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_campaign(campaign_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def delete_campaign(campaign_id: str, user: User = Depends(require_tenant_admin), db: Session = Depends(get_db)):
     c = _get_scoped(db, user, campaign_id)
     # Delete in foreign-key order: call results -> call sessions -> leads ->
     # campaign. Sessions reference both the campaign and its leads, results
@@ -278,7 +312,7 @@ def delete_campaign(campaign_id: str, user: User = Depends(get_current_user), db
 
 
 @router.post("/{campaign_id}/status", response_model=CampaignOut)
-def set_status(campaign_id: str, body: CampaignStatusIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def set_status(campaign_id: str, body: CampaignStatusIn, user: User = Depends(require_tenant_admin), db: Session = Depends(get_db)):
     c = _get_scoped(db, user, campaign_id)
     allowed = TRANSITIONS.get(c.status, set())
     if body.status not in allowed:
@@ -301,6 +335,9 @@ def _lead_out(l: Lead) -> LeadOut:
         agent_fields=l.agent_fields or {}, attempt_count=l.attempt_count,
         status=l.status,
         next_attempt_at=l.next_attempt_at.isoformat() if l.next_attempt_at else None,
+        assigned_caller_id=l.assigned_caller_id,
+        allocated_by=l.allocated_by,
+        allocated_at=l.allocated_at.isoformat() if l.allocated_at else None,
         created_at=l.created_at.isoformat() if l.created_at else None,
     )
 
@@ -308,16 +345,58 @@ def _lead_out(l: Lead) -> LeadOut:
 @router.get("/{campaign_id}/leads", response_model=LeadListOut)
 def list_leads(campaign_id: str, limit: int = 500, offset: int = 0,
                user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    c = _get_scoped(db, user, campaign_id)  # 404 unless this tenant's campaign
+    c = _get_scoped(db, user, campaign_id)  # 404 unless visible to this role
+    # C5 case scoping: Tenant Admin sees all; Team Leader sees their
+    # team's cases PLUS the unallocated pool (allocation starts
+    # there); Caller sees only their own cases.
     q = db.query(Lead).filter(Lead.campaign_id == c.campaign_id)
+    scope = case_scope(user, db)
+    if scope != "ALL":
+        if user.role == ROLE_CALLER:
+            q = q.filter(Lead.assigned_caller_id == user.user_id)
+        else:  # Team Leader: team's + unallocated
+            q = q.filter((Lead.assigned_caller_id.in_(scope)) |
+                         (Lead.assigned_caller_id.is_(None)))
     total = q.count()
     rows = q.order_by(Lead.created_at, Lead.lead_id).offset(offset).limit(limit).all()
     return LeadListOut(total=total, leads=[_lead_out(l) for l in rows])
 
 
+@router.post("/{campaign_id}/leads/{lead_id}/allocate")
+def allocate_lead(campaign_id: str, lead_id: str, body: AllocateIn,
+                  user: User = Depends(require_team_leader), db: Session = Depends(get_db)):
+    """Manual case allocation — Team Leader ONLY (decided 2026-10-29;
+    the Tenant Admin does NOT allocate). The Caller must be on the
+    Leader's team; the lead must be in this campaign and tenant.
+    caller_id None unallocates. The audit (who + when) rides on the
+    lead row itself."""
+    from datetime import datetime
+    c = _get_scoped(db, user, campaign_id)
+    lead = (db.query(Lead)
+            .filter(Lead.lead_id == lead_id, Lead.campaign_id == c.campaign_id)
+            .first())
+    if lead is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Lead not found")
+    if body.caller_id is not None:
+        caller = db.get(User, body.caller_id)
+        if (caller is None or caller.tenant_id != user.tenant_id
+                or caller.role != "caller"
+                or caller.user_id not in team_caller_ids(user, db)):
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                                "Allocate only to a Caller on your team")
+        lead.assigned_caller_id = caller.user_id
+    else:
+        lead.assigned_caller_id = None
+    lead.allocated_by = user.user_id
+    lead.allocated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(lead)
+    return _lead_out(lead)
+
+
 @router.get("/{campaign_id}/export")
 def export_campaign(campaign_id: str,
-                    user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+                    user: User = Depends(require_tenant_admin), db: Session = Depends(get_db)):
     """The whole campaign as a spreadsheet (xlsx): campaign details,
     one row per lead with its latest result, and one row per call with
     recording link and full transcript. The Calls sheet matches the
@@ -514,7 +593,7 @@ def export_campaign(campaign_id: str,
 
 @router.post("/{campaign_id}/leads/preview")
 async def preview_leads(campaign_id: str, file: UploadFile = File(...),
-                        user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+                        user: User = Depends(require_tenant_admin), db: Session = Depends(get_db)):
     """Parse an uploaded CSV without storing anything: headers, row count,
     sample rows and a SUGGESTED column mapping for the operator to confirm."""
     c = _get_scoped(db, user, campaign_id)
@@ -533,15 +612,19 @@ async def preview_leads(campaign_id: str, file: UploadFile = File(...),
 @router.post("/{campaign_id}/leads/upload", response_model=UploadResultOut)
 async def upload_leads(campaign_id: str, file: UploadFile = File(...),
                        mapping: str = Form(...),
-                       user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+                       user: User = Depends(require_tenant_admin), db: Session = Depends(get_db)):
     """Store leads from a CSV using the confirmed column mapping.
 
     mapping: JSON object {csv_column: target}; target ∈ name | phone_number |
-    bank_name | state | product_identifier | agent_field | ignore.
+    bank_name | state | product_identifier | agent_field | ignore | caller.
     Rows with no phone number are invalid; a phone already in this campaign
     (or repeated in the file) is a duplicate and is skipped — the same
     behaviour the wireframes show ("858 valid · 2 duplicates skipped").
+    A caller column assigns the case at upload (the file's allocation
+    data, plan Q3); unresolved or ambiguous caller values leave the
+    lead unallocated and are reported in unresolved_callers.
     """
+    from datetime import datetime
     c = _get_scoped(db, user, campaign_id)
     try:
         mapping = json.loads(mapping)
@@ -557,10 +640,18 @@ async def upload_leads(campaign_id: str, file: UploadFile = File(...),
     headers, rows = _read_csv(await file.read())
     identifier_type = PRODUCTS.get(c.product, PRODUCTS["other"])["identifier_type"]
     seen = {p for (p,) in db.query(Lead.phone_number).filter(Lead.campaign_id == c.campaign_id)}
+    callers = (db.query(User).filter(User.tenant_id == user.tenant_id,
+                                     User.role == "caller").all())
+    by_email = {u.email.lower(): u for u in callers}
+    by_name: dict[str, list] = {}
+    for u in callers:
+        by_name.setdefault(u.name.strip().lower(), []).append(u)
     created = duplicates = invalid = 0
+    unresolved: list[str] = []
     for row in rows:
         fields = {"name": "", "phone_number": "", "bank_name": "", "state": ""}
         agent_fields = {}
+        caller_value = ""
         for col, target in mapping.items():
             if target == "ignore" or col not in row:
                 continue
@@ -571,6 +662,8 @@ async def upload_leads(campaign_id: str, file: UploadFile = File(...),
                 if value:
                     agent_fields["product_identifier"] = value
                     agent_fields["product_identifier_type"] = identifier_type
+            elif target == "caller":
+                caller_value = value.strip()
             else:  # agent_field — keep under the normalised column name
                 if value:
                     agent_fields[_norm_header(col)] = value
@@ -582,12 +675,26 @@ async def upload_leads(campaign_id: str, file: UploadFile = File(...),
             duplicates += 1
             continue
         seen.add(phone)
+        assigned = None
+        if caller_value:
+            match = by_email.get(caller_value.lower())
+            if match is None:
+                names = by_name.get(caller_value.lower(), [])
+                match = names[0] if len(names) == 1 else None
+            if match is not None:
+                assigned = match.user_id
+            elif caller_value not in unresolved:
+                unresolved.append(caller_value)
         db.add(Lead(
             tenant_id=user.tenant_id, campaign_id=c.campaign_id,
             phone_number=phone, name=fields["name"], bank_name=fields["bank_name"],
             state=fields["state"], agent_fields=agent_fields,
+            assigned_caller_id=assigned,
+            allocated_by=user.user_id if assigned else None,
+            allocated_at=datetime.utcnow() if assigned else None,
         ))
         created += 1
     db.commit()
     return UploadResultOut(total_rows=len(rows), created=created,
-                           duplicates_skipped=duplicates, invalid_skipped=invalid)
+                           duplicates_skipped=duplicates, invalid_skipped=invalid,
+                           unresolved_callers=unresolved)
