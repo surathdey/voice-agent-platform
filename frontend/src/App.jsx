@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import React, { useEffect, useState } from 'react'
 import Agents from './pages/Agents'
 import AgentEditor from './pages/AgentEditor'
 import Campaigns from './pages/Campaigns'
@@ -8,80 +8,119 @@ import Settings from './pages/Settings'
 import Calls from './pages/Calls'
 import Dashboard from './pages/Dashboard'
 import BrowserTest from './pages/BrowserTest'
+import PlatformDashboard from './pages/PlatformDashboard'
+import Tenants from './pages/Tenants'
+import CatalogAuthoring from './pages/CatalogAuthoring'
 import { api, clearSession, getUser, setSession } from './api'
 
 const NAV = ['Dashboard', 'Campaigns', 'Agents', 'Calls', 'Browser Test', 'Journey', 'Human Queue', 'Settings']
 const ENABLED = ['Dashboard', 'Campaigns', 'Agents', 'Calls', 'Browser Test', 'Settings'] // later chunks enable the rest
 const NAV_VIEW = { Dashboard: 'dashboard', Campaigns: 'campaigns', Agents: 'agents', Calls: 'calls', 'Browser Test': 'browsertest', Settings: 'settings' }
+// Super Admin (Epic C): platform tabs ONLY — tenant tabs (Dashboard,
+// Campaigns, Calls, Settings, …) are never rendered for this role, so
+// the user is never shown a page the backend will then forbid.
+const SUPER_NAV = ['Platform Dashboard', 'Catalog', 'Tenants']
+const SUPER_VIEW = { 'Platform Dashboard': 'platform', Catalog: 'catalogadmin', Tenants: 'tenants' }
+const SUPER_VIEWS = ['platform', 'catalogadmin', 'tenants']
+const ROLE_LABEL = { super_admin: 'Super Admin', tenant_admin: 'Tenant Admin', team_leader: 'Team Leader', caller: 'Caller' }
 
 export default function App() {
   const [user, setUser] = useState(getUser())
   const [view, setView] = useState({ name: 'dashboard' })
 
+  // Older stored sessions predate the role field on login: refresh it
+  // once from /api/users/me so the sidebar gates on a real role.
+  useEffect(() => {
+    if (user && !user.role) {
+      api('/api/users/me').then((me) => setUser({ ...user, ...me })).catch(() => {})
+    }
+  }, [user])
+
   if (!user) return <Login onDone={(u) => setUser(u)} />
 
-  const activeNav = view.name === 'editor' ? 'Agents'
-    : ['campaigns', 'wizard', 'campaign'].includes(view.name) ? 'Campaigns'
-    : view.name === 'settings' ? 'Settings'
-    : view.name === 'calls' ? 'Calls'
-    : view.name === 'browsertest' ? 'Browser Test'
-    : view.name === 'dashboard' ? 'Dashboard' : 'Agents'
+  const isSuper = user.role === 'super_admin'
+  // A Super Admin never lands on a tenant view (e.g. a stale default):
+  // tenant views resolve to the Platform Dashboard for this role.
+  const effectiveView = isSuper && !SUPER_VIEWS.includes(view.name) ? 'platform' : view.name
+
+  const activeNav = isSuper
+    ? (effectiveView === 'platform' ? 'Platform Dashboard'
+      : effectiveView === 'catalogadmin' ? 'Catalog'
+      : 'Tenants')
+    : effectiveView === 'editor' ? 'Agents'
+    : ['campaigns', 'wizard', 'campaign'].includes(effectiveView) ? 'Campaigns'
+    : effectiveView === 'settings' ? 'Settings'
+    : effectiveView === 'calls' ? 'Calls'
+    : effectiveView === 'browsertest' ? 'Browser Test'
+    : effectiveView === 'dashboard' ? 'Dashboard' : 'Agents'
 
   return (
     <div className="shell">
       <aside className="sidebar">
         <div className="brand">VOICE AGENT PLATFORM</div>
         <nav>
-          {NAV.map((item) => (
-            <button
-              key={item}
-              className={item === activeNav ? 'active' : ''}
-              disabled={!ENABLED.includes(item)}
-              title={ENABLED.includes(item) ? '' : 'Arrives in a later build chunk'}
-              onClick={() => ENABLED.includes(item) && setView({ name: NAV_VIEW[item] })}
-            >{item}</button>
-          ))}
+          {isSuper
+            ? SUPER_NAV.map((item) => (
+              <button
+                key={item}
+                className={item === activeNav ? 'active' : ''}
+                onClick={() => setView({ name: SUPER_VIEW[item] })}
+              >{item}</button>
+            ))
+            : NAV.map((item) => (
+              <button
+                key={item}
+                className={item === activeNav ? 'active' : ''}
+                disabled={!ENABLED.includes(item)}
+                title={ENABLED.includes(item) ? '' : 'Arrives in a later build chunk'}
+                onClick={() => ENABLED.includes(item) && setView({ name: NAV_VIEW[item] })}
+              >{item}</button>
+            ))}
         </nav>
         <div className="tenant">
           Tenant<b>{user.tenant_name || '—'}</b>
           <span style={{ fontSize: 12.5 }}>{user.email}</span>
+          {user.role && <span style={{ fontSize: 12.5 }}>{ROLE_LABEL[user.role] || user.role}</span>}
           <button className="logout" onClick={() => { clearSession(); setUser(null) }}>Log out</button>
         </div>
       </aside>
       <main className="main">
-        {view.name === 'dashboard' && (
+        {effectiveView === 'platform' && <PlatformDashboard />}
+        {effectiveView === 'catalogadmin' && <CatalogAuthoring />}
+        {effectiveView === 'tenants' && <Tenants />}
+        {effectiveView === 'dashboard' && (
           <Dashboard
             onOpenCalls={() => setView({ name: 'calls' })}
             onOpenCampaigns={() => setView({ name: 'campaigns' })}
           />
         )}
-        {view.name === 'agents' && (
+        {effectiveView === 'agents' && (
           <Agents
             onOpen={(id) => setView({ name: 'editor', id })}
             onNew={() => setView({ name: 'editor', id: null })}
           />
         )}
-        {view.name === 'editor' && (
+        {effectiveView === 'editor' && (
           <AgentEditor agentId={view.id} onBack={() => setView({ name: 'agents' })} />
         )}
-        {view.name === 'campaigns' && (
+        {effectiveView === 'campaigns' && (
           <Campaigns
             onOpen={(id) => setView({ name: 'campaign', id })}
             onNew={() => setView({ name: 'wizard' })}
           />
         )}
-        {view.name === 'wizard' && (
+        {effectiveView === 'wizard' && (
           <CampaignWizard
             onLaunched={(id) => setView({ name: 'campaign', id })}
             onExit={() => setView({ name: 'campaigns' })}
           />
         )}
-        {view.name === 'campaign' && (
+        {effectiveView === 'campaign' && (
           <CampaignDetail campaignId={view.id} onBack={() => setView({ name: 'campaigns' })} />
         )}
-        {view.name === 'settings' && <Settings />}
-        {view.name === 'calls' && <Calls />}
-        {view.name === 'browsertest' && <BrowserTest />}
+        {effectiveView === 'settings' && <Settings />}
+        {effectiveView === 'calls' && <Calls />}
+        {effectiveView === 'browsertest' && <BrowserTest />}
       </main>
     </div>
   )

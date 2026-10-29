@@ -42,6 +42,14 @@ def my_tenant(user: User = Depends(get_current_user), db: Session = Depends(get_
     return _out(tenant)
 
 
+@router.get("", response_model=list[TenantOut])
+def list_tenants(user: User = Depends(require_super_admin), db: Session = Depends(get_db)):
+    """Tenant list (Epic C, Super Admin UI): platform metadata only —
+    tenant records, never customer data. Super Admin only."""
+    tenants = db.query(Tenant).order_by(Tenant.name).all()
+    return [_out(t) for t in tenants]
+
+
 @router.get("/{tenant_id}", response_model=TenantOut)
 def get_tenant(tenant_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     # Tenant scoping: another tenant's record is indistinguishable from
