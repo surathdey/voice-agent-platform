@@ -1,9 +1,13 @@
 """Twilio telephony-leg cost, joined to a platform call.
 
-Join: session.provider_call_id (Vapi call id) -> Vapi GET /call/{id}
--> phoneCallProviderId (Twilio Call SID) -> Twilio REST GET
+Join, managed: session.provider_call_id (Vapi call id) -> Vapi GET
+/call/{id} -> phoneCallProviderId (Twilio Call SID) -> Twilio REST GET
 /Calls/{sid}.json -> price (Twilio reports the charge as a NEGATIVE
 string; stored as a positive cost).
+Join, self-hosted Twilio: session.provider_call_id IS the Twilio Call
+SID already (the status handler stores Twilio's CallSid, "CA…") —
+used directly, no Vapi hop (Oct 26, 2026: the old code resolved
+only via Vapi, so self-hosted calls could never show a Twilio leg).
 
 ensure_twilio_cost() is called from the shared call serializer. It
 fills cost_breakdown["twilio"] + ["total_all_in"] and commits ONLY when
@@ -26,6 +30,7 @@ import base64
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 
 UA = "VoiceAgentPlatform/1.0"
@@ -39,20 +44,46 @@ def _http_json(url, headers, timeout=15):
 
 
 def resolve_twilio_creds(db, tenant_id):
-    """(account_sid, auth_token) or (None, None). Never logged."""
+    """(account_sid, auth_token) or (None, None). Never logged.
+
+    Tenant row first (registry field names account_sid / auth_token,
+    with the transport's legacy auth_id fallback — mirroring
+    providers.twilio_credentials), else platform .env. Fixed
+    Oct 26, 2026: the old code imported ProviderSettings (plural),
+    which does not exist — models.py has ProviderSetting (singular)
+    — so the tenant row was never read and every call fell back to
+    .env. It also read auth_id as the primary SID, where the
+    registry stores account_sid.
+    """
     try:
-        from .models import ProviderSettings
-        row = (db.query(ProviderSettings)
-               .filter(ProviderSettings.tenant_id == tenant_id,
-                       ProviderSettings.provider == "twilio").first())
+        from .models import ProviderSetting
+        row = (db.query(ProviderSetting)
+               .filter(ProviderSetting.tenant_id == tenant_id,
+                       ProviderSetting.provider == "twilio").first())
         f = (row.fields or {}) if row else {}
-        if f.get("auth_id") and f.get("auth_token"):
-            return f["auth_id"], f["auth_token"]
+        sid = f.get("account_sid") or f.get("auth_id")
+        if sid and f.get("auth_token"):
+            return sid, f["auth_token"]
     except Exception:
         pass
     sid = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
     tok = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
     return (sid, tok) if sid and tok else (None, None)
+
+
+def resolve_twilio_sid(db, session):
+    """Twilio Call SID for a session, or None when it cannot be
+    resolved yet. Self-hosted Twilio calls carry the SID directly:
+    the status handler stores Twilio's CallSid as provider_call_id
+    (starts with "CA"), so no Vapi hop is needed — and a Vapi hop
+    would be wrong there (no Vapi record exists for a self-hosted
+    call). Managed calls still resolve via their Vapi record."""
+    if (session.provider_mode or "") == "self_hosted":
+        sid = session.provider_call_id or ""
+        if sid.startswith("CA"):
+            return sid
+        return None
+    return _vapi_twilio_sid(db, session)
 
 
 def _vapi_twilio_sid(db, session):
@@ -111,7 +142,7 @@ def ensure_twilio_cost(db, session, result, cost):
             return cost
         tw_sid = tw.get("call_sid")
         if not tw_sid:
-            tw_sid = _vapi_twilio_sid(db, session)
+            tw_sid = resolve_twilio_sid(db, session)
             if not tw_sid:
                 cost["twilio"] = {"status": "pending",
                                   "note": "Twilio call id not resolved yet"}
@@ -148,3 +179,28 @@ def ensure_twilio_cost(db, session, result, cost):
             except Exception:
                 pass
     return cost
+
+
+def hangup_twilio_call(db, session):
+    """Complete a managed call via Twilio (the managed end-call net).
+
+    Returns True when Twilio accepted the completion. Never raises:
+    any failure returns False so the caller can still acknowledge the
+    webhook (Vapi's phrase detection remains as a fallback). The SID
+    resolves exactly like the cost path (Vapi record's
+    phoneCallProviderId); credentials resolve like the cost path.
+    """
+    try:
+        account_sid, token = resolve_twilio_creds(db, session.tenant_id)
+        twilio_sid = resolve_twilio_sid(db, session)
+        if not account_sid or not token or not twilio_sid:
+            return False
+        cred = base64.b64encode(f"{account_sid}:{token}".encode()).decode()
+        data = urllib.parse.urlencode({"Status": "completed"}).encode()
+        req = urllib.request.Request(
+            f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Calls/{twilio_sid}.json",
+            data=data, headers={"Authorization": f"Basic {cred}"}, method="POST")
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return 200 <= r.status < 300
+    except Exception:
+        return False

@@ -211,10 +211,11 @@ TRANSPORTS: dict[str, object] = {}
 
 
 def _register_real_transports() -> None:
-    from .transports import PlivoTransport, VapiTransport
+    from .transports import PlivoTransport, TwilioTransport, VapiTransport
 
     TRANSPORTS.setdefault("managed", VapiTransport())
     TRANSPORTS.setdefault("self_hosted", PlivoTransport())
+    TRANSPORTS.setdefault("self_hosted_twilio", TwilioTransport())
 
 
 _register_real_transports()
@@ -228,10 +229,23 @@ def resolve_transport(db: Session, tenant_id: str, mode: str):
     a real provider), A4 says the tenant's provider for this mode is
     ready, and a transport for the mode is registered. Otherwise the
     stub — honestly labelled, never disguised as a real call.
+
+    Self-hosted PSTN selection: the tenant's "pstn" setting (plivo |
+    twilio, default plivo) picks the adapter — but only when the chosen
+    provider is actually configured. A Twilio choice without Twilio
+    credentials falls back to Plivo (whose run() then fails honestly
+    if Plivo is not configured either), so a half-finished settings
+    change can never silently place a call on the wrong adapter. The
+    transport NAME reported stays the mode ("self_hosted") either way,
+    so the dispatch report / calls surface is unchanged.
     """
     cfg = prov.get_provider_config(tenant_id, mode, db=db)
     ready = bool(cfg["ready"])
     if settings.TELEPHONY_MODE == mode and ready and mode in TRANSPORTS:
+        if mode == "self_hosted" \
+                and prov.self_hosted_pstn(db, tenant_id) == "twilio" \
+                and prov.twilio_configured(db, tenant_id):
+            return TRANSPORTS["self_hosted_twilio"], mode, True
         return TRANSPORTS[mode], mode, True
     return StubTransport(), StubTransport.name, ready
 
@@ -290,9 +304,28 @@ def _retry_due(db: Session, campaign: Campaign | None, ended_utc: datetime) -> d
 def finalize_attempt(db: Session, session: CallSession, outcome: dict):
     """The one terminal write every mode lands on (§8.2).
 
-    Idempotent: if a CallResult already exists for the session, it is
-    returned unchanged and NOTHING is written (no second result, no
-    session mutation, no extra lead attempt count).
+    Idempotent: if a CallResult already exists for the session, no
+    second result is ever written and the lead / campaign bookkeeping
+    below runs only once. Two narrow upgrades still apply to the
+    existing row (Oct 26, 2026, Retest 5 gap — the hangup callback
+    can finalize first with an empty disposition, and the stream
+    finalize arriving later used to be dropped entirely):
+
+    - MERGE-UPGRADE: when the existing disposition is empty and the
+      new outcome carries a real one, the classification fields
+      (disposition, confidence, summary, captured_fields,
+      review_required) are upgraded from the new outcome. State,
+      end_reason and duration are NEVER touched — the hangup record
+      of what happened to the call stands. Cost is recomputed ONLY
+      when the stored breakdown is a rate-card estimate AND the new
+      outcome carries real engine metrics (tts_frames > 0) — a
+      provider-sourced breakdown is never overwritten.
+    - REVIEW FLAG: when the existing disposition stays empty but a
+      conversation transcript exists (live turns survived the
+      hangup-first guard), the row is flagged for review instead of
+      looking clean — an unclassified conversation must surface in
+      the review queue, never hide as a blank row.
+
     Returns (result, created).
     """
     existing = (
@@ -301,6 +334,40 @@ def finalize_attempt(db: Session, session: CallSession, outcome: dict):
         .first()
     )
     if existing is not None:
+        new_disp = outcome.get("disposition") or ""
+        if not (existing.disposition or "") and new_disp:
+            existing.disposition = new_disp
+            existing.confidence = float(outcome.get("confidence") or 0.0)
+            existing.summary = outcome.get("summary") or existing.summary
+            existing.captured_fields = outcome.get("captured_fields") or {}
+            existing.review_required = bool(
+                outcome.get("review_required") or False)
+            metrics = outcome.get("cost_metrics") or {}
+            old_cost = existing.cost_breakdown or {}
+            if old_cost.get("cost_source") == "rate_card" and int(
+                    metrics.get("tts_frames") or 0) > 0:
+                existing.cost_breakdown = costing.finalize_breakdown(
+                    db, session, outcome)
+            try:
+                from sqlalchemy.orm.attributes import flag_modified
+                flag_modified(existing, "captured_fields")
+                flag_modified(existing, "cost_breakdown")
+                db.commit()
+            except Exception:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+        elif not (existing.disposition or "") and session.transcript \
+                and not existing.review_required:
+            existing.review_required = True
+            try:
+                db.commit()
+            except Exception:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
         return existing, False
 
     session.state = outcome.get("final_state") or "COMPLETED"
@@ -309,7 +376,16 @@ def finalize_attempt(db: Session, session: CallSession, outcome: dict):
     if outcome.get("recording_url"):
         session.recording_url = outcome["recording_url"]
     if outcome.get("transcript") is not None:
-        session.transcript = outcome["transcript"]
+        # Hangup-first race guard (proven Oct 26, 2026, ses_63a45...):
+        # a terminal provider callback (Twilio "completed") carries an
+        # empty transcript, but the stream handler may already have
+        # appended live turns to the session row. Never clobber a
+        # non-empty live transcript with an empty outcome transcript —
+        # the pilot's turns were erased exactly this way, leaving an
+        # empty transcript beside an "active" engine and no way to
+        # tell what the call actually contained.
+        if outcome["transcript"] or not session.transcript:
+            session.transcript = outcome["transcript"]
     if session.answered_at is None and session.state == "COMPLETED":
         session.answered_at = session.ended_at
 
@@ -330,6 +406,15 @@ def finalize_attempt(db: Session, session: CallSession, outcome: dict):
         # never stored.
         cost_breakdown=costing.finalize_breakdown(db, session, outcome),
     )
+    # Hangup-first review rule (Oct 26, 2026, Retest 5 gap): a result
+    # created with an empty disposition BUT a non-empty live
+    # transcript is a conversation that was never classified — it
+    # must surface in the review queue, not look clean. Terminal
+    # telephony states (no-answer / busy / failed / voicemail) carry
+    # no transcript, so they are untouched by this rule; the
+    # classifier-failed path already sets review_required itself.
+    if not result.disposition and session.transcript:
+        result.review_required = True
     db.add(result)
 
     # S3 archival (012): best-effort durable copy of the provider

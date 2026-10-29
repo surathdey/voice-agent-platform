@@ -51,11 +51,32 @@ three new agents plus human-queue routing-rule flagging.
 Run against a FRESH database: like the earlier chunks, the suite seeds its
 own tenants/agents/campaigns/settings and asserts exact fresh-state values.
 """
+import io as _io
 import json
+import os as _os
 import sys
 import urllib.request
 import urllib.error
 import uuid
+import wave as _wave
+
+# Production mu-law encoder, used to state the mock's expected pumped
+# bytes: the pump must convert Bulbul WAV -> mu-law (see conversation.py
+# synthesize_tts), so expectations are mu-law lengths, not raw mock bytes.
+sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "backend"))
+from app.audio_codec import mulaw_encode as _mulaw_encode
+
+
+def _wav_wrap8(pcm):
+    """PCM16 little-endian payload -> minimal WAV (mono, 8 kHz), the
+    shape Bulbul TTS actually returns (Retest 3, Oct 26)."""
+    buf = _io.BytesIO()
+    with _wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(8000)
+        w.writeframes(pcm)
+    return buf.getvalue()
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8000"
 passed = failed = 0
@@ -317,11 +338,12 @@ print("── A4: provider settings — fresh state ───────")
 call("GET", "/api/settings/providers", expect=401)  # unauthenticated
 _, plist = call("GET", "/api/settings/providers", token=token)
 by_key = {p["provider"]: p for p in plist}
-assert set(by_key) == {"vapi", "twilio", "plivo", "exotel", "sarvam"}, sorted(by_key)
+assert set(by_key) == {"vapi", "twilio", "plivo", "exotel", "sarvam", "pstn"}, sorted(by_key)
 assert by_key["vapi"]["status"] == "stub" and by_key["vapi"]["configured"] is False, by_key["vapi"]
 assert by_key["plivo"]["status"] == "stub" and by_key["sarvam"]["status"] == "stub", by_key
 assert by_key["twilio"]["status"] == "not_configured", by_key["twilio"]
 assert by_key["exotel"]["status"] == "not_configured", by_key["exotel"]
+assert by_key["pstn"]["configured"] is True and by_key["pstn"]["status"] == "configured", by_key["pstn"]
 print("  PASS  fresh tenant: primary providers report stub; optional ones not_configured")
 
 print("── A4: campaign flagged when its mode has no provider ──")
@@ -423,7 +445,7 @@ print("── A4: health reports providers per mode ─────")
 _, health2 = call("GET", "/api/health")
 assert set(health2["providers"]) == {"managed", "self_hosted"}, health2
 assert health2["providers"]["managed"] == {"vapi": False, "twilio": False}, health2
-assert health2["providers"]["self_hosted"] == {"plivo": False, "exotel": False, "sarvam": False}, health2
+assert health2["providers"]["self_hosted"] == {"plivo": False, "exotel": False, "sarvam": False, "pstn": True}, health2
 assert VAPI_SENTINEL not in json.dumps(health2) and SARVAM_SENTINEL not in json.dumps(health2)
 print("  PASS  health: per-mode booleans from the .env fallback only — no tenant values")
 
@@ -862,8 +884,11 @@ try:
            all(r["headers"].get("Authorization") == "Bearer sk-fake-managed" for r in reqs))
     by_lead = {p["assistantOverrides"]["variableValues"]["lead_name"]: p for p in payloads}
     wb, hi = by_lead["F. Ali"], by_lead["G. Nath"]
-    check6("payload: the agent's single prompt is the system message, verbatim",
-           wb["assistant"]["model"]["messages"][0]["content"] == rpiM["prompt"])
+    _wb_sys = wb["assistant"]["model"]["messages"][0]["content"]
+    check6("payload: the agent's single prompt is the system message, plus only the per-call language-grounding + today lines",
+           _wb_sys.startswith(rpiM["prompt"])
+           and _wb_sys.endswith("[The call's language is Bengali. Begin the call in Bengali, including the opening line.]")
+           and "[Today is " in _wb_sys and "always include the year" in _wb_sys)
     check6("payload: assistant LLM from tenant default model (provider/name split)",
            wb["assistant"]["model"]["model"] == "gpt-4o-mini"
            and wb["assistant"]["model"]["provider"] == "openai", wb["assistant"]["model"])
@@ -1266,14 +1291,11 @@ try:
                 MOCK_STT["audio_frames"] += 1
                 n = info["frames"]
                 if n == 1:
-                    ws.send(json.dumps({"type": "data", "data": {
-                        "transcript": "Nomoskar, ami", "is_final": False}}))
+                    ws.send(json.dumps({"event": "transcript.partial", "utterance_idx": 0, "text": "Nomoskar, ami"}))
                 elif n == 2:
-                    ws.send(json.dumps({"type": "data", "data": {
-                        "transcript": _STT_FINAL_1, "is_final": True}}))
+                    ws.send(json.dumps({"event": "transcript.final", "utterance_idx": 0, "text": _STT_FINAL_1}))
                 elif n == 3:
-                    ws.send(json.dumps({"type": "data", "data": {
-                        "transcript": _STT_FINAL_2, "is_final": True}}))
+                    ws.send(json.dumps({"event": "transcript.final", "utterance_idx": 0, "text": _STT_FINAL_2}))
         except Exception:
             pass  # client went away mid-stream — the mock just stops
 
@@ -1387,7 +1409,7 @@ try:
                and doneT["stt_language"] == "bn-IN" and doneT["stt_detail"] == "", doneT)
         check6("A7: mock Saaras saw ONE connection, opened for bn-IN with the tenant key",
                len(MOCK_STT["connections"]) == 1
-               and "language-code=bn-IN" in MOCK_STT["connections"][0]["path"]
+               and "language_code=bn-IN" in MOCK_STT["connections"][0]["path"]
                and MOCK_STT["connections"][0]["api_key"] == "sk-fake-sarvam",
                MOCK_STT["connections"])
         check6("A7: Plivo media frames were forwarded to Saaras as audio messages",
@@ -1522,11 +1544,19 @@ try:
 
 
     def _mock_audio8(text):
-        return ("<tts:" + text + ">").encode() * 3
+        # PCM16 payload (padded to a whole sample); the handler wraps it
+        # in a WAV, exactly as Bulbul returns it.
+        b = ("<tts:" + text + ">").encode() * 3
+        return b if len(b) % 2 == 0 else b + b"\x00"
+
+
+    def _mock_wav8(text):
+        return _wav_wrap8(_mock_audio8(text))
 
 
     def _audio_len8(reply):
-        return sum(len(_mock_audio8(s)) for s in _SENT_8[reply])
+        # Pumped length is mu-law, not the PCM payload length.
+        return sum(len(_mulaw_encode(_mock_audio8(s))) for s in _SENT_8[reply])
 
 
     MOCK_AI = {"chat": [], "classify": [], "tts": [], "classify_mode": "ok"}
@@ -1553,12 +1583,12 @@ try:
                 body = json.loads(raw) if raw else {}
             except Exception:
                 body = {}
-            if self.path == "/chat/completions":
+            if self.path in ("/chat/completions", "/v1/chat/completions"):
                 self._chat(body)
             elif self.path == "/text-to-speech":
                 MOCK_AI["tts"].append(body)
                 text = (body.get("inputs") or [""])[0]
-                self._json(200, {"audios": [_b64_8.b64encode(_mock_audio8(text)).decode()]})
+                self._json(200, {"audios": [_b64_8.b64encode(_mock_wav8(text)).decode()]})
             else:
                 self._json(404, {})
 
@@ -1638,8 +1668,7 @@ try:
                 info["frames"] += 1
                 line = _L1_8 if info["frames"] == 1 else _L2_8 if info["frames"] == 2 else ""
                 if line:
-                    ws.send(json.dumps({"type": "data", "data": {
-                        "transcript": line, "is_final": True}}))
+                    ws.send(json.dumps({"event": "transcript.final", "utterance_idx": 0, "text": line}))
         except Exception:
             pass  # client went away mid-stream — the mock just stops
 
@@ -1844,13 +1873,22 @@ try:
            and "DISPOSITIONS" in chatA[0]["messages"][0]["content"],
            chatA[0]["messages"][0]["content"][:80])
     ttsA = MOCK_AI["tts"][tts0:]
+    # The agent's tts_voice_id here is the legacy platform id
+    # bulbul-bn-female-1, which bulbul_speaker() maps per language on
+    # bulbul:v4-flash — bn female = roopa_bn_conversational (Surath's
+    # Oct 26, 2026 Bengali pick; the old v3 priya mapping is gone).
+    # The mock records what the engine actually sends, so the
+    # expectation is the mapped speaker.
     check6("A8: Bulbul synthesized one request per reply sentence, agent voice + call language",
            [t["inputs"][0] for t in ttsA] ==
                _SENT_8[_R1_8] + _SENT_8[_R2_8] + _SENT_8[_R3_8]
-           and all(t["speaker"] == "bulbul-bn-female-1" for t in ttsA)
+           and all(t["speaker"] == "roopa_bn_conversational" for t in ttsA)
            and all(t["target_language_code"] == "bn-IN" for t in ttsA), ttsA)
     check6("A8: the playAudio frames carry exactly the synthesized audio, in order",
-           bytes(audioA) == b"".join(_mock_audio8(t["inputs"][0]) for t in ttsA),
+           bytes(audioA) == b"".join(_mulaw_encode(_mock_audio8(t["inputs"][0])) for t in ttsA),
+           len(audioA))
+    check6("A8: the pump converts Bulbul WAV to mu-law (no RIFF header in pumped frames)",
+           b"RIFF" not in bytes(audioA) and len(audioA) > 0,
            len(audioA))
     clsA = MOCK_AI["classify"][cls0:]
     check6("A8: exactly one classifier call, fed the prompt's buckets + the real transcript",
@@ -2028,10 +2066,15 @@ try:
 
     def _mock_audio9(text):
         rep = 60 if text.startswith(("First,", "Second,", "Third,")) else 3
-        return ("<tts:" + text + ">").encode() * rep
+        b = ("<tts:" + text + ">").encode() * rep
+        return b if len(b) % 2 == 0 else b + b"\x00"
 
 
-    _FULL_B_AUDIO_9 = sum(len(_mock_audio9(s)) for s in (_B1_9, _B2_9, _B3_9))
+    def _mock_wav9(text):
+        return _wav_wrap8(_mock_audio9(text))
+
+
+    _FULL_B_AUDIO_9 = sum(len(_mulaw_encode(_mock_audio9(s))) for s in (_B1_9, _B2_9, _B3_9))
 
     MOCK_AI9 = {"chat": [], "classify": [], "tts": []}
 
@@ -2057,12 +2100,12 @@ try:
                 body = json.loads(raw) if raw else {}
             except Exception:
                 body = {}
-            if self.path == "/chat/completions":
+            if self.path in ("/chat/completions", "/v1/chat/completions"):
                 self._chat(body)
             elif self.path == "/text-to-speech":
                 MOCK_AI9["tts"].append(body)
                 text = (body.get("inputs") or [""])[0]
-                self._json(200, {"audios": [_b64_9.b64encode(_mock_audio9(text)).decode()]})
+                self._json(200, {"audios": [_b64_9.b64encode(_mock_wav9(text)).decode()]})
             else:
                 self._json(404, {})
 
@@ -2134,14 +2177,11 @@ try:
                 info["frames"] += 1
                 mode = MOCK_STT9["mode"]
                 if mode == "barge" and info["frames"] == 1:
-                    ws.send(json.dumps({"type": "data", "data": {
-                        "transcript": "Wait, I have", "is_final": False}}))
+                    ws.send(json.dumps({"event": "transcript.partial", "utterance_idx": 0, "text": "Wait, I have"}))
                 elif mode == "barge" and info["frames"] == 2:
-                    ws.send(json.dumps({"type": "data", "data": {
-                        "transcript": _LI_9, "is_final": True}}))
+                    ws.send(json.dumps({"event": "transcript.final", "utterance_idx": 0, "text": _LI_9}))
                 elif mode == "talk" and info["frames"] == 1:
-                    ws.send(json.dumps({"type": "data", "data": {
-                        "transcript": _LANS_9, "is_final": True}}))
+                    ws.send(json.dumps({"event": "transcript.final", "utterance_idx": 0, "text": _LANS_9}))
         except Exception:
             pass  # client went away mid-stream — the mock just stops
 
@@ -2275,7 +2315,7 @@ try:
     audio_at_cut = len(audioB9)
     _media8(wsB9)  # media frame 2 → the interrupting line lands as a final
     okB = _until9(wsB9, audioB9, eventsB9,
-                  lambda: len(audioB9) >= audio_at_cut + len(_mock_audio9(_RB_9)), 10)
+                  lambda: len(audioB9) >= audio_at_cut + len(_mulaw_encode(_mock_audio9(_RB_9))), 10)
     check6("A9: the interrupting line becomes the next turn — its reply is spoken",
            okB, (len(audioB9), audio_at_cut))
     _stream_stop8(wsB9)
@@ -2318,12 +2358,12 @@ try:
     chat_s0, tts_s0 = len(MOCK_AI9["chat"]), len(MOCK_AI9["tts"])
     audioS9, eventsS9 = bytearray(), []
     wsS9 = _stream_open8(baseA9, tokenA9, sS9["session_id"])
-    open_target = sum(len(_mock_audio9(s)) for s in _OPEN_SENT_9)
+    open_target = sum(len(_mulaw_encode(_mock_audio9(s))) for s in _OPEN_SENT_9)
     okS = _until9(wsS9, audioS9, eventsS9, lambda: len(audioS9) >= open_target, 10)
     check6("A9: silence scenario — the opening is spoken in full first",
            okS and len(audioS9) == open_target, len(audioS9))
     okS = _until9(wsS9, audioS9, eventsS9,
-                  lambda: len(audioS9) >= open_target + len(_mock_audio9(_NUDGE_9)), 12)
+                  lambda: len(audioS9) >= open_target + len(_mulaw_encode(_mock_audio9(_NUDGE_9))), 12)
     ttsS = [t["inputs"][0] for t in MOCK_AI9["tts"][tts_s0:]]
     check6("A9: SILENCE — after the configured window the agent speaks a nudge",
            okS and _NUDGE_9 in ttsS, ttsS)
@@ -2334,13 +2374,13 @@ try:
            [m.get("content") for c in chatsS for m in c["messages"]][-2:])
     _media8(wsS9)  # the callee finally answers — the silence counter must reset
     okS = _until9(wsS9, audioS9, eventsS9,
-                  lambda: len(audioS9) >= open_target + len(_mock_audio9(_NUDGE_9))
-                  + len(_mock_audio9(_RANS_9)), 10)
+                  lambda: len(audioS9) >= open_target + len(_mulaw_encode(_mock_audio9(_NUDGE_9)))
+                  + len(_mulaw_encode(_mock_audio9(_RANS_9))), 10)
     check6("A9: the answer after the nudge gets a normal reply",
            okS, len(audioS9))
     okS = _until9(wsS9, audioS9, eventsS9,
-                  lambda: len(audioS9) >= open_target + 2 * len(_mock_audio9(_NUDGE_9))
-                  + len(_mock_audio9(_RANS_9)), 12)
+                  lambda: len(audioS9) >= open_target + 2 * len(_mulaw_encode(_mock_audio9(_NUDGE_9)))
+                  + len(_mulaw_encode(_mock_audio9(_RANS_9))), 12)
     ttsS = [t["inputs"][0] for t in MOCK_AI9["tts"][tts_s0:]]
     check6("A9: a fresh silence earns a fresh nudge (the counter reset on the answer)",
            okS and ttsS.count(_NUDGE_9) == 2
@@ -2727,12 +2767,14 @@ try:
                 body = json.loads(raw) if raw else {}
             except Exception:
                 body = {}
-            if self.path == "/chat/completions":
+            if self.path in ("/chat/completions", "/v1/chat/completions"):
                 self._chat(body)
             elif self.path == "/text-to-speech":
                 text = (body.get("inputs") or [""])[0]
                 self._json(200, {"audios": [
-                    _b64_11.b64encode(_mock_audio11(text)).decode()]})
+                    _b64_11.b64encode(
+                        _mock_wav9(text) if text.startswith(("First,", "Second,", "Third,"))
+                        else _mock_wav8(text)).decode()]})
             else:
                 self._json(404, {})
 
@@ -2812,22 +2854,18 @@ try:
                     continue
                 info["frames"] += 1
                 try:
-                    info["payloads"].append(_b64_11.b64decode(msg["audio"]["data"]))
+                    info["payloads"].append(_b64_11.b64decode(msg["audio"]))
                 except Exception:
                     pass
                 mode, n = MOCK_STT11["mode"], info["frames"]
                 if mode == "survey" and n == 1:
-                    ws.send(json.dumps({"type": "data", "data": {
-                        "transcript": _L1_8, "is_final": True}}))
+                    ws.send(json.dumps({"event": "transcript.final", "utterance_idx": 0, "text": _L1_8}))
                 elif mode == "survey" and n == 2:
-                    ws.send(json.dumps({"type": "data", "data": {
-                        "transcript": _L2_8, "is_final": True}}))
+                    ws.send(json.dumps({"event": "transcript.final", "utterance_idx": 0, "text": _L2_8}))
                 elif mode == "barge" and n == 1:
-                    ws.send(json.dumps({"type": "data", "data": {
-                        "transcript": "Wait, I have", "is_final": False}}))
+                    ws.send(json.dumps({"event": "transcript.partial", "utterance_idx": 0, "text": "Wait, I have"}))
                 elif mode == "barge" and n == 2:
-                    ws.send(json.dumps({"type": "data", "data": {
-                        "transcript": _LI_9, "is_final": True}}))
+                    ws.send(json.dumps({"event": "transcript.final", "utterance_idx": 0, "text": _LI_9}))
         except Exception:
             pass  # client went away mid-stream — the mock just stops
 
@@ -3019,7 +3057,7 @@ try:
         pass
     conns11 = MOCK_STT11["connections"][stt11_conns0:]
     check6("A11: Saaras saw ONE connection (bn-IN) and the PCM16→μ-law conversion is real",
-           len(conns11) == 1 and "language-code=bn-IN" in conns11[0]["path"]
+           len(conns11) == 1 and "language_code=bn-IN" in conns11[0]["path"]
            and len(conns11[0]["payloads"]) == 2
            and all(len(p) == 160 for p in conns11[0]["payloads"])
            and len(set(conns11[0]["payloads"][0])) == 1
@@ -3349,7 +3387,7 @@ try:
                 MOCK_AI12["tts"].append(body)
                 text = (body.get("inputs") or [""])[0]
                 self._send(json.dumps({"audios": [
-                    _b64_8.b64encode(_mock_audio8(text)).decode()]}).encode(),
+                    _b64_8.b64encode(_mock_wav8(text)).decode()]}).encode(),
                     "application/json")
                 return
             self._send(b"{}", "application/json")
@@ -3368,8 +3406,7 @@ try:
                 line = _L1_8 if info["frames"] == 1 else (
                     _L2_8 if info["frames"] == 2 else "")
                 if line:
-                    ws.send(json.dumps({"type": "data", "data": {
-                        "transcript": line, "is_final": True}}))
+                    ws.send(json.dumps({"event": "transcript.final", "utterance_idx": 0, "text": line}))
         except Exception:
             pass  # client went away mid-stream — the mock just stops
 
@@ -3464,12 +3501,12 @@ try:
     cbC = (doneC or {}).get("cost_breakdown") or {}
     durC = (doneC or {}).get("duration_s") or 0
     framesC = evC[0]
-    exp_framesC = sum(-(-len(_mock_audio8(t["inputs"][0])) // 160)
+    exp_framesC = sum(-(-len(_mulaw_encode(_mock_audio8(t["inputs"][0]))) // 160)
                       for t in MOCK_AI12["tts"])
     check6("A12: the wire carried exactly one playAudio per pumped frame, "
-           "bytes == the mock's synthesized audio",
+           "bytes == mu-law of the mock's synthesized audio",
            framesC == exp_framesC and framesC > 0
-           and len(audioC) == sum(len(_mock_audio8(t["inputs"][0]))
+           and len(audioC) == sum(len(_mulaw_encode(_mock_audio8(t["inputs"][0])))
                                   for t in MOCK_AI12["tts"]),
            (framesC, exp_framesC, len(audioC)))
     expC = {"telephony": round(2.0 * durC / 60, 4),
@@ -3513,7 +3550,7 @@ try:
     doneB = _bt_poll(baseC, tokenC, sidB, lambda c: c["final_state"] is not None)
     cbB = (doneB or {}).get("cost_breakdown") or {}
     durB = (doneB or {}).get("duration_s") or 0
-    framesB = sum(-(-len(_mock_audio8(t["inputs"][0])) // 160)
+    framesB = sum(-(-len(_mulaw_encode(_mock_audio8(t["inputs"][0]))) // 160)
                   for t in MOCK_AI12["tts"][ttsB0:])
     expB = {"stt": round(3.0 * durB / 60, 4), "llm": round(5.0 * durB / 60, 4),
             "tts": round(7.0 * framesB * 0.02 / 60, 4)}
@@ -4382,6 +4419,896 @@ try:
     _, campB6g = call("GET", f"/api/campaigns/{campB6['campaign_id']}", token=token)
     check6("B6: escalation routing rules round-trip on read",
            campB6g["routing_rules"] == campB6["routing_rules"], campB6g["routing_rules"])
+
+    # ── Holding line: slow kickoff speaks once, fast kickoff never ──
+    print("── Holding line: slow first turn speaks once, fast turn never ──")
+    # In-process engine test (no provider, no stream): a local mock
+    # Sarvam HTTP server delays the kickoff chat's first SSE chunk by
+    # 6 s in the slow case and answers at once in the fast case; the
+    # mock TTS records every synthesis text. The engine is built
+    # directly (the same class the stream handler runs) with a
+    # capturing send_audio; stt append_turn is stubbed out (no DB row
+    # exists for a synthetic session id, and the test asserts on the
+    # engine's own turns + the mock's TTS log, never on stored rows).
+    import asyncio as _asyncio_hold
+    import base64 as _b64_hold
+    from types import SimpleNamespace as _NS_hold
+    _sys_hold_path = os.path.join(os.getcwd(), "backend")
+    if _sys_hold_path not in sys.path:
+        sys.path.insert(0, _sys_hold_path)
+    import app.conversation as _conv_hold
+    import app.stt as _stt_hold
+    _orig_append_hold = _stt_hold.append_turn
+    _stt_hold.append_turn = lambda *a: None
+    _HOLD_BN = "এক মুহূর্ত অপেক্ষা করুন, দেখছি।"
+    _GREET_HOLD = "Hello, this is Priya calling. May I speak with Rohit?"
+    _GREET_SENT_HOLD = ["Hello, this is Priya calling.",
+                        "May I speak with Rohit?"]
+
+    def _dummy_hold(text):
+        b = ("<tts:" + text + ">").encode() * 3
+        return b if len(b) % 2 == 0 else b + b"\x00"
+
+    class _MockHoldAI(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def _json_hold(self, code, obj):
+            data = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b""
+            try:
+                body = json.loads(raw) if raw else {}
+            except Exception:
+                body = {}
+            if self.path.endswith("/chat/completions"):
+                if self.server.delay_s:
+                    time.sleep(self.server.delay_s)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                for piece in ("Hello, this is Priya calling. ",
+                              "May I speak with Rohit?"):
+                    self.wfile.write(("data: " + json.dumps(
+                        {"choices": [{"delta": {"content": piece}}]})
+                        + "\n\n").encode())
+                    self.wfile.flush()
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            elif self.path == "/text-to-speech":
+                text = (body.get("inputs") or [""])[0]
+                self.server.tts_log.append(text)
+                self._json_hold(200, {"audios": [_b64_hold.b64encode(
+                    _wav_wrap8(_dummy_hold(text))).decode()]})
+            else:
+                self._json_hold(404, {})
+
+    async def _run_hold(delay_s):
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), _MockHoldAI)
+        srv.delay_s = delay_s
+        srv.tts_log = []
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        _conv_hold.settings.SARVAM_BASE_URL = (
+            f"http://127.0.0.1:{srv.server_address[1]}")
+        frames = bytearray()
+
+        async def _send_hold(b):
+            frames.extend(b)
+
+        async def _close_hold():
+            pass
+
+        _agent_hold = _NS_hold(
+            prompt="You are a test agent. Greet the customer.",
+            llm_model="sarvam-105b", tts_voice_id="",
+            voice_gender="female", max_duration_s=300, max_turns=50,
+            silence_prompt_after_s=3600, silence_max_prompts=1,
+            captured_fields=[])
+        _camp_hold = _NS_hold(product="vehicle_loan",
+                              settlement_authority_pct=None)
+        _lead_hold = _NS_hold(name="Rohit", bank_name="Tata Capital",
+                              state="West Bengal", phone_number="9500000001",
+                              agent_fields={})
+        eng = _conv_hold.ConversationEngine(
+            session_id="hold-smoke", agent=_agent_hold, campaign=_camp_hold,
+            lead=_lead_hold, language="bn-IN", api_key="sk-fake",
+            send_audio=_send_hold, close_stream=_close_hold)
+        await eng.start()
+        _deadline = time.monotonic() + 30
+        while len(eng.turns) < 1 and time.monotonic() < _deadline:
+            await _asyncio_hold.sleep(0.1)
+        await eng.finish()
+        srv.shutdown()
+        return eng, list(srv.tts_log), bytes(frames)
+
+    _eng_slow, _tts_slow, _frames_slow = _asyncio_hold.run(_run_hold(6))
+    check6("Holding: slow kickoff (6 s) speaks the Bengali holding line "
+           "once, before the greeting, and the transcript holds only the greeting",
+           _tts_slow == [_HOLD_BN] + _GREET_SENT_HOLD
+           and len(_eng_slow.turns) >= 1
+           and _eng_slow.turns[0]["text"] == _GREET_HOLD
+           and _eng_slow.metrics()["holding_played"] is True
+           and _frames_slow == (_mulaw_encode(_dummy_hold(_HOLD_BN))
+                                + b"".join(_mulaw_encode(_dummy_hold(s))
+                                           for s in _GREET_SENT_HOLD)),
+           (_tts_slow, _eng_slow.turns[:1],
+            _eng_slow.metrics()["holding_played"]))
+    _eng_fast, _tts_fast, _frames_fast = _asyncio_hold.run(_run_hold(0))
+    check6("Holding: fast kickoff speaks no holding line at all",
+           _tts_fast == _GREET_SENT_HOLD
+           and len(_eng_fast.turns) >= 1
+           and _eng_fast.turns[0]["text"] == _GREET_HOLD
+           and _eng_fast.metrics()["holding_played"] is False,
+           (_tts_fast, _eng_fast.metrics()["holding_played"]))
+
+    # ── Empty end_call + early barge-in gating (Retest 4 fixes) ──
+    # A model that calls end_call with NO spoken text must never end
+    # the call in silence: one retry turn asks for the closing line,
+    # and a second empty answer falls back to the neutral closing.
+    # And a customer partial arriving while the reply is still being
+    # generated (no audio pumping yet) must not kill the turn.
+    _FALLBACK_BN = "ধন্যবাদ, ভালো থাকবেন।"
+
+    class _MockEmptyEndAI(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def _json_ee(self, code, obj):
+            data = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _sse_ee(self, pieces, end_call):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            for piece in pieces:
+                self.wfile.write(("data: " + json.dumps(
+                    {"choices": [{"delta": {"content": piece}}]})
+                    + "\n\n").encode())
+                self.wfile.flush()
+            if end_call:
+                self.wfile.write(("data: " + json.dumps({"choices": [
+                    {"delta": {"tool_calls": [
+                        {"index": 0, "id": "call_end_1",
+                         "type": "function",
+                         "function": {"name": "end_call",
+                                      "arguments": ""}}]}}]})
+                    + "\n\n").encode())
+                self.wfile.flush()
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b""
+            try:
+                body = json.loads(raw) if raw else {}
+            except Exception:
+                body = {}
+            if self.path.endswith("/chat/completions"):
+                self.server.chat_count += 1
+                n = self.server.chat_count
+                if n == 1:
+                    self._sse_ee(("Hello, this is Priya calling. ",
+                                  "May I speak with Rohit?"), False)
+                elif n == 2:
+                    self._sse_ee((), True)
+                elif self.server.retry_mode == "closing":
+                    self._sse_ee(("Thank you very much. ",
+                                  "Have a good day."), True)
+                else:
+                    self._sse_ee((), True)
+            elif self.path == "/text-to-speech":
+                text = (body.get("inputs") or [""])[0]
+                self.server.tts_log.append(text)
+                self._json_ee(200, {"audios": [_b64_hold.b64encode(
+                    _wav_wrap8(_dummy_hold(text))).decode()]})
+            else:
+                self._json_ee(404, {})
+
+    def _build_ee_engine():
+        agent = _NS_hold(
+            prompt="You are a test agent. Greet the customer.",
+            llm_model="sarvam-105b", tts_voice_id="",
+            voice_gender="female", max_duration_s=300, max_turns=50,
+            silence_prompt_after_s=3600, silence_max_prompts=1,
+            captured_fields=[])
+        camp = _NS_hold(product="vehicle_loan",
+                        settlement_authority_pct=None)
+        lead = _NS_hold(name="Rohit", bank_name="Tata Capital",
+                        state="West Bengal", phone_number="9500000001",
+                        agent_fields={})
+        frames = bytearray()
+
+        async def _send_ee(b):
+            frames.extend(b)
+
+        async def _close_ee():
+            pass
+
+        eng = _conv_hold.ConversationEngine(
+            session_id="empty-end-smoke", agent=agent, campaign=camp,
+            lead=lead, language="bn-IN", api_key="<redacted>",
+            send_audio=_send_ee, close_stream=_close_ee)
+        return eng
+
+    async def _run_empty_end(retry_mode):
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), _MockEmptyEndAI)
+        srv.chat_count = 0
+        srv.retry_mode = retry_mode
+        srv.tts_log = []
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        _conv_hold.settings.SARVAM_BASE_URL = (
+            f"http://127.0.0.1:{srv.server_address[1]}")
+        eng = _build_ee_engine()
+        await eng.start()
+        deadline = time.monotonic() + 30
+        while len(eng.turns) < 1 and time.monotonic() < deadline:
+            await _asyncio_hold.sleep(0.1)
+        eng.enqueue_final({"speaker": "customer",
+                           "text": "Yes, this is Rohit.", "offset_s": 1.0})
+        deadline = time.monotonic() + 30
+        while not eng.end_reason and time.monotonic() < deadline:
+            await _asyncio_hold.sleep(0.1)
+        await eng.finish()
+        srv.shutdown()
+        return eng, list(srv.tts_log)
+
+    _eng_ee, _tts_ee = _asyncio_hold.run(_run_empty_end("empty"))
+    check6("Empty end_call: second empty answer speaks the neutral "
+           "fallback closing, never a silent cut",
+           _tts_ee == _GREET_SENT_HOLD + [_FALLBACK_BN]
+           and [t["text"] for t in _eng_ee.turns] == [
+               _GREET_HOLD, "Yes, this is Rohit.", _FALLBACK_BN]
+           and _eng_ee.end_reason == "agent_end_call",
+           (_tts_ee, [t["text"] for t in _eng_ee.turns],
+            _eng_ee.end_reason))
+    _eng_rc, _tts_rc = _asyncio_hold.run(_run_empty_end("closing"))
+    check6("Empty end_call: retry closing is spoken instead of the "
+           "fallback, then the call ends",
+           _tts_rc == _GREET_SENT_HOLD + ["Thank you very much.",
+                                          "Have a good day."]
+           and _eng_rc.turns[-1]["text"] == (
+               "Thank you very much. Have a good day.")
+           and _FALLBACK_BN not in _tts_rc
+           and _eng_rc.end_reason == "agent_end_call",
+           (_tts_rc, [t["text"] for t in _eng_rc.turns],
+            _eng_rc.end_reason))
+
+    async def _run_gate():
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), _MockHoldAI)
+        srv.delay_s = 2
+        srv.tts_log = []
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        _conv_hold.settings.SARVAM_BASE_URL = (
+            f"http://127.0.0.1:{srv.server_address[1]}")
+        eng = _build_ee_engine()
+        await eng.start()
+        await _asyncio_hold.sleep(0.5)
+        eng.note_speech_activity("hello")
+        deadline = time.monotonic() + 30
+        while len(eng.turns) < 1 and time.monotonic() < deadline:
+            await _asyncio_hold.sleep(0.1)
+        await eng.finish()
+        srv.shutdown()
+        return eng, list(srv.tts_log)
+
+    _eng_gate, _tts_gate = _asyncio_hold.run(_run_gate())
+    check6("Barge-in gating: a partial during LLM wait (no audio yet) "
+           "does not kill the kickoff turn",
+           len(_eng_gate.turns) >= 1
+           and _eng_gate.turns[0]["text"] == _GREET_HOLD
+           and _eng_gate.metrics()["holding_played"] is False
+           and _tts_gate == _GREET_SENT_HOLD,
+           ([t["text"] for t in _eng_gate.turns],
+            _eng_gate.metrics()["holding_played"], _tts_gate))
+    # ── End-call net (stall fix, Oct 26, 2026): a spoken closing ──
+    # without the end_call tool must still end the call. The matcher
+    # is pure, so it is tested directly: prompt CLOSINGS lines parse,
+    # exact and tail matches fire, and non-closing text (including a
+    # closing buried mid-turn) never fires.
+    import app.conversation as _conv_net
+    _FAKE_PROMPT_NET = (
+        'ROLE\nYou are Priya.\n\nCLOSINGS - final words:\n\n'
+        'CONFIRMED:\nEnglish: "Thank you very much for confirming. '
+        'Have a good day."\n'
+        'Hindi: "पुष्टि करने के लिए बहुत-बहुत धन्यवाद। आपका दिन शुभ हो।"\n')
+    _net_closings = _conv_net.prompt_closings(_FAKE_PROMPT_NET)
+    _net_fallback = list(_conv_net.FALLBACK_CLOSINGS.values())
+    check6("End-call net: CLOSINGS parse + exact/tail match, "
+           "non-closing never matches",
+           len(_net_closings) == 2
+           and _conv_net.is_closing_text(
+               "पुष्टि करने के लिए बहुत-बहुत धन्यवाद। आपका दिन शुभ हो।",
+               _net_closings) != ""
+           and _conv_net.is_closing_text(
+               "Yes. पुष्टि करने के लिए बहुत-बहुत धन्यवाद। आपका दिन शुभ हो।",
+               _net_closings) != ""
+           and _conv_net.is_closing_text(
+               "धन्यवाद, आपका दिन शुभ हो।", _net_fallback) != ""
+           and _conv_net.is_closing_text(
+               "क्या मैं Surath Dey जी से बात कर रही हूँ?",
+               _net_closings) == ""
+           and _conv_net.is_closing_text(
+               "पुष्टि करने के लिए बहुत-बहुत धन्यवाद। आपका दिन शुभ हो। "
+               "And one more thing.", _net_closings) == "",
+           (_net_closings,
+            _conv_net.is_closing_text(
+                "धन्यवाद, आपका दिन शुभ हो।", _net_fallback)))
+    # ── Greeting fast-path (Oct 26, 2026): the matcher is pure, so
+    # it is tested directly — exact bare greetings fire, and
+    # questions, denials, confirmations, and any content never do;
+    # the templated lines carry greeting + bank + recorded note +
+    # the identity question, and no lead name means no line (LLM
+    # path instead).
+    _fg = _conv_net.is_bare_greeting
+    _fl = _conv_net.fast_greeting_line
+    check6("Fast greeting: bare greetings fire, questions/denials/"
+           "content never do",
+           _fg("hello") and _fg("Hello!") and _fg("नमस्ते।")
+           and _fg("  হ্যালো ") and _fg("good morning")
+           and not _fg("who are you?") and not _fg("आप कौन बोल रहे हो?")
+           and not _fg("नहीं") and not _fg("हाँ") and not _fg("হ্যাঁ")
+           and not _fg("hello, I already paid")
+           and not _fg("hello, who is this?") and not _fg("")
+           and not _fg("hello hello")
+           and not _fg("मैं नहीं जानता उसे"),
+           (_fg("hello"), _fg("who are you?"), _fg("नहीं")))
+    check6("Fast greeting: lines carry greeting + bank + question",
+           _fl("hi-IN", "female", "Tata Capital", "Surath Dey")
+           == ("नमस्ते, मैं Tata Capital से प्रिया बोल रही हूँ। "
+               "यह एक रिकॉर्डेड कॉल है। "
+               "क्या मैं Surath Dey जी से बात कर रही हूँ?")
+           and _fl("hi-IN", "male", "Tata Capital", "Surath Dey")
+           == ("नमस्ते, मैं Tata Capital से प्रिया बोल रहा हूँ। "
+               "यह एक रिकॉर्डेड कॉल है। "
+               "क्या मैं Surath Dey जी से बात कर रहा हूँ?")
+           and _fl("bn-IN", "female", "Tata Capital", "Surath Dey")
+           == ("নমস্কার, আমি Tata Capital থেকে প্রিয়া বলছি। "
+               "এটি একটি রেকর্ডেড কল। "
+               "আমি কি Surath Dey জি-এর সাথে কথা বলছি?")
+           and _fl("en-IN", "female", "Tata Capital", "Surath Dey")
+           == ("Namaste, I am Priya calling from Tata Capital. "
+               "This is a recorded call. "
+               "Am I speaking with Surath Dey ji?")
+           and _fl("hi-IN", "female", "Tata Capital", "") is None
+           and _fl("hi-IN", "female", "", "Surath Dey")
+           == ("नमस्ते, मैं प्रिया बोल रही हूँ। "
+               "यह एक रिकॉर्डेड कॉल है। "
+               "क्या मैं Surath Dey जी से बात कर रही हूँ?"),
+           _fl("hi-IN", "female", "Tata Capital", "Surath Dey"))
+    # ── Delay fixes (Oct 26, 2026): language note, streaming TTS,
+    # token/character cost metering, finalize merge-upgrade ──
+    import app.costing as _costing_new
+    import app.orchestrator as _orch_new
+    import app.twilio_cost as _tw_new
+    import app.models as _models_new
+
+    # Language note: the engine's system message is the single prompt
+    # PLUS a bracketed note naming the call's resolved language;
+    # rendered_prompt (the stored prompt) stays clean.
+    def _lang_note_ok():
+        try:
+            _a_ln = _NS_hold(prompt="You are Priya. DISPOSITIONS test.",
+                             llm_model="sarvam-105b", tts_voice_id="",
+                             voice_gender="female", max_duration_s=300,
+                             max_turns=50, silence_prompt_after_s=3600,
+                             silence_max_prompts=1, captured_fields=[])
+            _c_ln = _NS_hold(product="vehicle_loan",
+                             settlement_authority_pct=None)
+            _l_ln = _NS_hold(name="Rohit", bank_name="Tata Capital",
+                             state="West Bengal", phone_number="9500000001",
+                             agent_fields={})
+
+            async def _noop_ln(b):
+                pass
+
+            async def _close_ln():
+                pass
+
+            _eng_ln = _conv_hold.ConversationEngine(
+                session_id="lang-note-smoke", agent=_a_ln, campaign=_c_ln,
+                lead=_l_ln, language="bn-IN", api_key="x",
+                send_audio=_noop_ln, close_stream=_close_ln)
+            _sys_ln = _eng_ln.messages[0]["content"]
+            return (_sys_ln.startswith("You are Priya.")
+                    and "Bengali" in _sys_ln
+                    and _eng_ln.rendered_prompt
+                    == "You are Priya. DISPOSITIONS test."
+                    and _eng_ln.messages[0]["role"] == "system")
+        except Exception:
+            return False
+
+    check6("Delay: engine system message carries the call-language note, stored prompt stays clean",
+           _lang_note_ok(), "")
+
+    # stream_chat usage: Sarvam streams usage on chunks (even without
+    # stream_options) — the parser must return the last one, not drop
+    # it. A usage-only final chunk (no choices) must still win.
+    def _usage_ok():
+        _orig_req = _conv_hold._sarvam_request
+        try:
+
+            class _FakeResp:
+                def __init__(self, lines):
+                    self._lines = lines
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+                def __iter__(self):
+                    for ln in self._lines:
+                        yield ln.encode()
+
+            def _fake_req(path, key, payload, timeout=20):
+                return _FakeResp([
+                    'data: {"choices": [{"delta": {"content": "Hi"}}], '
+                    '"usage": {"prompt_tokens": 10, "completion_tokens": 5, '
+                    '"prompt_tokens_details": {"cached_tokens": 2}}}\n',
+                    'data: {"usage": {"prompt_tokens": 12, '
+                    '"completion_tokens": 8, "prompt_tokens_details": '
+                    '{"cached_tokens": 3}}}\n',
+                    'data: [DONE]\n',
+                ])
+
+            _conv_hold._sarvam_request = _fake_req
+            _got = []
+
+            def _on_tok(t):
+                _got.append(t)
+
+            _full, _tool, _usage = _conv_hold.stream_chat(
+                "x", "sarvam-105b", [{"role": "user", "content": "hi"}],
+                _on_tok)
+            return (_full == "Hi" and _tool == "" and _got == ["Hi"]
+                    and _usage.get("prompt_tokens") == 12
+                    and _usage.get("completion_tokens") == 8
+                    and (_usage.get("prompt_tokens_details") or {}).get(
+                        "cached_tokens") == 3)
+        except Exception:
+            return False
+        finally:
+            _conv_hold._sarvam_request = _orig_req
+
+    check6("Delay: stream_chat returns the provider's streamed token usage (last chunk wins)",
+           _usage_ok(), "")
+
+    # Streaming TTS: mu-law chunks from a mock WS server pump in
+    # order; a failing WS server falls back to REST audio; after two
+    # pre-audio streaming failures the third sentence skips WS.
+    async def _run_stream_tts_ok():
+        import base64 as _b64_st
+        from websockets.asyncio.server import serve as _ws_serve_st
+        _mock_mulaw = bytes(range(256)) * 2  # 512 bytes, deterministic
+        _seen_config = []
+        _ws_conns = [0]
+
+        async def _mock_ws(ws):
+            _ws_conns[0] += 1
+            async for raw in ws:
+                try:
+                    m = json.loads(raw) if isinstance(raw, str) else raw
+                except Exception:
+                    continue
+                if m.get("type") == "config":
+                    _seen_config.append(m.get("data") or {})
+                elif m.get("type") == "flush":
+                    for i in range(0, len(_mock_mulaw), 100):
+                        await ws.send(json.dumps({
+                            "type": "audio",
+                            "data": {"content_type": "audio/mulaw",
+                                     "audio": _b64_st.b64encode(
+                                         _mock_mulaw[i:i + 100]).decode()}}))
+                    await ws.send(json.dumps({
+                        "type": "event",
+                        "data": {"event_type": "final"}}))
+
+        async def _mock_ws_fail(ws):
+            _ws_conns[0] += 1
+            await ws.close()
+
+        class _MockRestAI(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b""
+                try:
+                    body = json.loads(raw) if raw else {}
+                except Exception:
+                    body = {}
+                if self.path == "/text-to-speech":
+                    text = (body.get("inputs") or [""])[0]
+                    data = json.dumps({"audios": [_b64_st.b64encode(
+                        _wav_wrap8(_dummy_hold(text))).decode()]}).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+        _srv_rest = ThreadingHTTPServer(("127.0.0.1", 0), _MockRestAI)
+        threading.Thread(target=_srv_rest.serve_forever, daemon=True).start()
+        _orig_base = _conv_hold.settings.SARVAM_BASE_URL
+        _orig_ws = _conv_hold.settings.SARVAM_TTS_WS_URL
+        _orig_streaming = _conv_hold.settings.SARVAM_TTS_STREAMING
+        try:
+            _conv_hold.settings.SARVAM_BASE_URL = (
+                f"http://127.0.0.1:{_srv_rest.server_address[1]}")
+            _conv_hold.settings.SARVAM_TTS_STREAMING = True
+
+            def _build_eng():
+                _a = _NS_hold(prompt="You are Priya.",
+                              llm_model="sarvam-105b", tts_voice_id="",
+                              voice_gender="female", max_duration_s=300,
+                              max_turns=50, silence_prompt_after_s=3600,
+                              silence_max_prompts=1, captured_fields=[])
+                _c = _NS_hold(product="vehicle_loan",
+                              settlement_authority_pct=None)
+                _l = _NS_hold(name="Rohit", bank_name="Tata Capital",
+                              state="West Bengal",
+                              phone_number="9500000001", agent_fields={})
+                _frames = bytearray()
+
+                async def _send(b):
+                    _frames.extend(b)
+
+                async def _close():
+                    pass
+
+                _eng = _conv_hold.ConversationEngine(
+                    session_id="stream-tts-smoke", agent=_a, campaign=_c,
+                    lead=_l, language="bn-IN", api_key="x",
+                    send_audio=_send, close_stream=_close)
+                return _eng, _frames
+
+            async with _ws_serve_st(_mock_ws, "127.0.0.1", 0) as _srv_ws:
+                _port_ws = _srv_ws.sockets[0].getsockname()[1]
+                _conv_hold.settings.SARVAM_TTS_WS_URL = (
+                    f"ws://127.0.0.1:{_port_ws}")
+                _eng1, _frames1 = _build_eng()
+                _sent = "নমস্কার, আমি প্রিয়া বলছি।"
+                _st1, _fr1 = await _eng1._speak(_sent)
+                _ok1 = (_st1 == "spoken"
+                        and bytes(_frames1) == _mock_mulaw
+                        and _fr1 == 4  # 512 bytes = 3x160 + 32 tail
+                        and _seen_config
+                        and _seen_config[0].get("output_audio_codec")
+                        == "mulaw"
+                        and _eng1.metrics()["tts_chars"] == len(_sent))
+            _ws_conns[0] = 0
+            async with _ws_serve_st(_mock_ws_fail, "127.0.0.1", 0) as _srv_fail:
+                _port_fail = _srv_fail.sockets[0].getsockname()[1]
+                _conv_hold.settings.SARVAM_TTS_WS_URL = (
+                    f"ws://127.0.0.1:{_port_fail}")
+                _eng2, _frames2 = _build_eng()
+                _sent2 = "Hello test."
+                _expect_rest = _mulaw_encode(_dummy_hold(_sent2))
+                _results = []
+                for _ in range(3):
+                    _st, _fr = await _eng2._speak(_sent2)
+                    _results.append((_st, _fr))
+                _ok2 = (all(s == "spoken" for s, _ in _results)
+                        and bytes(_frames2) == _expect_rest * 3
+                        and _ws_conns[0] == 2)
+            return (_ok1 and _ok2,
+                    (_st1, _fr1, len(_frames1), _seen_config[:1],
+                     _results, _ws_conns[0], len(_frames2)))
+        except Exception as e:
+            return False, f"{type(e).__name__}: {e}"
+        finally:
+            _conv_hold.settings.SARVAM_BASE_URL = _orig_base
+            _conv_hold.settings.SARVAM_TTS_WS_URL = _orig_ws
+            _conv_hold.settings.SARVAM_TTS_STREAMING = _orig_streaming
+            _srv_rest.shutdown()
+
+    _stream_ok, _stream_detail = _asyncio_hold.run(_run_stream_tts_ok())
+    check6("Delay: streaming TTS pumps mu-law chunks in order; failing WS falls back to REST and disables after two failures",
+           _stream_ok, _stream_detail)
+
+    # Token/character cost legs: a self-hosted Twilio call prices
+    # telephony on the Twilio rate, LLM on tokens (turns + classifier,
+    # cached at its own rate), TTS on characters.
+    def _costing_ok():
+        try:
+            from sqlalchemy import create_engine as _sa_new
+            from sqlalchemy.orm import sessionmaker as _sm_new
+            _eng_db = _sa_new("sqlite://")
+            _models_new.Base.metadata.create_all(_eng_db)
+            _dbn = _sm_new(bind=_eng_db)()
+            _dbn.add(_models_new.ProviderSetting(
+                tenant_id="t-cost", provider="sarvam", enabled=True,
+                fields={"rate_stt_per_min": 0.49,
+                        "rate_llm_input_per_1m": 15,
+                        "rate_llm_output_per_1m": 60,
+                        "rate_llm_cached_per_1m": 5,
+                        "rate_tts_per_1k_chars": 3}))
+            _dbn.add(_models_new.ProviderSetting(
+                tenant_id="t-cost", provider="twilio", enabled=True,
+                fields={"rate_telephony_per_min": 10}))
+            _dbn.commit()
+            _sess = _NS_hold(provider_mode="self_hosted", channel="",
+                             tenant_id="t-cost", provider_call_id="CA123",
+                             stt_status="active", llm_status="active")
+            _out = {"duration_s": 60,
+                    "cost_metrics": {
+                        "tts_frames": 100, "tts_chars": 500,
+                        "llm_usage": {"prompt_tokens": 3000,
+                                      "completion_tokens": 500,
+                                      "cached_tokens": 1000},
+                        "llm_usage_classify": {"prompt_tokens": 2600,
+                                               "completion_tokens": 50,
+                                               "cached_tokens": 0}}}
+            _bd = _costing_new.finalize_breakdown(_dbn, _sess, _out)
+            # telephony 10x60/60=10; stt 0.49; llm (4600x15 + 1000x5
+            # + 550x60)/1e6=0.107; tts 500x3/1000=1.5; total 12.097
+            return (_bd["telephony"] == 10.0 and _bd["stt"] == 0.49
+                    and _bd["llm"] == 0.107 and _bd["tts"] == 1.5
+                    and _bd["total"] == 12.097
+                    and "Twilio rate card" in _bd["basis"]["telephony"]
+                    and "token usage" in _bd["basis"]["llm"]
+                    and "per character" in _bd["basis"]["tts"])
+        except Exception:
+            return False
+
+    check6("Cost: self-hosted Twilio call prices telephony on Twilio rate, LLM on tokens, TTS on characters",
+           _costing_ok(), "")
+
+    # Finalize merge-upgrade: a hangup-first result (empty disposition
+    # + live transcript) is flagged for review; the later stream
+    # finalize upgrades the classification WITHOUT touching state,
+    # end_reason or duration; a third finalize cannot overwrite a
+    # real disposition.
+    def _merge_ok():
+        try:
+            from sqlalchemy import create_engine as _sa_new2
+            from sqlalchemy.orm import sessionmaker as _sm_new2
+            _eng_db2 = _sa_new2("sqlite://")
+            _models_new.Base.metadata.create_all(_eng_db2)
+            _dbm = _sm_new2(bind=_eng_db2)()
+            _dbm.add(_models_new.ProviderSetting(
+                tenant_id="t-merge", provider="sarvam", enabled=True,
+                fields={"rate_stt_per_min": 0.49,
+                        "rate_llm_input_per_1m": 15,
+                        "rate_llm_output_per_1m": 60,
+                        "rate_llm_cached_per_1m": 5,
+                        "rate_tts_per_1k_chars": 3}))
+            _dbm.add(_models_new.ProviderSetting(
+                tenant_id="t-merge", provider="twilio", enabled=True,
+                fields={"rate_telephony_per_min": 10}))
+            _dbm.commit()
+            _ses = _models_new.CallSession(
+                session_id="ses_merge", tenant_id="t-merge",
+                attempt_id="att1", provider_mode="self_hosted",
+                provider_call_id="CA999", channel="", state="QUEUED",
+                stt_status="active", llm_status="active",
+                transcript=[{"speaker": "customer", "text": "hello",
+                             "offset_s": 1.0}])
+            _dbm.add(_ses)
+            _dbm.commit()
+            _hang = {"final_state": "COMPLETED",
+                     "end_reason": "call_completed", "disposition": "",
+                     "confidence": 0.0,
+                     "summary": "[SELF-HOSTED] Twilio reported the call "
+                                "completed (hangup callback) before the media "
+                                "stream finalized it.",
+                     "captured_fields": {}, "duration_s": 56,
+                     "recording_url": "", "transcript": [],
+                     "cost_breakdown": {"telephony": 0, "stt": 0, "llm": 0,
+                                        "tts": 0, "total": 0,
+                                        "currency": "INR",
+                                        "mode": "self_hosted"},
+                     "review_required": False}
+            _res1, _created1 = _orch_new.finalize_attempt(_dbm, _ses, _hang)
+            _ok_a = (_created1 is True and _res1.disposition == ""
+                     and _res1.review_required is True
+                     and _res1.duration_s == 56
+                     and _ses.end_reason == "call_completed")
+            _stream = {"final_state": "COMPLETED",
+                       "end_reason": "stream_closed",
+                       "disposition": "RPC_CONFIRMED", "confidence": 0.9,
+                       "summary": "classified",
+                       "captured_fields": {"identity_confirmed": True},
+                       "duration_s": 60,
+                       "recording_url": "",
+                       "transcript": [{"speaker": "agent", "text": "hi",
+                                       "offset_s": 2.0}],
+                       "cost_breakdown": {"telephony": 0, "stt": 0,
+                                          "llm": 0, "tts": 0, "total": 0,
+                                          "currency": "INR",
+                                          "mode": "self_hosted"},
+                       "cost_metrics": {"tts_frames": 100,
+                                        "tts_chars": 200,
+                                        "llm_usage": {"prompt_tokens": 100,
+                                                      "completion_tokens": 10,
+                                                      "cached_tokens": 0}},
+                       "review_required": False}
+            _res2, _created2 = _orch_new.finalize_attempt(
+                _dbm, _ses, _stream)
+            _ok_b = (_created2 is False
+                     and _res2.disposition == "RPC_CONFIRMED"
+                     and _res2.captured_fields.get("identity_confirmed")
+                     is True
+                     and _res2.review_required is False
+                     and _res2.duration_s == 56
+                     and _ses.end_reason == "call_completed"
+                     and (_res2.cost_breakdown or {}).get("total", 0) > 0)
+            _res3, _ = _orch_new.finalize_attempt(
+                _dbm, _ses, {**_stream, "disposition": "HOSTILE"})
+            _ok_c = _res3.disposition == "RPC_CONFIRMED"
+            return _ok_a and _ok_b and _ok_c
+        except Exception:
+            return False
+
+    check6("Disposition: hangup-first result flagged for review, later stream finalize upgrades classification without touching state/end_reason/duration",
+           _merge_ok(), "")
+
+    # Twilio leg, self-hosted: the SID on the session is used
+    # directly (no Vapi hop), and an INR breakdown never sums a USD
+    # Twilio price into total_all_in.
+    def _twilio_cost_ok():
+        try:
+            from sqlalchemy import create_engine as _sa_new3
+            from sqlalchemy.orm import sessionmaker as _sm_new3
+            _eng_db3 = _sa_new3("sqlite://")
+            _models_new.Base.metadata.create_all(_eng_db3)
+            _dbt = _sm_new3(bind=_eng_db3)()
+            _ses_t = _models_new.CallSession(
+                session_id="ses_tw", tenant_id="t-tw",
+                attempt_id="att1", provider_mode="self_hosted",
+                provider_call_id="CA1234567890abcdef", channel="",
+                state="COMPLETED")
+            _dbt.add(_ses_t)
+            _res_t = _models_new.CallResult(
+                tenant_id="t-tw", session_id="ses_tw", disposition="",
+                cost_breakdown={"telephony": 0, "stt": 0, "llm": 0,
+                                "tts": 0, "total": 0, "currency": "INR",
+                                "mode": "self_hosted",
+                                "cost_source": "rate_card"})
+            _dbt.add(_res_t)
+            _dbt.commit()
+            _orig_creds = _tw_new.resolve_twilio_creds
+            _orig_price = _tw_new._twilio_price
+            _orig_vapi = _tw_new._vapi_twilio_sid
+            _vapi_called = [False]
+
+            def _no_vapi(db, session):
+                _vapi_called[0] = True
+                raise AssertionError("Vapi hop must not run")
+
+            _tw_new.resolve_twilio_creds = lambda db, tid: ("ACxxx", "tok")
+            _tw_new._twilio_price = lambda sid, tok, twsid: (
+                0.5, "USD", "completed")
+            _tw_new._vapi_twilio_sid = _no_vapi
+            try:
+                _cost = _res_t.cost_breakdown
+                _tw_new.ensure_twilio_cost(_dbt, _ses_t, _res_t, _cost)
+            finally:
+                _tw_new.resolve_twilio_creds = _orig_creds
+                _tw_new._twilio_price = _orig_price
+                _tw_new._vapi_twilio_sid = _orig_vapi
+            _dbt.refresh(_res_t)
+            _tw = _cost.get("twilio") or {}
+            return (_vapi_called[0] is False
+                    and _tw.get("status") == "completed"
+                    and _tw.get("cost") == 0.5
+                    and _tw.get("currency") == "USD"
+                    and _tw.get("call_sid") == "CA1234567890abcdef"
+                    and "total_all_in" not in _cost
+                    and (_res_t.cost_breakdown or {}).get(
+                        "twilio", {}).get("status") == "completed")
+        except Exception:
+            return False
+
+    check6("Cost: self-hosted Twilio leg resolves the SID directly (no Vapi hop) and never sums USD into an INR total",
+           _twilio_cost_ok(), "")
+
+    # ── Typing bed (Oct 26, 2026) ──
+    # The bed is synthesized in code (no downloaded audio): a 12 s
+    # loop of key-click bursts with silent margins so wrapping is
+    # click-free. It mixes UNDER speech (frame count unchanged) and
+    # plays bed-only frames in gaps; neither touches TTS metering or
+    # cost. NOTE on the suite: the exact-byte pump tests above run
+    # with TYPING_BED_ENABLED=false (a mixed byte stream cannot match
+    # an unmixed expectation, and the bed task's gap frames would
+    # land in the captured frames) — this section enables the bed
+    # per-engine and tests the feature itself.
+    print("── Typing bed: synthesized loop, under-speech mix, gap frames ──")
+    import asyncio as _asyncio_bed
+    from types import SimpleNamespace as _NS_bed
+    _sys_bed_path = os.path.join(os.getcwd(), "backend")
+    if _sys_bed_path not in sys.path:
+        sys.path.insert(0, _sys_bed_path)
+    import app.conversation as _conv_bed
+    import struct as _struct_bed
+    _loop_bed = _conv_bed._typing_loop_pcm16()
+    _samp_bed = _struct_bed.unpack("<96000h", _loop_bed)
+    check6("Bed: 12 s loop, silent margins, deterministic, wraps clean",
+           len(_loop_bed) == 192000
+           and max(abs(s) for s in _samp_bed[:2400]) == 0
+           and max(abs(s) for s in _samp_bed[-2400:]) == 0
+           and max(abs(s) for s in _samp_bed) > 5000
+           and _conv_bed._typing_loop_pcm16() == _loop_bed
+           and _conv_bed._bed_samples(_loop_bed, 95900, 160)[0]
+           == _loop_bed[95900 * 2:] + _loop_bed[:60 * 2]
+           and _conv_bed._bed_samples(_loop_bed, 95900, 160)[1] == 60,
+           (len(_loop_bed), max(abs(s) for s in _samp_bed)))
+
+    async def _run_bed():
+        _agent_bed = _NS_bed(
+            prompt="You are a test agent. Greet.", llm_model="sarvam-105b",
+            tts_voice_id="", voice_gender="female", max_duration_s=300,
+            max_turns=50, silence_prompt_after_s=3600,
+            silence_max_prompts=1, captured_fields=[])
+        _camp_bed = _NS_bed(product="vehicle_loan",
+                            settlement_authority_pct=None)
+        _lead_bed = _NS_bed(name="Rohit", bank_name="Tata Capital",
+                            state="West Bengal", phone_number="9500000001",
+                            agent_fields={})
+        _frames_bed = []
+
+        async def _send_bed(b):
+            await _asyncio_bed.sleep(0.02)
+            _frames_bed.append(b)
+
+        async def _close_bed():
+            pass
+
+        _eng_bed = _conv_bed.ConversationEngine(
+            session_id="bed-smoke", agent=_agent_bed, campaign=_camp_bed,
+            lead=_lead_bed, language="hi-IN", api_key="<redacted>",
+            send_audio=_send_bed, close_stream=_close_bed)
+        _eng_bed._bed_enabled = True
+        _eng_bed._bed_pos = 30000  # a burst region (loop head is silent)
+
+        async def _chunks_bed():
+            yield b"\x00" * 320  # 2 frames of digital silence as voice
+
+        _st_bed, _n_bed = await _eng_bed._pump_audio(_chunks_bed())
+        _pump_ok = (_st_bed == "spoken" and _n_bed == 2
+                    and len(_frames_bed) == 2
+                    and all(len(f) == 160 for f in _frames_bed)
+                    and _eng_bed.metrics()["tts_frames"] == 2
+                    and _eng_bed.metrics()["bed_only_frames"] == 0)
+        _eng_gap = _conv_bed.ConversationEngine(
+            session_id="bed-smoke-gap", agent=_agent_bed,
+            campaign=_camp_bed, lead=_lead_bed, language="hi-IN",
+            api_key="<redacted>", send_audio=_send_bed,
+            close_stream=_close_bed)
+        _eng_gap._bed_enabled = True
+        _task_gap = _asyncio_bed.create_task(_eng_gap._bed_loop())
+        await _asyncio_bed.sleep(0.15)
+        _eng_gap._ended = True
+        await _asyncio_bed.wait_for(_task_gap, timeout=2)
+        _gap_ok = (_eng_gap.metrics()["bed_only_frames"] >= 2
+                   and _eng_gap.metrics()["tts_frames"] == 0)
+        return _pump_ok, _gap_ok, _eng_bed.metrics(), _eng_gap.metrics()
+
+    _bed_pump_ok, _bed_gap_ok, _bed_m, _bed_gm = _asyncio_bed.run(_run_bed())
+    check6("Bed: pump mixes under speech, frame count + TTS metering unchanged",
+           _bed_pump_ok, _bed_m)
+    check6("Bed: gap loop sends bed-only frames, never TTS frames",
+           _bed_gap_ok, _bed_gm)
+
+    _stt_hold.append_turn = _orig_append_hold
 
 finally:
     for _p in _procs6:

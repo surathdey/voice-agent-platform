@@ -20,6 +20,13 @@ Two transports register alongside the stub in app.orchestrator.TRANSPORTS:
   path with an honestly-labelled spike result. The conversation brain
   (Sarvam STT → LLM → Bulbul TTS) plugs into that stream endpoint in
   A7/A8; nothing here pretends a conversation happened.
+- **TwilioTransport (self_hosted, alternative PSTN)** — the same
+  boundary through Twilio: creates the call via Twilio's REST API with
+  an answer URL returning TwiML that opens a bidirectional media
+  stream to the Twilio stream endpoint. Selected per tenant by the
+  "pstn" provider setting (plivo | twilio, default plivo) when the
+  tenant's Twilio credentials are configured; Plivo stays the default
+  and its code path is untouched.
 
 Honesty gates (unchanged from A5): a real transport runs ONLY when
 TELEPHONY_MODE equals the campaign's mode AND A4 says the tenant's
@@ -94,7 +101,10 @@ def http_json(method: str, url: str, headers: dict, payload: dict | None):
 
 
 def http_form(url: str, headers: dict, form: dict):
-    data = urllib.parse.urlencode(form).encode()
+    # doseq=True so list values encode as repeated parameters (Twilio's
+    # StatusCallbackEvent needs one parameter per event; a single
+    # space-separated value is ignored by Twilio and no callbacks arrive).
+    data = urllib.parse.urlencode(form, doseq=True).encode()
     headers = {**headers, "Content-Type": "application/x-www-form-urlencoded"}
     return _request("POST", url, headers, data)
 
@@ -133,6 +143,12 @@ def lead_variables(campaign: Campaign, lead: Lead) -> dict:
     prompt addresses the lead through placeholders (e.g. {{lead_name}},
     {{bank_name}} in the seeded RPI prompt); both spellings are carried."""
     af = lead.agent_fields or {}
+    _acct = (
+        af.get("account_no", "") or af.get("account_number", "")
+        or (af.get("product_identifier", "") if af.get("product_identifier_type") == "account_number" else "")
+    )
+    _acct = str(_acct).strip()
+    _rc = str(af.get("product_identifier", "") or "").strip()
     return {
         "name": lead.name or "",
         "lead_name": lead.name or "",
@@ -143,10 +159,18 @@ def lead_variables(campaign: Campaign, lead: Lead) -> dict:
         "product": campaign.product or "",
         "product_identifier": af.get("product_identifier", "") or "",
         "product_identifier_type": af.get("product_identifier_type", "") or "",
-        "account_number": (
-            af.get("account_no", "") or af.get("account_number", "")
-            or (af.get("product_identifier", "") if af.get("product_identifier_type") == "account_number" else "")
-        ),
+        # Pre-computed numbers (2026-10-27): the model repeatedly failed
+        # to EXTRACT these from the raw values on live calls — it spoke
+        # 9876 (first four) as the "last four digits" of 987654 in
+        # Hindi and English, and the full 987654 in Bengali — despite
+        # an explicit prompt guardrail. So the platform computes them
+        # and the prompt reads the ready value instead of computing:
+        # account_last4 is the final four characters, and
+        # product_identifier_spelled is the RC already split into
+        # single characters ("W B 0 2 A B 1 2 3 4").
+        "account_last4": _acct[-4:] if len(_acct) >= 4 else _acct,
+        "product_identifier_spelled": " ".join(_rc),
+        "account_number": _acct,
         "principal": af.get("principal", "") or "",
         "loan_type": af.get("loan_type", "") or _loan_type_label(campaign.product),
         "due_date": af.get("due_date", "") or "",
@@ -257,13 +281,65 @@ def _vapi_transcriber(fields: dict, language: str) -> dict:
     shipped defaults (2026-10-23): Bengali needs nova-3, because Vapi's
     nova-2 language enum contains NO Bengali — a bn placement on nova-2
     is rejected HTTP 400 before anything else runs; Hindi and English
-    are in the nova-2 enum and stay there."""
+    are in the nova-2 enum and stay there.
+    NOTE 2026-10-26: language="multi" was tried here for mid-call
+    switching and REVERTED the same night — it garbled Hindi
+    transcription on a live call (ses_0606c033f56a4177: mangled
+    opening, "No, no, no", HOSTILE) and was pulled before the Oct 28
+    demo. A/B 2026-10-27 (Surath's P1 order, demo-eve): multi was
+    re-enabled for a controlled live A/B — and FAILED the control:
+    the Hindi control call (ses_af2fd27fc6374274) looped its intro
+    because multi on nova-2 mangled Hindi input into Latin-script
+    garbage ("haan haan" never registered, HOSTILE mislabel again).
+    nova-2 + multi is OUT (failed twice). REVERTED to monolingual
+    2026-10-27 00:26 for platform safety; variant nova-3 + multi
+    RUNNING since 00:27 on Surath's go (see below) — the verdict
+    decides whether it stays or monolingual returns before the demo."""
     code = (language or "hi").split("-")[0].strip().lower() or "hi"
     provider = (fields.get(f"{code}_transcriber_provider") or "").strip() or "deepgram"
     model = (fields.get(f"{code}_transcriber_model") or "").strip()
     if not model:
         model = "nova-3" if code == "bn" else "nova-2"
+    # VARIANT 2026-10-27 (Surath's P1 order): nova-3 + multi. nova-2 +
+    # multi mangled Hindi input itself on both attempts, so the
+    # variant forces Deepgram's newer model with multilingual
+    # detection. A/B-only: the verdict decides whether this stays or
+    # monolingual returns before the demo.
+    if provider == "deepgram":
+        return {"provider": provider, "model": "nova-3", "language": "multi"}
     return {"provider": provider, "model": model, "language": code}
+
+
+# Phrases Vapi listens for to end a managed call (shared with the
+# managed end-call net in routers/telephony.py — the net also ends
+# the call when the assistant speaks one of these alone after a
+# closing, so the two lists must never drift apart).
+END_CALL_PHRASES = [
+    "ভালো থাকবেন",
+    "ভালো থাকবে",
+    "ভালো থাক",
+    "आपका दिन शुभ हो",
+    "Have a good day",
+    "চিন্তা করবেন না",
+    "चिंता न करें",
+    "don't worry about this right now",
+]
+
+
+def _today_str(tz_name):
+    """'27 October 2026' in the campaign's timezone (UTC fallback).
+    Never raises — a bad timezone name falls back to UTC."""
+    from datetime import datetime, timezone
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(tz_name) if tz_name else timezone.utc
+    except Exception:
+        tz = timezone.utc
+    try:
+        now = datetime.now(tz)
+    except Exception:
+        now = datetime.now(timezone.utc)
+    return f"{now.day} {now.strftime('%B %Y')}"
 
 
 def build_vapi_payload(session: CallSession, agent: AgentConfig,
@@ -289,6 +365,34 @@ def build_vapi_payload(session: CallSession, agent: AgentConfig,
     from .orchestrator import disposition_buckets  # deferred: import cycle
 
     language = resolve_language(agent, lead)
+    # Language grounding (managed): the agent's prompt lists one opening
+    # line per language and says "in the call's language", but never
+    # states which language this call is — so the model guessed (it
+    # picked the first-listed English template on a Hindi call,
+    # 2026-10-26). Ground the OPENING only, per call, from the same
+    # resolved language that already picks voice + transcriber:
+    # West Bengal -> Bengali, default -> Hindi, preferred_language
+    # wins. Scoped to the opening on purpose: the prompt's LANGUAGE
+    # section still governs mid-call switching, so a customer who
+    # answers in another language still gets switched to.
+    _LANG_NAMES = {"hi": "Hindi", "bn": "Bengali", "en": "English"}
+    _lang_code = (language or "hi").split("-")[0].strip().lower() or "hi"
+    _lang_name = _LANG_NAMES.get(_lang_code, _lang_code)
+    # Date grounding (managed): the model has no current-date context,
+    # so a confirmed "15th November" was read back as 2023 on live
+    # calls in all three languages (2026-10-27) even after the prompt
+    # gained a speak-the-year rule — the rule fixed the FORM (a year
+    # was spoken) but not the VALUE. State today per the campaign's
+    # timezone (UTC fallback) so year-bearing read-backs land in the
+    # right year. Placed BEFORE the language bracket so the message
+    # still ends with the grounding line the tests assert.
+    _today = _today_str(getattr(campaign, "timezone", None))
+    system_content = (agent.prompt or "") + (
+        f"\n\n[Today is {_today}. When you confirm a date, always "
+        f"include the year.]\n"
+        f"[The call's language is {_lang_name}. Begin the call in "
+        f"{_lang_name}, including the opening line.]"
+    )
     model_provider, model_name = _split_provider(
         vapi_fields.get("default_model"), _FALLBACK_MODEL)
 
@@ -315,7 +419,7 @@ def build_vapi_payload(session: CallSession, agent: AgentConfig,
         "model": {
             "provider": model_provider,
             "model": model_name,
-            "messages": [{"role": "system", "content": agent.prompt or ""}],
+            "messages": [{"role": "system", "content": system_content}],
             # NO tools on purpose — above all no endCall tool. Live
             # A/B 2026-10-24: without any tool, the RPI v3 test call
             # spoke its opening and the full verbatim closing (the call
@@ -331,6 +435,13 @@ def build_vapi_payload(session: CallSession, agent: AgentConfig,
         "firstMessageMode": "assistant-speaks-first",
         "serverUrl": webhook_url,
         "serverUrlSecret": settings.WEBHOOK_SECRET,
+        # Explicit serverMessages: Vapi's default server set does NOT
+        # include "transcript" (it is client-side by default), so
+        # without this the managed end-call net in
+        # routers/telephony.py never sees a closing. end-of-call-report
+        # stays because the finalize path depends on it; nothing else
+        # in the default set is consumed by the platform.
+        "serverMessages": ["end-of-call-report", "transcript"],
         "analysisPlan": {
             "summaryPlan": {"enabled": True},
             "structuredDataSchema": {
@@ -355,16 +466,7 @@ def build_vapi_payload(session: CallSession, agent: AgentConfig,
         # the Bengali closings actually produced on live calls
         # (2026-10-25, twice on PTP retest v2) — so it is listed
         # alongside the full form; it occurs only at closings too.
-        "endCallPhrases": [
-            "ভালো থাকবেন",
-            "ভালো থাকবে",
-            "ভালো থাক",
-            "आपका दिन शुभ हो",
-            "Have a good day",
-            "চিন্তা করবেন না",
-            "चिंता न करें",
-            "don't worry about this right now",
-        ],
+        "endCallPhrases": END_CALL_PHRASES,
     }
     credential_id = (vapi_fields.get("server_credential_id") or "").strip()
     if credential_id:
@@ -595,10 +697,12 @@ def plivo_answer_xml(session_id: str) -> str:
     )
 
 
-def plivo_stream_outcome(duration_s: int, stt_status: str = "",
-                         stt_language: str = "", stt_detail: str = "",
-                         transcript: list | None = None) -> dict:
-    """§8.2 outcome for a call whose media stream opened and closed.
+def _self_hosted_stream_outcome(provider_label: str, duration_s: int, stt_status: str = "",
+                                stt_language: str = "", stt_detail: str = "",
+                                transcript: list | None = None) -> dict:
+    """§8.2 outcome for a self-hosted call whose media stream opened and
+    closed, shared by the Plivo and Twilio flavours — only the provider
+    label in the summary strings differs.
 
     Three honest shapes, by how the A7 STT leg went (stt_status is the
     record on the session row; the stream handler passes it through):
@@ -620,7 +724,7 @@ def plivo_stream_outcome(duration_s: int, stt_status: str = "",
             "end_reason": "stream_closed",
             "disposition": "",
             "confidence": 0.0,
-            "summary": (f"[SELF-HOSTED] Plivo call completed with live Sarvam "
+            "summary": (f"[SELF-HOSTED] {provider_label} call completed with live Sarvam "
                         f"Saaras transcription ({stt_language or 'language n/a'}) "
                         f"— {len(turns)} final segment(s) captured in the "
                         "transcript. No speech was generated — the reply "
@@ -645,7 +749,8 @@ def plivo_stream_outcome(duration_s: int, stt_status: str = "",
             "end_reason": "stream_closed",
             "disposition": "",
             "confidence": 0.0,
-            "summary": ("[SELF-HOSTED SPIKE] Plivo call connected and the media "
+            "summary": ("[SELF-HOSTED SPIKE] "
+                        f"{provider_label} call connected and the media "
                         f"stream opened and closed cleanly, but the Sarvam STT "
                         f"session failed ({reason}) — the transcript is "
                         "partial. No speech was generated — the conversation "
@@ -661,7 +766,8 @@ def plivo_stream_outcome(duration_s: int, stt_status: str = "",
         "end_reason": "stream_closed",
         "disposition": "",
         "confidence": 0.0,
-        "summary": ("[SELF-HOSTED SPIKE] Plivo call connected and the media "
+        "summary": ("[SELF-HOSTED SPIKE] "
+                    f"{provider_label} call connected and the media "
                     "stream opened and closed cleanly. No speech was "
                     "generated or heard — the conversation brain (Sarvam "
                     "STT → LLM → TTS) lands in A7/A8."),
@@ -671,6 +777,24 @@ def plivo_stream_outcome(duration_s: int, stt_status: str = "",
         "transcript": [],
         "cost_breakdown": _zero_cost("self_hosted", "INR"),
     }
+
+
+def plivo_stream_outcome(duration_s: int, stt_status: str = "",
+                         stt_language: str = "", stt_detail: str = "",
+                         transcript: list | None = None) -> dict:
+    """Plivo flavour of the shared self-hosted stream outcome — the
+    exact A6/A7 shape, unchanged (provider label "Plivo")."""
+    return _self_hosted_stream_outcome(
+        "Plivo", duration_s, stt_status, stt_language, stt_detail, transcript)
+
+
+def twilio_stream_outcome(duration_s: int, stt_status: str = "",
+                          stt_language: str = "", stt_detail: str = "",
+                          transcript: list | None = None) -> dict:
+    """Twilio flavour of the shared self-hosted stream outcome — the
+    same three honest shapes, provider label "Twilio"."""
+    return _self_hosted_stream_outcome(
+        "Twilio", duration_s, stt_status, stt_language, stt_detail, transcript)
 
 
 # Plivo CallStatus → (§8.2 final_state, end_reason) for terminal states.
@@ -789,3 +913,185 @@ class PlivoTransport:
         return _placement_failed(
             "self_hosted", "INR", "Plivo", status, err,
             (body.get("message") or body.get("error")) if isinstance(body, dict) else None)
+
+
+# ── Self-hosted transport: Twilio (Plivo alternative) ───────────────────
+
+def twilio_answer_xml(session_id: str) -> str:
+    """The answer-URL document for Twilio (§8.3, Twilio flavour): a
+    <Connect><Stream> opening the bidirectional media stream to our
+    Twilio stream endpoint, session-bound by the URL path and by a
+    stream Parameter. <Connect> is REQUIRED here, not <Start>: a
+    <Start><Stream> does not block the call, so with nothing after it
+    Twilio ends the call the moment the TwiML ends — the first two
+    pilots cut instantly on pickup for exactly this reason. <Connect>
+    holds the call open while the stream runs, and closing the stream
+    ends the call, matching the Plivo behaviour. The stream URL must be
+    wss:// in production (ws_base() derives wss from an https
+    PUBLIC_BASE_URL); a local http base yields ws://, which Twilio
+    rejects at call time, so live Twilio calls need the public https
+    base. No <Say> — the brain speaks through the stream, never
+    through TwiML speech."""
+    stream_url = f"{ws_base()}/api/telephony/twilio/stream/{session_id}"
+    status_url = f"{public_base()}/api/telephony/twilio/stream-status/{session_id}"
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        "<Response>\n"
+        f'  <Connect><Stream url="{stream_url}" '
+        f'statusCallback="{status_url}" statusCallbackMethod="POST">'
+        f'<Parameter name="session_id" value="{session_id}"/></Stream></Connect>\n'
+        "</Response>"
+    )
+
+
+def parse_twilio_stream_event(event: dict) -> tuple[str, str, bytes]:
+    """Parse one Twilio media-stream WebSocket message into
+    (kind, stream_sid, audio_bytes) — pure, unit-testable.
+
+    Kinds: "connected" | "start" | "media" | "mark" | "stop" |
+    "unknown". Audio is the base64 μ-law 8 kHz payload of a "media"
+    event, decoded; an undecodable payload yields b"" (the stream
+    handler skips empty audio, same as the Plivo pump). Twilio's media
+    format is μ-law at 8 kHz — the SAME format the Saaras STT leg is
+    fed on the Plivo path — so no transcoding happens anywhere: the
+    decoded bytes are fed to pipeline.feed() verbatim, and the engine's
+    160-byte μ-law frames go back as Twilio media messages verbatim
+    (base64 only at the WebSocket boundary, as on Plivo)."""
+    if not isinstance(event, dict):
+        return "unknown", "", b""
+    kind = (event.get("event") or "").strip().lower()
+    start = event.get("start") or {}
+    sid = event.get("streamSid") or start.get("streamSid") or ""
+    if kind == "media":
+        payload = (event.get("media") or {}).get("payload") or ""
+        try:
+            audio = base64.b64decode(payload, validate=True)
+        except Exception:
+            audio = b""
+        return "media", sid, audio
+    if kind in ("connected", "start", "mark", "stop"):
+        return kind, sid, b""
+    return "unknown", sid, b""
+
+
+# Twilio CallStatus → (§8.2 final_state, end_reason) for terminal states.
+_TWILIO_TERMINAL = {
+    "completed": ("COMPLETED", "call_completed"),
+    "busy": ("BUSY", "busy"),
+    "failed": ("FAILED", "provider_error"),
+    "no-answer": ("NO_ANSWER", "no_answer"),
+    "canceled": ("FAILED", "cancelled"),
+}
+
+
+def twilio_terminal_outcome(call_status: str, form: dict) -> dict | None:
+    """§8.2 outcome for a terminal Twilio status callback, or None when
+    the status is not terminal (queued / initiated / ringing /
+    in-progress are state updates, handled by the router). A completed
+    call whose AnsweredBy says a machine answered maps to VOICEMAIL —
+    the Twilio equivalent of Plivo's machine status."""
+    key = (call_status or "").strip().lower()
+    if key not in _TWILIO_TERMINAL:
+        return None
+    final_state, end_reason = _TWILIO_TERMINAL[key]
+    if key == "completed" and (form.get("AnsweredBy") or "").strip().lower().startswith("machine"):
+        final_state, end_reason = "VOICEMAIL", "amd_voicemail"
+    duration = 0
+    try:
+        duration = int(form.get("CallDuration") or 0)
+    except (TypeError, ValueError):
+        duration = 0
+    summary = {
+        "COMPLETED": ("[SELF-HOSTED] Twilio reported the call completed "
+                      "(hangup callback) before the media stream finalized it."),
+        "NO_ANSWER": "Twilio reported the call was not answered.",
+        "BUSY": "Twilio reported the number was busy.",
+        "FAILED": f"Twilio reported the call ended as {key}.",
+        "VOICEMAIL": "Twilio's answering-machine detection reported a machine.",
+    }[final_state]
+    return {
+        "final_state": final_state,
+        "end_reason": end_reason,
+        "disposition": "",
+        "confidence": 0.0,
+        "summary": summary,
+        "captured_fields": {},
+        "duration_s": duration,
+        "recording_url": form.get("RecordingUrl", "") or "",
+        "transcript": [],
+        "cost_breakdown": _zero_cost("self_hosted", "INR"),
+    }
+
+
+def verify_twilio_signature(url: str, params: dict, auth_token: str,
+                            signature: str) -> bool:
+    """Twilio request-signature check (Twilio's scheme): base64
+    HMAC-SHA1 over the callback URL + the sorted form parameters
+    concatenated. (Plivo's scheme is SHA256 — the two must not be
+    confused.)"""
+    if not auth_token or not signature:
+        return False
+    base = url + "".join(f"{k}{params[k]}" for k in sorted(params))
+    digest = hmac.new(auth_token.encode(), base.encode(), hashlib.sha1).digest()
+    expected = base64.b64encode(digest).decode()
+    return hmac.compare_digest(expected, signature)
+
+
+class TwilioTransport:
+    """Self-hosted telephony via Twilio — the Plivo alternative.
+
+    Same boundary as PlivoTransport: run() places the call via Twilio's
+    REST API with our answer URL; the call finalizes through the Twilio
+    stream endpoint / status callbacks (routers/telephony.py) into the
+    same finalize path. run() returns None once Twilio accepts the
+    call. A tenant without Twilio credentials is honestly FAILED —
+    never silently placed on Plivo.
+    """
+
+    name = "self_hosted"
+
+    def run(self, db: Session, session: CallSession, agent: AgentConfig,
+            campaign: Campaign, seq: int, run_start: datetime):
+        sid, token = prov.twilio_credentials(db, session.tenant_id)
+        if not sid or not token:
+            return {
+                "final_state": "FAILED",
+                "end_reason": "provider_error",
+                "disposition": "",
+                "confidence": 0.0,
+                "summary": ("Self-hosted PSTN is set to Twilio but no Twilio "
+                            "credentials are configured for this tenant — "
+                            "no call was placed."),
+                "captured_fields": {},
+                "duration_s": 0,
+                "recording_url": "",
+                "transcript": [],
+                "cost_breakdown": _zero_cost("self_hosted", "INR"),
+            }
+        answer_url = f"{public_base()}/api/telephony/twilio/answer/{session.session_id}"
+        form = {
+            "From": session.from_number or "",
+            "To": session.to_number or "",
+            "Url": answer_url,
+            "Method": "POST",
+            "StatusCallback": f"{public_base()}/api/telephony/twilio/status/{session.session_id}",
+            # Repeated parameters: Twilio ignores a single space-separated
+            # value, which is why the first two pilots got zero callbacks.
+            "StatusCallbackEvent": ["initiated", "ringing", "answered", "completed"],
+            "StatusCallbackMethod": "POST",
+            "Record": "true",
+        }
+        status, body, err = http_form(
+            f"{settings.TWILIO_BASE_URL.rstrip('/')}/2010-04-01/Accounts/{sid}/Calls.json",
+            {"Authorization": _basic_auth(sid, token)},
+            form)
+        session.started_at = datetime.utcnow()
+        if status and 200 <= status < 300 and body and body.get("sid"):
+            session.provider_call_id = body["sid"]
+            session.state = "DIALING"
+            db.commit()
+            return None  # placed — stream / status callbacks finalize it
+        db.commit()
+        return _placement_failed(
+            "self_hosted", "INR", "Twilio", status, err,
+            (body.get("message") or body.get("code")) if isinstance(body, dict) else None)

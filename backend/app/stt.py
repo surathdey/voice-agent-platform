@@ -160,34 +160,43 @@ def append_final_turn(session_id: str, turn: dict) -> None:
 # ── The Saaras streaming client (one connection per call) ───────────────
 
 def _audio_message(mulaw: bytes) -> str:
-    """One Saaras audio message: the Plivo frame (μ-law, 8 kHz) base64'd
-    into the streaming envelope, format declared alongside."""
-    return json.dumps({"audio": {
-        "data": base64.b64encode(mulaw).decode(),
-        "encoding": "audio/x-mulaw",
-        "sample_rate": 8000,
-    }})
+    """One Saaras realtime audio message: the Twilio/Plivo frame (μ-law,
+    8 kHz) base64'd into the realtime envelope. The realtime endpoint
+    declares encoding + sample rate in the connection query params, so
+    the per-frame message carries only the event type and the audio."""
+    return json.dumps({"event": "audio_input",
+                       "audio": base64.b64encode(mulaw).decode()})
 
 
 def _extract_transcript(raw) -> tuple[str, bool] | None:
-    """Pull (text, is_final) out of one Saaras message, tolerating the
-    documented envelope ({"type": "data", "data": {transcript, is_final}})
-    and a flat shape. Returns None for non-transcript messages; raises
-    ValueError on a provider error message."""
+    """Pull (text, is_final) out of one Saaras realtime message.
+    The realtime endpoint emits typed events: `transcript.partial`
+    (interim text -> the engine's barge-in / silence signal) and
+    `transcript.final` (one finished utterance -> a transcript turn).
+    VAD / session / pong events carry no text and are ignored. A fatal
+    `error` event raises ValueError (the session records it as failed);
+    a non-fatal error (e.g. a rejected config update) is ignored — the
+    session continues on its previous config. Returns None for
+    non-transcript messages. Raises ValueError on a fatal provider
+    error message."""
     try:
         msg = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
     except Exception:
         return None
     if not isinstance(msg, dict):
         return None
-    if msg.get("type") == "error":
-        data = msg.get("data") or {}
-        raise ValueError(data.get("error_code") or "provider_error")
-    data = msg.get("data") if isinstance(msg.get("data"), dict) else msg
-    text = data.get("transcript")
-    if not isinstance(text, str):
+    event = msg.get("event")
+    if event == "transcript.partial":
+        text = msg.get("text")
+        return (text, False) if isinstance(text, str) else None
+    if event == "transcript.final":
+        text = msg.get("text")
+        return (text, True) if isinstance(text, str) else None
+    if event == "error":
+        if msg.get("is_fatal"):
+            raise ValueError(msg.get("code") or "provider_error")
         return None
-    return text, bool(data.get("is_final"))
+    return None
 
 
 class SaarasSttSession:
@@ -216,8 +225,36 @@ class SaarasSttSession:
         self.on_partial = on_partial
         self._api_key = api_key
         base = (settings.SARVAM_WS_URL or "wss://api.sarvam.ai").rstrip("/")
-        self._url = (f"{base}/speech-to-text/ws"
-                     f"?language-code={language}&model={settings.SARVAM_STT_MODEL}")
+        # Realtime endpoint (official sarvamai SDK protocol): μ-law is a
+        # supported encoding, 8 kHz is declared in the query, and VAD
+        # endpointing drives turn boundaries — partials stream during
+        # the utterance, one final lands per utterance. The legacy
+        # /speech-to-text/ws endpoint takes WAV/PCM only and emits no
+        # partials, and model saaras:v2.5 is not a valid STT model on
+        # the current API — both mismatches closed the pilot call's
+        # session, so this client targets realtime only.
+        self._url = (f"{base}/speech-to-text-realtime/ws"
+                     f"?language_code={language}"
+                     f"&model={settings.SARVAM_STT_REALTIME_MODEL}"
+                     f"&encoding=mulaw&sample_rate=8000"
+                     f"&endpointing=vad&mode=transcribe")
+        # Optional VAD tuning (Oct 26, 2026 — all unset by default, so
+        # the URL above is unchanged unless an operator sets them):
+        # the realtime endpoint's own query params, confirmed from
+        # LiveKit's Sarvam plugin source + Pipecat's Sarvam service
+        # (both clients of this same endpoint): threshold = VAD
+        # activation threshold, min_speech_duration_ms, and
+        # silence_duration_ms (the end-of-turn silence). Any value
+        # change needs a live A/B test — too-low silence splits
+        # utterances into false turns.
+        if settings.SARVAM_VAD_SOT_THRESHOLD:
+            self._url += f"&threshold={settings.SARVAM_VAD_SOT_THRESHOLD}"
+        if settings.SARVAM_VAD_MIN_SPEECH_MS:
+            self._url += ("&min_speech_duration_ms="
+                          f"{settings.SARVAM_VAD_MIN_SPEECH_MS}")
+        if settings.SARVAM_VAD_MIN_SILENCE_MS:
+            self._url += ("&silence_duration_ms="
+                          f"{settings.SARVAM_VAD_MIN_SILENCE_MS}")
         self._ws = None
         self._task: asyncio.Task | None = None
         self._buffer: list[bytes] = []

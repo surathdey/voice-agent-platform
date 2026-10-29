@@ -452,7 +452,7 @@ async def browser_stream(websocket: WebSocket, session_id: str):
             db.commit()
             if engine.llm_status != "failed" \
                     and any(t.get("speaker") == "agent" for t in engine.turns):
-                classification = await asyncio.to_thread(
+                classification, classify_usage = await asyncio.to_thread(
                     conversation.classify_call, api_key, engine.model,
                     engine.rendered_prompt, engine.captured_fields,
                     engine.turns)
@@ -494,7 +494,14 @@ async def browser_stream(websocket: WebSocket, session_id: str):
             # finalize (see routers/telephony.py) — the TTS leg is
             # priced on the synthesized audio actually pumped; the
             # browser channel's telephony leg is labelled, never costed.
+            # The classifier call's token usage joins the LLM leg, as
+            # on the phone path.
             outcome["cost_metrics"] = engine.metrics()
+            if engine.llm_status != "failed" \
+                    and any(t.get("speaker") == "agent"
+                            for t in engine.turns):
+                outcome["cost_metrics"]["llm_usage_classify"] = \
+                    classify_usage
             orchestrator.finalize_attempt(db, s, outcome)
             result = (
                 db.query(CallResult)

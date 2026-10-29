@@ -17,6 +17,12 @@ export default function Campaigns({ onOpen, onNew }) {
 
   const count = (s) => campaigns.filter((c) => c.status === s).length
 
+  // Newest first: the API returns oldest first, so the latest campaign
+  // used to sit at the bottom of a long scroll. Sort by created_at
+  // descending here so the newest campaign is on top.
+  const sorted = [...campaigns].sort((a, b) =>
+    (Date.parse(b.created_at || '') || 0) - (Date.parse(a.created_at || '') || 0))
+
   return (
     <div>
       <div className="page-head">
@@ -45,7 +51,7 @@ export default function Campaigns({ onOpen, onNew }) {
             </tr>
           </thead>
           <tbody>
-            {campaigns.map((c) => (
+            {sorted.map((c) => (
               <tr key={c.campaign_id} className="clickable" onClick={() => onOpen(c.campaign_id)}>
                 <td><b style={{ color: 'var(--navy)' }}>{c.name}</b>
                   <div style={{ color: 'var(--slate)', fontSize: 12.5 }}>

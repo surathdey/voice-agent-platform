@@ -5,6 +5,8 @@ orchestration mode:
 
     managed     → vapi (the managed platform) · twilio (optional)
     self_hosted → plivo (telephony) · exotel (telephony, alternative)
+                  · twilio (telephony, alternative — see "pstn" selection)
+                  · pstn (the self-hosted PSTN choice: plivo | twilio)
                   · sarvam (STT / LLM / TTS)
 
 Credential resolution per field: the tenant's ProviderSetting row wins; a
@@ -132,6 +134,13 @@ PROVIDERS = {
              "env_attr": "TWILIO_ACCOUNT_SID"},
             {"name": "auth_token", "label": "Auth token", "secret": True, "required": True,
              "env_attr": "TWILIO_AUTH_TOKEN"},
+            # ── Rate card — the tenant's contracted per-minute
+            # telephony rate for self-hosted Twilio calls (app.costing
+            # prices the telephony leg from it when the call's Twilio
+            # SID is known; the provider-reported Twilio price on the
+            # Calls page is separate and needs no rate). Empty = 0.
+            {"name": "rate_telephony_per_min", "label": "Rate card · telephony, Twilio (INR per minute)", "secret": False, "required": False,
+             "env_attr": "TWILIO_RATE_TELEPHONY_PER_MIN"},
         ],
     },
     "plivo": {
@@ -148,6 +157,22 @@ PROVIDERS = {
             # from it at finalize (app.costing). Empty = costed at 0.
             {"name": "rate_telephony_per_min", "label": "Rate card · telephony (INR per minute)", "secret": False, "required": False,
              "env_attr": "PLIVO_RATE_TELEPHONY_PER_MIN"},
+        ],
+    },
+    "pstn": {
+        "mode": "self_hosted", "label": "Self-hosted PSTN provider",
+        "description": "Which telephony adapter self-hosted dispatch uses: Plivo "
+                       "(default) or Twilio (alternative, e.g. when Plivo "
+                       "signup is unavailable in the tenant's region). "
+                       "This is a SELECTION, not a credential: the chosen "
+                       "provider's own credentials must still be configured. "
+                       "When the selected provider is not configured, "
+                       "dispatch falls back to Plivo (and fails honestly "
+                       "there if Plivo is not configured either).",
+        "primary": False, "optional": True,
+        "fields": [
+            {"name": "provider", "label": "Self-hosted PSTN provider (plivo | twilio)", "secret": False, "required": False,
+             "env_attr": "SELF_HOSTED_PSTN_PROVIDER"},
         ],
     },
     "exotel": {
@@ -172,19 +197,32 @@ PROVIDERS = {
         "fields": [
             {"name": "api_key", "label": "API key", "secret": True, "required": True,
              "env_attr": "SARVAM_API_KEY"},
-            # ── Rate cards (A12) — the tenant's contracted per-minute
-            # rates for the three Sarvam legs; per-call cost breakdowns
-            # are computed from them at finalize (app.costing). STT is
-            # metered on streamed-audio duration, the LLM on call
-            # duration (the API returns no token usage to this
-            # integration), TTS on synthesized audio actually pumped.
-            # Empty = costed at 0.
+            # ── Rate cards (A12) — the tenant's contracted rates for
+            # the three Sarvam legs; per-call cost breakdowns are
+            # computed from them at finalize (app.costing). STT is
+            # metered on streamed-audio duration (Saaras returns no
+            # per-call usage). The LLM is metered on TOKENS from the
+            # usage Sarvam streams (Oct 26, 2026 — the old "no token
+            # usage" claim was wrong; the per-minute LLM rate below
+            # is only the fallback when no usage was captured). TTS
+            # is metered on CHARACTERS in synthesis requests (Bulbul
+            # returns no usage and bills per character — the
+            # per-minute TTS rate below is only the fallback when no
+            # character count was captured). Empty = costed at 0.
             {"name": "rate_stt_per_min", "label": "Rate card · STT — Saaras (INR per minute of call audio)", "secret": False, "required": False,
              "env_attr": "SARVAM_RATE_STT_PER_MIN"},
-            {"name": "rate_llm_per_min", "label": "Rate card · LLM (INR per minute of call duration)", "secret": False, "required": False,
+            {"name": "rate_llm_per_min", "label": "Rate card · LLM fallback (INR per minute of call duration)", "secret": False, "required": False,
              "env_attr": "SARVAM_RATE_LLM_PER_MIN"},
-            {"name": "rate_tts_per_min", "label": "Rate card · TTS — Bulbul (INR per minute of synthesized audio played)", "secret": False, "required": False,
+            {"name": "rate_llm_input_per_1m", "label": "Rate card · LLM input (INR per 1M prompt tokens)", "secret": False, "required": False,
+             "env_attr": "SARVAM_RATE_LLM_INPUT_PER_1M"},
+            {"name": "rate_llm_output_per_1m", "label": "Rate card · LLM output (INR per 1M completion tokens, reasoning billed as output)", "secret": False, "required": False,
+             "env_attr": "SARVAM_RATE_LLM_OUTPUT_PER_1M"},
+            {"name": "rate_llm_cached_per_1m", "label": "Rate card · LLM cached input (INR per 1M cached prompt tokens)", "secret": False, "required": False,
+             "env_attr": "SARVAM_RATE_LLM_CACHED_PER_1M"},
+            {"name": "rate_tts_per_min", "label": "Rate card · TTS fallback (INR per minute of synthesized audio played)", "secret": False, "required": False,
              "env_attr": "SARVAM_RATE_TTS_PER_MIN"},
+            {"name": "rate_tts_per_1k_chars", "label": "Rate card · TTS — Bulbul (INR per 1,000 characters synthesized)", "secret": False, "required": False,
+             "env_attr": "SARVAM_RATE_TTS_PER_1K_CHARS"},
         ],
     },
 }
@@ -250,6 +288,47 @@ def _assess(db: Session, tenant_id: str, provider: str):
     return values, sources, row, missing, not missing
 
 
+def twilio_configured(db: Session, tenant_id: str) -> bool:
+    """Whether the tenant can place Twilio calls: a Twilio account SID
+    plus auth token, from the tenant row or the .env fallback.
+
+    Field-spelling tolerance: the registry names the SID field
+    "account_sid", but older tenant rows (and the cost module's reader)
+    store it as "auth_id" — both spellings count. A disabled row never
+    counts, matching _assess.
+    """
+    values, _sources, row = resolve_fields(db, tenant_id, "twilio")
+    if row is not None and not row.enabled:
+        return False
+    raw = (row.fields or {}) if row else {}
+    sid = (values.get("account_sid") or raw.get("auth_id") or "").strip()
+    token = (values.get("auth_token") or "").strip()
+    return bool(sid and token)
+
+
+def twilio_credentials(db: Session, tenant_id: str) -> tuple[str, str]:
+    """(account_sid, auth_token) for the Twilio transport / signature
+    checks, or ("", "") when not configured. Internal — never logged."""
+    if not twilio_configured(db, tenant_id):
+        return "", ""
+    values, _sources, row = resolve_fields(db, tenant_id, "twilio")
+    raw = (row.fields or {}) if row else {}
+    sid = (values.get("account_sid") or raw.get("auth_id") or "").strip()
+    return sid, (values.get("auth_token") or "").strip()
+
+
+def self_hosted_pstn(db: Session, tenant_id: str) -> str:
+    """The tenant's self-hosted PSTN choice: "plivo" (default) or
+    "twilio". Tenant row wins, then the .env fallback; anything else
+    (unset, disabled row, unknown value) means Plivo — the default is
+    never a surprise."""
+    values, _sources, row = resolve_fields(db, tenant_id, "pstn")
+    if row is not None and not row.enabled:
+        return "plivo"
+    choice = (values.get("provider") or "").strip().lower()
+    return choice if choice in ("plivo", "twilio") else "plivo"
+
+
 def get_provider_config(tenant_id: str, mode: str, db: Session | None = None) -> dict:
     """INTERNAL service API for the orchestrator (A5+): the effective
     provider configuration for one tenant + orchestration mode.
@@ -260,8 +339,8 @@ def get_provider_config(tenant_id: str, mode: str, db: Session | None = None) ->
          "providers": {key: {"configured": bool, "source": "tenant"|"env"|None,
                              "fields": {name: value}}}}
     `ready` means a real call could be placed in this mode: managed needs
-    Vapi; self-hosted needs Sarvam AND one telephony provider (Plivo or
-    Exotel). When not ready, dispatch must run in stub mode.
+    Vapi; self-hosted needs Sarvam AND one telephony provider (Plivo,
+    Exotel or Twilio). When not ready, dispatch must run in stub mode.
     """
     own = db is None
     if own:
@@ -283,6 +362,8 @@ def get_provider_config(tenant_id: str, mode: str, db: Session | None = None) ->
             # Telephony may come from either adapter; both missing = not ready
             # (already covered by plivo being primary, so drop the duplicate).
             if providers.get("exotel", {}).get("configured") and "plivo" in missing:
+                missing.remove("plivo")
+            if twilio_configured(db, tenant_id) and "plivo" in missing:
                 missing.remove("plivo")
         return {"tenant_id": tenant_id, "mode": mode, "ready": not missing,
                 "missing": missing, "providers": providers}
@@ -323,7 +404,17 @@ def provider_view(db: Session, tenant_id: str, provider: str) -> dict:
     any_set = any(values[f["name"]] and sources[f["name"]] in ("tenant", "env")
                   for f in spec["fields"])
 
-    if row is not None and not row.enabled:
+    if provider == "pstn":
+        # A selection, not a credential: never report "Credentials saved".
+        # Unset means the Plivo default applies; an explicit choice names it.
+        _choice = (values.get("provider") or "").strip().lower()
+        if _choice in ("plivo", "twilio"):
+            status, detail = "configured", f"Self-hosted PSTN provider is {_choice}."
+        elif _choice:
+            status, detail = "failed", f"Unknown PSTN provider {_choice!r} — expected 'plivo' or 'twilio'."
+        else:
+            status, detail = "configured", "No PSTN provider selected — self-hosted dispatch defaults to Plivo."
+    elif row is not None and not row.enabled:
         status, detail = "not_configured", "Disabled in tenant settings — re-enable to use this provider."
     elif missing and any_set:
         labels = [f["label"] for f in spec["fields"] if f["name"] in missing]
@@ -439,6 +530,15 @@ def _check(provider: str, v: dict) -> tuple[str, str]:
                           {"api-subscription-key": v["api_key"],
                            "Content-Type": "application/json"}, data=body)
         return _verdict("Sarvam", code, err)
+    if provider == "pstn":
+        # A selection, not a credential — nothing to call. The value
+        # itself is the check: unset means the Plivo default applies.
+        choice = (v.get("provider") or "").strip().lower()
+        if not choice:
+            return "connected", "No PSTN provider selected — self-hosted dispatch defaults to Plivo."
+        if choice in ("plivo", "twilio"):
+            return "connected", f"Self-hosted PSTN provider is {choice} (selection only — the provider's own credentials are tested separately)."
+        return "failed", f"Unknown PSTN provider {choice!r} — expected 'plivo' or 'twilio'."
     return "failed", f"No connection check implemented for {provider}."
 
 

@@ -30,7 +30,8 @@ it briefly in the new language (for example: "Alright, I will speak in
 Hindi"), then continue. Keep the bank's name and the customer's name
 unchanged in every language.
 
-OPENING - speak this first, in the call's language, word for word:
+OPENING - speak this first, in the call's language, word for word, all
+three sentences together in a single turn, before waiting for an answer:
 English: "Namaste, I am Priya calling from {{bank_name}}. This is a
 recorded call. Am I speaking with {{lead_name}} ji?"
 Hindi: "नमस्ते, मैं {{bank_name}} से प्रिया बोल रही हूँ। यह एक रिकॉर्डेड
@@ -42,7 +43,19 @@ FLOW
 1. Speak the opening line. Then follow the answer:
 2. The person confirms they ARE {{lead_name}}: thank them and close at
    once with the CONFIRMED closing below. Ask nothing more - the
-   confirmation is all this call needs.
+   confirmation is all this call needs. A short yes right after the
+   identity question IS a confirmation: "হ্যাঁ", "হ্যাঁ বলুন" or
+   "হ্যাঁ, বলুন" in Bengali, or the equivalent short yes in any
+   language, means they are {{lead_name}} - close at once, and do not
+   ask the identity question again. Only a genuinely unclear answer
+   goes to step 9.
+   The same applies when the yes comes with a question, such as
+   "হ্যাঁ বলছি, আপনি বলুন, আপনি কে বলছেন" or "yes speaking, tell
+   me": the yes already confirms they are {{lead_name}} - do not ask
+   the identity question again. Answer their question briefly with
+   the purpose line from step 4, then close at once with the
+   CONFIRMED closing. Never answer a confirmed yes with another
+   identity question, and never answer it with only a thanks line.
 3. The person says they are someone else: ask the records question, word
    for word, in the call's language:
    English: "Our records show this number is registered under
@@ -88,6 +101,9 @@ FLOW
    it is still not established, close with the DENIAL closing.
 10. If the call reaches voicemail or an answering machine: say nothing
     and end the call.
+11. If the person speaks while you are talking and your line is cut
+    off, resume from the sentence that was cut off, then continue the
+    flow - do not skip ahead, and do not restart the whole opening.
 
 HOW EVERY CALL ENDS
 - When the outcome is clear, the closing line for that outcome is your
@@ -98,9 +114,14 @@ HOW EVERY CALL ENDS
   The approved closing lines are the only words you may ever end a
   call with, and your final words on every call are exactly one of
   them - in full.
-- You never need to do anything to end the call: the call ends by
-  itself the moment your closing line is finished. So after the
-  closing line, say nothing more - not one extra word.
+- Speak each closing line once, in full, in a single turn. Once you
+  have spoken a closing line completely, never speak it, or part of
+  it, again on this call - the call ends right after it. If the
+  person speaks after a complete closing, end the call; do not
+  answer with the closing a second time. (A closing left incomplete
+  is different: the self-check below still completes it.)
+- After the complete closing line, end the call immediately - speak
+  nothing more, do not wait for a reply, not one extra word.
 - PRE-END SELF-CHECK: before you finish, silently ask yourself:
   (a) Is the outcome clear? (b) Have I spoken the complete closing
   line for that outcome, every sentence? If (b) is no, speak the
@@ -1222,7 +1243,7 @@ def seed(db: Session) -> None:
             prompt=RPI_PROMPT,
             llm_model="sarvam-105b",
             stt_provider="saaras", stt_language="hi-IN",
-            tts_provider="bulbul", tts_voice_id="bulbul-hi-female-1",
+            tts_provider="bulbul", tts_voice_id="priya",
             language_rule={"default": "hi-IN", "by_state": {"West Bengal": "bn-IN"}},
             captured_fields=[
                 {"name": "identity_confirmed", "type": "boolean",
@@ -1253,7 +1274,7 @@ def seed(db: Session) -> None:
             prompt=REMINDER_PROMPT,
             llm_model="sarvam-105b",
             stt_provider="saaras", stt_language="hi-IN",
-            tts_provider="bulbul", tts_voice_id="bulbul-hi-female-1",
+            tts_provider="bulbul", tts_voice_id="priya",
             language_rule={"default": "hi-IN", "by_state": {"West Bengal": "bn-IN"}},
             captured_fields=[
                 {"name": "payment_date", "type": "date",
@@ -1284,7 +1305,7 @@ def seed(db: Session) -> None:
             prompt=PTP_PROMPT,
             llm_model="sarvam-105b",
             stt_provider="saaras", stt_language="hi-IN",
-            tts_provider="bulbul", tts_voice_id="bulbul-hi-female-1",
+            tts_provider="bulbul", tts_voice_id="priya",
             language_rule={"default": "hi-IN", "by_state": {"West Bengal": "bn-IN"}},
             captured_fields=[
                 {"name": "promise_date", "type": "date",
@@ -1319,7 +1340,7 @@ def seed(db: Session) -> None:
             prompt=SETTLEMENT_PROMPT,
             llm_model="sarvam-105b",
             stt_provider="saaras", stt_language="hi-IN",
-            tts_provider="bulbul", tts_voice_id="bulbul-hi-female-1",
+            tts_provider="bulbul", tts_voice_id="priya",
             language_rule={"default": "hi-IN", "by_state": {"West Bengal": "bn-IN"}},
             captured_fields=[
                 {"name": "settlement_amount", "type": "number",
@@ -1354,7 +1375,7 @@ def seed(db: Session) -> None:
             prompt=BRK_PROMPT,
             llm_model="sarvam-105b",
             stt_provider="saaras", stt_language="hi-IN",
-            tts_provider="bulbul", tts_voice_id="bulbul-hi-female-1",
+            tts_provider="bulbul", tts_voice_id="priya",
             language_rule={"default": "hi-IN", "by_state": {"West Bengal": "bn-IN"}},
             captured_fields=[
                 {"name": "promise_date", "type": "date",

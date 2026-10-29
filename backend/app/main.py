@@ -27,6 +27,8 @@ recorded on the session and marks the transcript partial — the call
 itself never fails because the ear did. The reply brain — LLM/TTS —
 is A8.)
 """
+import logging
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -35,6 +37,23 @@ from . import seed as seed_module
 from .config import settings
 from .db import SessionLocal, init_db
 from .routers import agents, auth, browser_test, calls, campaigns, settings as settings_router, telephony, tenants
+
+# Turn-loop tracing (stall fix, Oct 26, 2026) logs at INFO through the
+# "app" namespace — but the process has no handler at INFO for that
+# namespace (uvicorn configures only its own loggers), which silently
+# swallowed every app log line: the Oct 26 verify call left no trace
+# lines at all for exactly this reason. Give the "app" namespace its
+# own INFO handler here, at import time, so engine/telephone trace
+# lines reach the container logs. The root level is untouched (no
+# SQLAlchemy query flood); uvicorn's own loggers are untouched.
+_app_log = logging.getLogger("app")
+_app_log.setLevel(logging.INFO)
+if not _app_log.handlers:
+    _app_handler = logging.StreamHandler()
+    _app_handler.setLevel(logging.INFO)
+    _app_handler.setFormatter(
+        logging.Formatter("%(levelname)s: %(name)s: %(message)s"))
+    _app_log.addHandler(_app_handler)
 
 app = FastAPI(title="Voice Agent Platform", version="0.6.0")
 

@@ -281,7 +281,7 @@ class ProviderSetting(Base):
 
     setting_id: Mapped[str] = mapped_column(String(40), primary_key=True, default=lambda: new_id("pset"))
     tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.tenant_id"), nullable=False, index=True)
-    provider: Mapped[str] = mapped_column(String(30), nullable=False)  # vapi | twilio | plivo | exotel | sarvam
+    provider: Mapped[str] = mapped_column(String(30), nullable=False)  # vapi | twilio | plivo | exotel | sarvam | pstn
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     fields: Mapped[dict] = mapped_column(JSON, default=dict)
     # Last Test-connection outcome (sanitised message — never contains a secret).
