@@ -1909,3 +1909,24 @@ and to suffix invite emails + the throwaway slug with a
 per-run random hex — re-runs are now clean (28/28). The
 duplicate-email and duplicate-slug guards firing on
 re-runs is itself evidence those guards work on Postgres.
+
+## Fix — login 401 said 'Session expired' (2026-10-29, live user test)
+
+`frontend/src/api.js` treated EVERY 401 as an expired
+session (clear + reload + throw 'Session expired') — both
+in `api()` and in `apiUpload()`. A failed login therefore
+told the user his session had expired when his credentials
+were simply wrong for that box (backend detail 'Invalid
+email or password' was discarded, and the reload wiped the
+login form's error state). Fixed: 'Session expired' +
+clear + reload now happens ONLY for a non-auth call that
+actually carried a token. Auth endpoints (`/api/auth/*`)
+and token-less calls surface the backend's own detail
+instead, with no clear and no reload — so a failed login
+shows 'Invalid email or password' and a failed setup
+shows 'Invalid or expired invite'. Verified with a node
+harness importing the real api.js (stubbed localStorage /
+window / fetch): 12/12, covering failed login with no
+token, failed login with a stale token lingering,
+setup 401, authenticated-call 401 (still session-expired
++ clear + reload), upload 401 with token, and login 200.

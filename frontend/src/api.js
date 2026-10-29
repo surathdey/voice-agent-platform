@@ -16,19 +16,30 @@ export function clearSession() {
 }
 
 export async function api(path, options = {}) {
+  const hadToken = !!getToken()
+  // Auth endpoints establish the session — their 401 means the
+  // credentials (or invite) were wrong, never an expired session.
+  const isAuthEndpoint = path.includes('/api/auth/')
   const res = await fetch(path, {
     ...options,
     headers: {
       'Content-Type': 'application/json',
-      ...(getToken() ? { Authorization: `Bearer ${getToken()}` } : {}),
+      ...(hadToken ? { Authorization: `Bearer ${getToken()}` } : {}),
       ...(options.headers || {}),
     },
     body: options.body ? JSON.stringify(options.body) : undefined,
   })
   if (res.status === 401) {
-    clearSession()
-    window.location.reload()
-    throw new Error('Session expired')
+    if (!isAuthEndpoint && hadToken) {
+      clearSession()
+      window.location.reload()
+      throw new Error('Session expired')
+    }
+    // No session to expire (login/setup/public call): surface the
+    // backend's own reason, e.g. 'Invalid email or password'.
+    let msg = 'Authentication failed (401)'
+    try { const j = await res.json(); if (j.detail) msg = j.detail } catch {}
+    throw new Error(msg)
   }
   if (!res.ok) {
     let msg = `Request failed (${res.status})`
@@ -41,15 +52,21 @@ export async function api(path, options = {}) {
 
 /* Multipart upload (CSV files) — same auth/error handling, no JSON body. */
 export async function apiUpload(path, formData) {
+  const hadToken = !!getToken()
   const res = await fetch(path, {
     method: 'POST',
     body: formData,
-    headers: { ...(getToken() ? { Authorization: `Bearer ${getToken()}` } : {}) },
+    headers: { ...(hadToken ? { Authorization: `Bearer ${getToken()}` } : {}) },
   })
   if (res.status === 401) {
-    clearSession()
-    window.location.reload()
-    throw new Error('Session expired')
+    if (hadToken) {
+      clearSession()
+      window.location.reload()
+      throw new Error('Session expired')
+    }
+    let msg = 'Authentication failed (401)'
+    try { const j = await res.json(); if (j.detail) msg = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail) } catch {}
+    throw new Error(msg)
   }
   if (!res.ok) {
     let msg = `Upload failed (${res.status})`
