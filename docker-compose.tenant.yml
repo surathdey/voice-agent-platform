@@ -84,6 +84,14 @@ services:
       EXOTEL_SUBDOMAIN: ${EXOTEL_SUBDOMAIN:-}
       SARVAM_API_KEY: ${SARVAM_API_KEY:-}
       S3_RECORDINGS_BUCKET: ${S3_RECORDINGS_BUCKET:-}
+      # C5 roles: passed through only when the box env sets them.
+      # Empty default = no Super Admin on this box (the normal
+      # tenant-box case — Super Admin lives on the platform box;
+      # the test box sets these to prove the role gates).
+      SUPER_ADMIN_EMAIL: ${SUPER_ADMIN_EMAIL:-}
+      SUPER_ADMIN_PASSWORD: ${SUPER_ADMIN_PASSWORD:-}
+      INVITE_DEV_OTP: ${INVITE_DEV_OTP:-false}
+      APPROVAL_WINDOW_HOURS: ${APPROVAL_WINDOW_HOURS:-24}
     ports:
       - "127.0.0.1:${BACKEND_PORT}:8000"
     depends_on:

@@ -1880,3 +1880,22 @@ recorded (the step raised before it). Lesson carried
 forward: every new migration's DDL must be proven on the
 Postgres test box, not only on SQLite — the local suite
 cannot catch dialect-only type errors.
+
+C5 follow-up fix 2, found by the test-box verify (not by
+the local suite): the box backend never received
+SUPER_ADMIN_* / INVITE_DEV_OTP — `docker compose
+--env-file` sets compose-level variables for
+interpolation, but a container only sees what the
+service's `environment:` block passes. The tenant compose
+template passed seed + provider vars but not the C5 vars,
+so the seed bootstrap saw empty SUPER_ADMIN_* and created
+no Super Admin (super login 401'd while the tenant-admin
+migration itself had worked). Fixed in
+`docker-compose.tenant.yml`: SUPER_ADMIN_EMAIL /
+SUPER_ADMIN_PASSWORD / INVITE_DEV_OTP /
+APPROVAL_WINDOW_HOURS now pass through with empty/false
+defaults — empty default = no Super Admin on a normal
+tenant box (Super Admin lives on the platform box; the
+test box sets these to prove the role gates). The
+provision script deliberately does NOT generate super
+creds for tenant boxes.
