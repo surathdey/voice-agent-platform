@@ -1603,3 +1603,15 @@ count assertions now expect 1-13. The five stale transcriber
 assertions (nova-2 per-language expectations vs the settled
 nova-3 + multi transcriber) are NOT touched here — they are
 the parked post-demo item, still failing as before.
+
+Follow-up fix, found by the test-box verification (not by the
+local suite): the adoption markers were persisted in the
+database but invisible over the API — `AgentOut` lacked the
+fields AND the agents router's `_out()` builds AgentOut
+field-by-field without them. Both now carry
+`adopted_catalog_agent` / `adopted_catalog_version`, proven
+by `scripts/verify_c2_testbox.py` (10/10, markers set on the
+adopted agent). The seeder also takes its login email from
+VAP_EMAIL now (default demo@qgbs.example) because a
+provisioned box's seed user is admin@<slug>.example, not the
+fresh-DB demo user.

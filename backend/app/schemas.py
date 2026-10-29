@@ -76,6 +76,10 @@ class AgentOut(AgentIn):
     agent_id: str
     tenant_id: str
     prompt_version: int = 1  # current (latest) prompt version number
+    # C2: which catalog version this agent currently equals (None when
+    # the agent was never adopted, or diverged by a manual prompt edit).
+    adopted_catalog_agent: Optional[str] = None
+    adopted_catalog_version: Optional[int] = None
 
 
 class PromptVersionOut(BaseModel):

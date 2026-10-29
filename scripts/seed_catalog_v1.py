@@ -5,12 +5,13 @@ Reads scripts/catalog_seed_v1.json (the five live agents' current
 prompts + structured config, exported from the live DB 2026-10-29)
 and publishes each as catalog version 1 on the target box.
 
-Usage:  VAP_PASSWORD=<box seed password> python3 scripts/seed_catalog_v1.py [base_url] [seed_json]
+Usage:  VAP_EMAIL=<box seed email> VAP_PASSWORD=<box seed password>
+        python3 scripts/seed_catalog_v1.py [base_url] [seed_json]
 Defaults: base_url http://127.0.0.1:8000 (in-container backend),
-seed_json scripts/catalog_seed_v1.json next to this script.
-Login is demo@qgbs.example; the password comes ONLY from the
-VAP_PASSWORD environment variable (passed at `docker compose exec`
-time, never written into this script or any file).
+seed_json scripts/catalog_seed_v1.json next to this script,
+VAP_EMAIL demo@qgbs.example. The credentials come ONLY from the
+environment (passed at `docker compose exec` time, never written
+into this script or any file).
 
 Idempotent: an agent slug that already exists is left alone, and a
 catalog agent that already has a published version is not re-published
@@ -26,6 +27,7 @@ BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8000"
 SEED = (sys.argv[2] if len(sys.argv) > 2
         else os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           "catalog_seed_v1.json"))
+EMAIL = os.environ.get("VAP_EMAIL", "demo@qgbs.example")
 PASSWORD = os.environ.get("VAP_PASSWORD")
 if not PASSWORD:
     sys.exit("VAP_PASSWORD is required (pass it via docker compose exec -e)")
@@ -46,7 +48,7 @@ def call(method, path, body=None, token=None):
 
 
 status, login = call("POST", "/api/auth/login",
-                     {"email": "demo@qgbs.example", "password": PASSWORD})
+                     {"email": EMAIL, "password": PASSWORD})
 assert status == 200, f"login failed: {status} {login}"
 token = login["access_token"]
 

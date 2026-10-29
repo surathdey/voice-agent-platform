@@ -52,6 +52,8 @@ def _out(db: Session, a: AgentConfig) -> AgentOut:
         silence_prompt_after_s=a.silence_prompt_after_s,
         silence_max_prompts=getattr(a, "silence_max_prompts", 1) or 1,
         prompt_version=_latest_version(db, a.agent_id),
+        adopted_catalog_agent=a.adopted_catalog_agent,
+        adopted_catalog_version=a.adopted_catalog_version,
     )
 
 
