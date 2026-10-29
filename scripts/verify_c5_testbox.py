@@ -14,9 +14,14 @@ Credentials come only from the environment.
 """
 import json
 import os
+import secrets
 import sys
 import urllib.request
 import urllib.error
+
+# Unique per run: the box keeps its data, so re-runs must not collide
+# with the previous run's invited accounts (duplicate email -> 409).
+RUN = secrets.token_hex(4)
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8000"
 EMAIL = os.environ.get("VAP_EMAIL", "demo@qgbs.example")
@@ -84,11 +89,11 @@ _, camp = call("POST", "/api/campaigns", {
     "schedule": {"calling_days": "Every day", "window_start": "00:00",
                  "window_end": "23:59"},
 }, token=TA, expect=201)
-call("DELETE", f"/api/campaigns/{camp['campaign_id']}", token=TA, expect=200)
+call("DELETE", f"/api/campaigns/{camp['campaign_id']}", token=TA, expect=204)
 
 print("── Invite flow on the box ──")
 _, inv = call("POST", "/api/users/invites",
-              {"email": "c5caller@test.example", "name": "C5 Caller",
+              {"email": f"c5caller-{RUN}@test.example", "name": "C5 Caller",
                "role": "caller"}, token=TA, expect=201)
 assert inv.get("dev_otp"), "dev_otp missing — box needs INVITE_DEV_OTP=true"
 _, setup = call("POST", "/api/auth/setup",
@@ -108,7 +113,7 @@ call("GET", "/api/users", token=CALLER, expect=403)
 print("── Team Leader path on the box ──")
 _, me_tenant = call("GET", "/api/tenants/me", token=TA, expect=200)
 _, inv_tl = call("POST", "/api/users/invites",
-                 {"email": "c5lead@test.example", "name": "C5 Lead",
+                 {"email": f"c5lead-{RUN}@test.example", "name": "C5 Lead",
                   "role": "team_leader",
                   "tenant_id": me_tenant["tenant_id"]},
                  token=SUPER, expect=201)
@@ -129,10 +134,10 @@ check("TL lists the team they lead",
 
 print("── Super Admin on the box ──")
 _, cat = call("POST", "/api/catalog/agents",
-              {"slug": "c5-test-agent", "name": "C5 Test Agent",
+              {"slug": f"c5-test-agent-{RUN}", "name": "C5 Test Agent",
                "stage": "Verification"}, token=SUPER, expect=201)
 check("super catalog write works (throwaway slug, disposable box)",
-      cat["slug"] == "c5-test-agent")
+      cat["slug"] == f"c5-test-agent-{RUN}")
 call("GET", "/api/campaigns", token=SUPER, expect=403)
 call("GET", "/api/queue", token=SUPER, expect=403)
 

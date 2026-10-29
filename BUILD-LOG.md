@@ -1899,3 +1899,13 @@ tenant box (Super Admin lives on the platform box; the
 test box sets these to prove the role gates). The
 provision script deliberately does NOT generate super
 creds for tenant boxes.
+
+C5 verify-script hardening (test-only): the test-box
+verifier first expected DELETE 200 (the API correctly
+returns 204) and used fixed invite emails + a fixed
+throwaway catalog slug, so a second run on the same box
+correctly 409'd/422'd on duplicates. Fixed to expect 204
+and to suffix invite emails + the throwaway slug with a
+per-run random hex — re-runs are now clean (28/28). The
+duplicate-email and duplicate-slug guards firing on
+re-runs is itself evidence those guards work on Postgres.
