@@ -81,6 +81,13 @@ class AgentConfig(Base):
     stage: Mapped[str] = mapped_column(String(120), default="")       # journey stage label
     purpose: Mapped[str] = mapped_column(String(300), default="")     # one-line summary (card subtitle)
     is_reference: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Epic C, C2 adoption linkage: which catalog agent + version this
+    # tenant agent was last adopted from. NULL = never adopted (a
+    # hand-built agent, or a pre-C2 agent). A manual prompt edit via
+    # PUT clears both markers: the agent's prompt no longer equals the
+    # catalog version, and claiming otherwise would be a lie.
+    adopted_catalog_agent: Mapped[str | None] = mapped_column(String(80), nullable=True, default=None)
+    adopted_catalog_version: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
 
     # ── THE single prompt: behaviour + dialogue/flow + FULL disposition logic.
     prompt: Mapped[str] = mapped_column(Text, default="")
@@ -138,6 +145,114 @@ class PromptVersion(Base):
     __table_args__ = (UniqueConstraint("agent_id", "version", name="uq_prompt_version"),)
 
 
+class CatalogAgent(Base):
+    """One agent in the platform catalog (Epic C, C2 — design §11).
+
+    The catalog is authored ONCE, on the platform side; tenants adopt
+    versions from it. It holds NO customer data — only agent
+    definitions. A tenant box runs the same schema but its catalog
+    tables stay empty unless it IS the platform box (or imports a
+    catalog snapshot for adoption).
+    """
+
+    __tablename__ = "catalog_agents"
+
+    catalog_agent_id: Mapped[str] = mapped_column(String(40), primary_key=True, default=lambda: new_id("cat"))
+    slug: Mapped[str] = mapped_column(String(80), unique=True, nullable=False, index=True)  # e.g. "rpi"
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    stage: Mapped[str] = mapped_column(String(120), default="")
+    purpose: Mapped[str] = mapped_column(String(300), default="")
+    # Structured defaults a version adoption copies (same shape as
+    # AgentConfig's structured config; the version row carries the
+    # prompt text, this row carries the rest).
+    llm_model: Mapped[str] = mapped_column(String(120), default="sarvam-105b")
+    stt_provider: Mapped[str] = mapped_column(String(60), default="saaras")
+    stt_language: Mapped[str] = mapped_column(String(20), default="hi-IN")
+    tts_provider: Mapped[str] = mapped_column(String(60), default="bulbul")
+    tts_voice_id: Mapped[str] = mapped_column(String(120), default="")
+    voice_gender: Mapped[str] = mapped_column(String(10), default="female")
+    language_rule: Mapped[dict] = mapped_column(JSON, default=dict)
+    captured_fields: Mapped[list] = mapped_column(JSON, default=list)
+    max_duration_s: Mapped[int] = mapped_column(Integer, default=300)
+    max_turns: Mapped[int] = mapped_column(Integer, default=50)
+    silence_prompt_after_s: Mapped[int] = mapped_column(Integer, default=8)
+    silence_max_prompts: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class CatalogVersion(Base):
+    """One IMMUTABLE published version of a catalog agent (C2).
+
+    A published version NEVER changes: there is deliberately NO update
+    or delete endpoint for versions. A fix or improvement becomes a
+    NEW version row (version = max + 1). The version metadata is the
+    mismatch guard: suitable_for / model / validated_on tell a tenant
+    which stack the version was live-call proven on, so a tenant never
+    adopts a version unproven on its own stack.
+    """
+
+    __tablename__ = "catalog_versions"
+
+    version_id: Mapped[str] = mapped_column(String(40), primary_key=True, default=lambda: new_id("cv"))
+    catalog_agent_id: Mapped[str] = mapped_column(ForeignKey("catalog_agents.catalog_agent_id"), nullable=False, index=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)  # 1, 2, 3… per catalog agent
+    prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    note: Mapped[str] = mapped_column(String(300), default="")
+    # Mismatch guard (C2): "managed" | "self_hosted" | "both".
+    suitable_for: Mapped[str] = mapped_column(String(20), default="both")
+    # e.g. "gpt-4o" (Vapi managed default), "sarvam-105b" (self-hosted).
+    model: Mapped[str] = mapped_column(String(120), default="")
+    # Which stack(s) this version was live-call proven on, e.g.
+    # "Vapi managed". "Best for X" is claimed ONLY for stacks named
+    # here; anything else reads "intended for X".
+    validated_on: Mapped[str] = mapped_column(String(200), default="")
+    published_by: Mapped[str] = mapped_column(String(200), default="")
+    published_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (UniqueConstraint("catalog_agent_id", "version", name="uq_catalog_version"),)
+
+
+class TenantAdoption(Base):
+    """A tenant's CURRENT adoption of one catalog agent (C2).
+
+    One row per (tenant, catalog agent): re-adoption updates it.
+    History lives in AdoptionLog (append-only); this table answers
+    "what does this tenant run right now".
+    """
+
+    __tablename__ = "tenant_adoptions"
+
+    adoption_id: Mapped[str] = mapped_column(String(40), primary_key=True, default=lambda: new_id("adp"))
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.tenant_id"), nullable=False, index=True)
+    catalog_agent_id: Mapped[str] = mapped_column(String(80), nullable=False, index=True)  # slug
+    catalog_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("agent_configs.agent_id"), nullable=False)
+    adopted_by: Mapped[str] = mapped_column(String(200), default="")
+    adopted_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (UniqueConstraint("tenant_id", "catalog_agent_id", name="uq_tenant_adoption"),)
+
+
+class AdoptionLog(Base):
+    """Append-only adoption history (C2 — design §11).
+
+    The platform-side record of who runs what. This is the ONLY
+    cross-tenant view, and it holds NO customer data: tenant slug,
+    catalog agent, version, who, when. Never updated, never deleted.
+    """
+
+    __tablename__ = "adoption_log"
+
+    log_id: Mapped[str] = mapped_column(String(40), primary_key=True, default=lambda: new_id("adl"))
+    tenant_id: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    tenant_slug: Mapped[str] = mapped_column(String(120), default="")
+    catalog_agent_id: Mapped[str] = mapped_column(String(80), nullable=False, index=True)  # slug
+    catalog_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    adopted_by: Mapped[str] = mapped_column(String(200), default="")
+    adopted_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class Campaign(Base):
     """One campaign is bound to exactly ONE agent (design §11.2, decision 14.1).
 
@@ -153,6 +268,15 @@ class Campaign(Base):
     campaign_id: Mapped[str] = mapped_column(String(40), primary_key=True, default=lambda: new_id("cmp"))
     tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.tenant_id"), nullable=False, index=True)
     agent_id: Mapped[str] = mapped_column(ForeignKey("agent_configs.agent_id"), nullable=False)
+    # Epic C, C2 campaign pinning: the prompt text + versions this
+    # campaign runs on, snapshotted at creation, for LIFE. A later
+    # adoption or prompt edit never changes a running campaign; only
+    # a new campaign picks up the new version. Pre-C2 campaigns have
+    # an empty pinned_prompt and fall back to the agent's live prompt.
+    pinned_prompt: Mapped[str] = mapped_column(Text, default="")
+    pinned_prompt_version: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
+    pinned_catalog_agent: Mapped[str | None] = mapped_column(String(80), nullable=True, default=None)
+    pinned_catalog_version: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     # Canonical product kind (see schemas.PRODUCTS): vehicle_loan | credit_card
     # | home_loan | personal_loan | other. The kind decides which identifier

@@ -86,6 +86,93 @@ class PromptVersionOut(BaseModel):
     created_at: Optional[str] = None
 
 
+# ── Catalog & adoption (Epic C, C2 — design §11) ─────────────────────────
+# A catalog version is IMMUTABLE: there is no update/delete schema for
+# versions by design — a fix becomes a new version (publish endpoint).
+
+class CatalogVersionIn(BaseModel):
+    prompt: str
+    note: str = ""
+    # Mismatch guard: "managed" | "self_hosted" | "both".
+    suitable_for: str = "both"
+    model: str = ""
+    # Stack(s) live-call proven on, e.g. "Vapi managed". "Best for X"
+    # is claimed ONLY for stacks named here.
+    validated_on: str = ""
+
+
+class CatalogVersionOut(CatalogVersionIn):
+    version_id: str
+    catalog_agent_id: str
+    version: int
+    published_by: str = ""
+    published_at: Optional[str] = None
+    # Computed for the requesting tenant's stack (not stored):
+    unproven_on_stack: bool = False      # suitable_for fits neither "both" nor this stack
+    fit_label: str = ""                  # "best for managed" | "intended for managed" | ""
+
+
+class CatalogAgentIn(BaseModel):
+    slug: str                            # e.g. "rpi" — lowercase, stable
+    name: str
+    stage: str = ""
+    purpose: str = ""
+    # Structured defaults an adoption copies (same shape as AgentIn).
+    llm_model: str = "sarvam-105b"
+    stt_provider: str = "saaras"
+    stt_language: str = "hi-IN"
+    tts_provider: str = "bulbul"
+    tts_voice_id: str = ""
+    voice_gender: str = "female"
+    language_rule: dict = Field(default_factory=dict)
+    captured_fields: List[CapturedField] = []
+    max_duration_s: int = 300
+    max_turns: int = 50
+    silence_prompt_after_s: int = 8
+    silence_max_prompts: int = 1
+
+
+class CatalogAgentOut(CatalogAgentIn):
+    catalog_agent_id: str
+    versions: List[CatalogVersionOut] = []
+    # This tenant's view: current adoption + availability flags.
+    adopted_version: Optional[int] = None
+    latest_version: Optional[int] = None
+    new_version_available: bool = False
+    # True when no published version suits this tenant's stack.
+    unproven_on_stack: bool = False
+    tenant_stack: str = ""               # managed | self_hosted | stub
+
+
+class AdoptionIn(BaseModel):
+    catalog_agent_id: str                # slug or catalog_agent_id
+    version: Optional[int] = None        # None = latest published
+    # Cross-box import mode: a full version payload (from the export
+    # endpoint) for tenant boxes that cannot read the platform box's
+    # database. When present it wins over the same-DB lookup.
+    payload: Optional[dict] = None
+
+
+class AdoptionOut(BaseModel):
+    adoption_id: str
+    tenant_id: str
+    catalog_agent_id: str                # slug
+    catalog_version: int
+    agent_id: str
+    agent_name: str
+    adopted_by: str
+    adopted_at: Optional[str] = None
+
+
+class AdoptionLogOut(BaseModel):
+    tenant_id: str
+    tenant_slug: str
+    catalog_agent_id: str
+    catalog_version: int
+    adopted_by: str
+    adopted_at: Optional[str] = None
+
+
 # ── Campaigns & leads (A3) ────────────────────────────────────────────────
 # Canonical product kinds. The kind decides which identifier the agent uses
 # on the call (design §15): vehicle → registration number, credit card →
@@ -149,6 +236,10 @@ class CampaignOut(CampaignIn):
     tenant_id: str
     status: str = "draft"                # draft → active → paused → completed
     agent_name: str = ""
+    # C2 pinning (display only — the text itself stays server-side):
+    pinned_prompt_version: Optional[int] = None
+    pinned_catalog_agent: Optional[str] = None
+    pinned_catalog_version: Optional[int] = None
     product_label: str = ""
     identifier_type: str = ""            # derived from product
     identifier_label: str = ""

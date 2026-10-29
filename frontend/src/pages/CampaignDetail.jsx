@@ -288,6 +288,16 @@ export default function CampaignDetail({ campaignId, onBack }) {
             <dt>Channel</dt><dd>{campaign.channel}</dd>
             <dt>Calling via</dt><dd>{campaign.provider_mode === 'managed' ? 'Managed platform (Vapi)' : 'Self-hosted stack'}</dd>
             <dt>Agent</dt><dd>{campaign.agent_name} — configured in Agents; nothing agent-level is set here</dd>
+            <dt>Pinned prompt</dt>
+            <dd>
+              {campaign.pinned_prompt_version
+                ? `version ${campaign.pinned_prompt_version}`
+                : 'live prompt (pre-C2 campaign)'}
+              {campaign.pinned_catalog_agent
+                ? ` · catalog ${campaign.pinned_catalog_agent} v${campaign.pinned_catalog_version}`
+                : ''}
+              {' — kept for life; a later adoption never changes this campaign'}
+            </dd>
           </dl>
         </div>
         <div className="card">

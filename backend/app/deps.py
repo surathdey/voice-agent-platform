@@ -27,3 +27,14 @@ def get_current_user(
     if user is None or not user.is_active or user.tenant_id != payload.get("tenant_id"):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Unknown user")
     return user
+
+
+def require_catalog_admin(user: User = Depends(get_current_user)) -> User:
+    """Catalog write gate (Epic C, C2).
+
+    C2 ships this as "any authenticated operator" because roles land
+    in C5; C5 tightens this ONE function to Super Admin only, and
+    every catalog write endpoint follows. The seam exists so the C5
+    diff touches one function instead of every endpoint.
+    """
+    return user

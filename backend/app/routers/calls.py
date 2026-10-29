@@ -40,7 +40,7 @@ from ..db import get_db
 from ..deps import get_current_user
 from .. import stt as stt_module
 from ..models import AgentConfig, CallResult, CallSession, Campaign, Lead, Tenant, User
-from ..orchestrator import Dispatcher, disposition_buckets, receive_result
+from ..orchestrator import Dispatcher, campaign_prompt, disposition_buckets, receive_result
 from ..schemas import (
     CallListOut,
     CallOut,
@@ -227,7 +227,10 @@ def campaign_results(campaign_id: str, user: User = Depends(get_current_user),
     appended so nothing is ever hidden."""
     c = _campaign_scoped(db, user, campaign_id)
     agent = db.get(AgentConfig, c.agent_id)
-    buckets = disposition_buckets(agent.prompt if agent else "")
+    # C2: the summary's bucket set follows the campaign's PINNED prompt,
+    # not the agent's live prompt — a pinned campaign's dispositions
+    # must appear in its own summary even after a later adoption.
+    buckets = disposition_buckets(campaign_prompt(c, agent) if agent else "")
 
     sessions = (db.query(CallSession)
                 .filter(CallSession.campaign_id == c.campaign_id).all())

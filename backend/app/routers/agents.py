@@ -119,6 +119,13 @@ def update_agent(agent_id: str, body: AgentIn, user: User = Depends(get_current_
     a = _get_scoped(db, user, agent_id)
     prompt_changed = a.prompt != body.prompt
     _apply(a, body)
+    if prompt_changed:
+        # C2: a manual prompt edit diverges the agent from its adopted
+        # catalog version — clear the markers rather than claim a
+        # version the prompt no longer equals. Structured-only edits
+        # keep the markers (the prompt still equals the version).
+        a.adopted_catalog_agent = None
+        a.adopted_catalog_version = None
     db.flush()
     if prompt_changed:
         _snapshot(db, user, a, note="Edit")

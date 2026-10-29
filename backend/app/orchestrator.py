@@ -88,6 +88,23 @@ _BUCKET_LINE = re.compile(r"^-\s+([A-Z][A-Z0-9_]{2,})\s*(?::|$)")
 _SECTION_HEAD = re.compile(r"^[A-Z][A-Z /&-]{2,}$")
 
 
+def campaign_prompt(campaign, agent) -> str:
+    """The prompt a campaign's calls actually run on (Epic C, C2 pinning).
+
+    A campaign pins its prompt text at creation and keeps it for life;
+    a later adoption or prompt edit never changes a running campaign.
+    Campaigns created before C2 have no pinned text and fall back to
+    the agent's live prompt. Every runtime prompt read (stub buckets,
+    Vapi payload, self-hosted engine, classifier via rendered_prompt)
+    goes through this helper — directly or via the pinned text copied
+    at the same points — so pinning is uniform, not per-transport luck.
+    """
+    pinned = getattr(campaign, "pinned_prompt", "") or ""
+    if pinned:
+        return pinned
+    return agent.prompt or ""
+
+
 def disposition_buckets(prompt: str) -> list[str]:
     """Extract the disposition bucket set from the agent's single prompt.
 
@@ -153,7 +170,7 @@ class StubTransport:
 
     def run(self, db: Session, session: CallSession, agent: AgentConfig,
             campaign: Campaign, seq: int, run_start: datetime) -> dict:
-        buckets = disposition_buckets(agent.prompt)
+        buckets = disposition_buckets(campaign_prompt(campaign, agent))
         already = (
             db.query(CallResult)
             .join(CallSession, CallResult.session_id == CallSession.session_id)

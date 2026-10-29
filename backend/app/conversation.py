@@ -805,7 +805,11 @@ class ConversationEngine:
         # no such message — stopping our own frame pump is the cut.
         self._clear_audio = clear_audio
         _lv = lead_variables(campaign, lead)
-        self._prompt = render_prompt(agent.prompt or "", _lv)
+        # C2 pinning: the campaign's pinned prompt is what the engine
+        # speaks AND what the classifier classifies against (via
+        # rendered_prompt) — pre-C2 campaigns fall back to live.
+        _pinned = getattr(campaign, "pinned_prompt", "") or ""
+        self._prompt = render_prompt(_pinned or agent.prompt or "", _lv)
         self._model = agent.llm_model or "sarvam-105b"
         self._speaker = bulbul_speaker(agent.tts_voice_id or "", language,
                                        agent.voice_gender or "female")

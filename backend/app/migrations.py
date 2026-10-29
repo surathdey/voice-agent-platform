@@ -293,6 +293,31 @@ def _apply_012(conn, insp, dialect):
                    "recording_s3_bucket VARCHAR(100) NOT NULL DEFAULT ''")
 
 
+def _marker_013(insp, dialect):
+    return _has_columns(insp, "agent_configs",
+                        "adopted_catalog_agent", "adopted_catalog_version") and \
+        _has_columns(insp, "campaigns",
+                     "pinned_prompt", "pinned_prompt_version",
+                     "pinned_catalog_agent", "pinned_catalog_version")
+
+
+def _apply_013(conn, insp, dialect):
+    """Epic C, C2 campaign pinning + adoption linkage columns.
+
+    New TABLES (catalog_agents, catalog_versions, tenant_adoptions,
+    adoption_log) need no step: create_all in db.init_db creates
+    missing tables on every boot. Only the new COLUMNS on existing
+    tables need this step. All nullable: pre-C2 rows pin nothing and
+    fall back to the agent's live prompt, exactly as before.
+    """
+    _ensure_column(conn, "agent_configs", "adopted_catalog_agent VARCHAR(80)")
+    _ensure_column(conn, "agent_configs", "adopted_catalog_version INTEGER")
+    _ensure_column(conn, "campaigns", "pinned_prompt TEXT")
+    _ensure_column(conn, "campaigns", "pinned_prompt_version INTEGER")
+    _ensure_column(conn, "campaigns", "pinned_catalog_agent VARCHAR(80)")
+    _ensure_column(conn, "campaigns", "pinned_catalog_version INTEGER")
+
+
 MIGRATIONS = [
     (1, "001_initial", _marker_001, _apply_001),
     (2, "002_a3_campaign_fields", _marker_002, _apply_002),
@@ -306,6 +331,7 @@ MIGRATIONS = [
     (10, "010_b4_settlement_cap", _marker_010, _apply_010),
     (11, "011_lead_done_status", _marker_011, _apply_011),
     (12, "012_s3_recording_archive", _marker_012, _apply_012),
+    (13, "013_c2_catalog_pinning", _marker_013, _apply_013),
 ]
 
 

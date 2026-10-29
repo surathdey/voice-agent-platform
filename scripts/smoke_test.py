@@ -3973,11 +3973,11 @@ try:
                    <= _db_cols(_legacy_path, "agent_configs")
                and {"stt_status", "llm_status", "tts_status"} <= _sess_cols
                and "review_required" in _db_cols(_legacy_path, "call_results"))
-        check6("FIX: schema_migrations records exactly versions 1-12",
+        check6("FIX: schema_migrations records exactly versions 1-13",
                [r[0] for r in _db_query(
                    _legacy_path,
                    "SELECT version FROM schema_migrations ORDER BY version")]
-               == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
+               == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13])
         _recorded_before = _db_query(
             _legacy_path,
             "SELECT version, name, applied_at FROM schema_migrations "
@@ -4020,7 +4020,7 @@ try:
     baseF = start_app6(18120, "freshmig", {})
     _fresh_path = os.path.join(TMP6, "freshmig.db")
     check6("FIX: a fresh database boots to the identical final schema "
-           "with a complete 1-12 migration record",
+           "with a complete 1-13 migration record",
            "timezone" in _db_cols(_fresh_path, "tenants")
            and "channel" in _db_cols(_fresh_path, "call_sessions")
            and "recording_s3_key" in _db_cols(_fresh_path, "call_sessions")
@@ -4028,7 +4028,7 @@ try:
            and [r[0] for r in _db_query(
                _fresh_path,
                "SELECT version FROM schema_migrations ORDER BY version")]
-           == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
+           == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13])
 
     # ── B2: the second seeded agent — Payment Reminder ─────────────
     # Runs after the A1–A10 sections: the BASE (stub-mode) parts add

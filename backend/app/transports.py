@@ -348,7 +348,8 @@ def build_vapi_payload(session: CallSession, agent: AgentConfig,
     """The Vapi POST /call/phone body for one attempt (§8.1 start-call,
     managed flavour). Pure — unit-testable without HTTP.
 
-    The assistant carries the agent's single prompt verbatim as its
+    The assistant carries the campaign's PINNED prompt verbatim (C2;
+    pre-C2 campaigns fall back to the agent's live prompt) as its
     system message, an analysis plan whose structured-data schema asks
     for exactly the disposition bucket set parsed from that same prompt
     plus the agent's captured fields (§8.2 normalisation source), and
@@ -362,8 +363,12 @@ def build_vapi_payload(session: CallSession, agent: AgentConfig,
     §8.1 shared secret inline (the legacy serverUrlSecret field's
     secret is stored/echoed only, never transmitted).
     """
-    from .orchestrator import disposition_buckets  # deferred: import cycle
+    from .orchestrator import campaign_prompt, disposition_buckets  # deferred: import cycle
 
+    # C2 pinning: the campaign's pinned prompt is the assistant's
+    # system message (and the disposition enum's source). Pre-C2
+    # campaigns fall back to the agent's live prompt.
+    prompt = campaign_prompt(campaign, agent)
     language = resolve_language(agent, lead)
     # Language grounding (managed): the agent's prompt lists one opening
     # line per language and says "in the call's language", but never
@@ -387,7 +392,7 @@ def build_vapi_payload(session: CallSession, agent: AgentConfig,
     # right year. Placed BEFORE the language bracket so the message
     # still ends with the grounding line the tests assert.
     _today = _today_str(getattr(campaign, "timezone", None))
-    system_content = (agent.prompt or "") + (
+    system_content = (prompt or "") + (
         f"\n\n[Today is {_today}. When you confirm a date, always "
         f"include the year.]\n"
         f"[The call's language is {_lang_name}. Begin the call in "
@@ -399,7 +404,7 @@ def build_vapi_payload(session: CallSession, agent: AgentConfig,
     properties: dict = {
         "disposition": {
             "type": "string",
-            "enum": disposition_buckets(agent.prompt),
+            "enum": disposition_buckets(prompt),
             "description": "Exactly one disposition bucket, as defined in "
                            "the DISPOSITIONS section of the system prompt.",
         }

@@ -27,7 +27,7 @@ from sqlalchemy.orm import Session
 from .. import providers as prov
 from ..db import get_db
 from ..deps import get_current_user
-from ..models import AgentConfig, CallResult, CallSession, Campaign, Lead, User
+from ..models import AgentConfig, CallResult, CallSession, Campaign, Lead, PromptVersion, User
 from ..schemas import (
     PRODUCTS,
     CampaignIn,
@@ -129,6 +129,24 @@ def _agent_scoped(db: Session, user: User, agent_id: str) -> AgentConfig:
     return a
 
 
+def _latest_prompt_version(db: Session, agent_id: str) -> int:
+    row = (
+        db.query(PromptVersion)
+        .filter(PromptVersion.agent_id == agent_id)
+        .order_by(PromptVersion.version.desc())
+        .first()
+    )
+    return row.version if row else 0
+
+
+def _pin(c: Campaign, agent: AgentConfig, db: Session) -> None:
+    """Snapshot the campaign's prompt for life (C2 pinning)."""
+    c.pinned_prompt = agent.prompt or ""
+    c.pinned_prompt_version = _latest_prompt_version(db, agent.agent_id)
+    c.pinned_catalog_agent = agent.adopted_catalog_agent
+    c.pinned_catalog_version = agent.adopted_catalog_version
+
+
 def _out(db: Session, c: Campaign) -> CampaignOut:
     agent = db.get(AgentConfig, c.agent_id)
     meta = PRODUCTS.get(c.product, PRODUCTS["other"])
@@ -151,6 +169,9 @@ def _out(db: Session, c: Campaign) -> CampaignOut:
         identifier_type=meta["identifier_type"], identifier_label=meta["identifier_label"],
         schedule=c.schedule or {}, retry_rules=c.retry_rules or {},
         routing_rules=c.routing_rules or [],
+        pinned_prompt_version=c.pinned_prompt_version,
+        pinned_catalog_agent=c.pinned_catalog_agent,
+        pinned_catalog_version=c.pinned_catalog_version,
         lead_count=db.query(Lead).filter(Lead.campaign_id == c.campaign_id).count(),
         provider_configured=ready, provider_flag=flag,
         created_at=c.created_at.isoformat() if c.created_at else None,
@@ -198,9 +219,10 @@ def list_campaigns(user: User = Depends(get_current_user), db: Session = Depends
 @router.post("", response_model=CampaignOut, status_code=status.HTTP_201_CREATED)
 def create_campaign(body: CampaignIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     _validate(body)
-    _agent_scoped(db, user, body.agent_id)  # bound agent must be this tenant's
+    agent = _agent_scoped(db, user, body.agent_id)  # bound agent must be this tenant's
     c = Campaign(tenant_id=user.tenant_id, status="draft")
     _apply(c, body)
+    _pin(c, agent, db)  # C2: the campaign pins its prompt for life
     db.add(c)
     db.commit()
     db.refresh(c)
@@ -216,8 +238,17 @@ def get_campaign(campaign_id: str, user: User = Depends(get_current_user), db: S
 def update_campaign(campaign_id: str, body: CampaignIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     c = _get_scoped(db, user, campaign_id)
     _validate(body)
-    _agent_scoped(db, user, body.agent_id)
+    agent = _agent_scoped(db, user, body.agent_id)
+    # C2: a campaign pins for life. Re-pin ONLY while it is still a
+    # draft with no dispatched sessions (setup correction, not a
+    # running campaign); otherwise the pinned prompt is untouched.
+    had_sessions = (
+        db.query(CallSession).filter(CallSession.campaign_id == c.campaign_id).first()
+        is not None
+    )
     _apply(c, body)
+    if c.status == "draft" and not had_sessions:
+        _pin(c, agent, db)
     db.commit()
     db.refresh(c)
     return _out(db, c)

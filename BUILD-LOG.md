@@ -1499,3 +1499,107 @@ create_engine site). There is no shared app process and no code
 path that opens two tenant databases in one request — isolation is
 structural (separate process + database + credentials + network
 per box), not a filter every query must remember.
+
+## Epic C, story C2 — Admin catalog + adoption (2026-10-29)
+
+Catalog/adoption (design §11). What landed:
+
+- `backend/app/models.py`: new tables `catalog_agents`,
+  `catalog_versions` (immutable by design — no update/delete
+  endpoint exists), `tenant_adoptions` (current pointer, unique
+  tenant+slug), `adoption_log` (append-only, no customer data).
+  `AgentConfig` gains `adopted_catalog_agent` /
+  `adopted_catalog_version`; `Campaign` gains `pinned_prompt` /
+  `pinned_prompt_version` / `pinned_catalog_agent` /
+  `pinned_catalog_version`.
+- `backend/app/routers/catalog.py` (new): GET/POST
+  `/api/catalog/agents`, GET `/api/catalog/agents/{slug|id}`,
+  POST `/api/catalog/agents/{slug}/versions` (publish, version =
+  max+1, `suitable_for` validated to managed|self_hosted|both),
+  GET `.../versions/{version}/export`, POST/GET
+  `/api/catalog/adoptions`, GET `/api/catalog/adoption-log`.
+  Version metadata on every version: `suitable_for`, `model`,
+  `validated_on`. The tenant's view adds `adopted_version`,
+  `latest_version`, `new_version_available`, plus
+  `unproven_on_stack` / `fit_label` from the box's own stack
+  (managed|self_hosted|stub): a version is flagged when the box
+  runs a real stack and `suitable_for` is neither `both` nor that
+  stack; `fit_label` is "best for {stack}" when the stack token
+  appears in `validated_on`, else "intended for {stack}"; the
+  stub stack shows neither flag nor label (nothing is proven or
+  unproven there). Write gate is `require_catalog_admin` (a stub
+  for now — C5 tightens it to Super Admin).
+- `backend/app/routers/campaigns.py`: campaign creation pins the
+  agent's adopted version (or the edited prompt text with NULL
+  catalog markers when the agent diverged from its adoption).
+  PUT re-pins ONLY when the campaign is still a draft AND has no
+  CallSession rows; otherwise the pinned text/version are left
+  untouched. CampaignOut exposes the pinned VERSION fields, not
+  the pinned text.
+- `backend/app/routers/agents.py`: a PUT that changes the prompt
+  text clears the agent's adopted markers (the agent no longer
+  equals its adopted version); structured-only edits keep them.
+- `backend/app/orchestrator.py` (`campaign_prompt()` helper),
+  `transports.py` (Vapi payload system message + disposition
+  enum), `conversation.py` (spoken prompt AND classifier via
+  `rendered_prompt`), `routers/calls.py` (results-summary bucket
+  set): every runtime read of an agent's prompt goes through the
+  campaign's PINNED text when one exists, else the live prompt.
+  A running campaign therefore keeps its pinned version for
+  life, and a new version never auto-applies — the tenant sees
+  only a "new version available" notice until it adopts.
+- Adoption (same-DB or cross-box import via the export payload):
+  copies prompt text + the catalog agent's full structured
+  config (language rule, captured fields, voice, limits) into
+  the tenant's own AgentConfig, records a PromptVersion row
+  ("Adopted {slug} v{n}"), moves the TenantAdoption pointer,
+  and appends an AdoptionLog row. Reuse order: current adoption
+  target, then the single same-named agent, then create. The
+  tenant runtime reads only its own DB after adoption.
+- `backend/migrations.py` 013 + `backend/migrations/
+  013_c2_catalog_pinning.sql`: marker + `_ensure_column` for the
+  six new columns (all nullable); the four new tables need no
+  step — `create_all` makes missing tables.
+- Frontend: `Agents.jsx` catalog adoption section (adopted vs
+  latest per agent, "New version available" badge, per-version
+  suitable_for/model/validated_on/fit_label/unproven warning,
+  Adopt button, pinned-semantics footnote); `CampaignDetail.jsx`
+  "Pinned prompt" line with a "live prompt (pre-C2 campaign)"
+  fallback for campaigns created before pinning.
+- `scripts/test_catalog_adoption.py` (new): 64 assertions —
+  empty catalog, publish v1+v2, v1 text intact, metadata shown,
+  stub stack shows no flag/label, no PUT/DELETE route (404 on
+  the versioned path, 405 on the collection), flag logic unit
+  tests for managed/self_hosted, adopt v1, adoption log + list,
+  new-version flag, campaign pins v1, publish+adopt v3 leaves
+  the old campaign pinned v1, stub dispatch disposition from
+  the PINNED buckets (v1 -> PINNED_ALPHA, new campaign v3 ->
+  PINNED_EPSILON), manual edit clears markers so the next
+  campaign pins no catalog version, export/import adoption.
+  Result on a fresh SQLite backend: 64 passed, 0 failed.
+- `scripts/catalog_seed_v1.json` + `scripts/seed_catalog_v1.py`
+  (new): catalog v1 content = the five live agents' current
+  prompts, exported read-only from the live DB 2026-10-29
+  (`scripts/export_live_prompts.sql`, verified: RPI v10,
+  Reminder v2, PTP v7, Settlement v8, Broken v2, live prompt ==
+  latest PromptVersion text for all five). Catalog version
+  numbering starts at 1 per catalog agent; the live version is
+  preserved in each entry's `live_version` + `note`. Metadata
+  for all five: suitable_for "managed", model "gpt-4o",
+  validated_on "Vapi managed". The seeder is idempotent
+  (existing slugs/versions are skipped) and takes its login
+  password only from VAP_PASSWORD at exec time.
+
+Decisions carried forward: catalog write gate stays a stub
+until C5 (Super Admin); PUT re-pins only for draft campaigns
+with no calls; a prompt-changing PUT clears adopted markers;
+CampaignOut never exposes pinned text; the stub stack carries
+no unproven flag.
+
+Smoke-script maintenance in this story (test-only, no product
+change): `scripts/smoke_test.py` counted migration versions
+1-12; C2 legitimately adds migration 013, so the two
+count assertions now expect 1-13. The five stale transcriber
+assertions (nova-2 per-language expectations vs the settled
+nova-3 + multi transcriber) are NOT touched here — they are
+the parked post-demo item, still failing as before.
