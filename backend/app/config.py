@@ -153,6 +153,13 @@ class Settings:
     SARVAM_VAD_MIN_SILENCE_MS: str = os.getenv(
         "SARVAM_VAD_MIN_SILENCE_MS", "")
 
+    # Epic C (C1) — Secure Box identity: this box's tenant slug.
+    # Empty = derived from SEED_TENANT_NAME (app.box), so the original
+    # single box needs no configuration change. Each box sets its own
+    # slug; the slug is what the reverse proxy and operators use to
+    # tell boxes apart, and it is reported on /api/health.
+    BOX_TENANT_SLUG: str = os.getenv("BOX_TENANT_SLUG", "")
+
     # Seeded demo tenant / login (created on first boot if absent)
     SEED_TENANT_NAME: str = os.getenv("SEED_TENANT_NAME", "QGBS")
     SEED_USER_EMAIL: str = os.getenv("SEED_USER_EMAIL", "demo@qgbs.example")

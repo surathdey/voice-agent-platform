@@ -1457,3 +1457,45 @@ The owner's first live app-placed Vapi call failed: the Calls page showed FAILED
 2. **Provider error messages preserved** — the HTTP seam previously discarded error bodies, so a rejected placement recorded only "HTTP 400" (that opacity cost the debugging hour; Vapi's body named the exact field). The seam now parses error JSON, and the placement-failure summary appends the provider's own message (string or validation list, whitespace-normalised, capped at 400 chars) for both Vapi and Plivo.
 3. **Transcriber is Settings-configurable per language (owner's explicit decision)** — new tenant fields {en,hi,bn}_transcriber_provider / {en,hi,bn}_transcriber_model on the Vapi card, mirroring the A6 voice profiles exactly: registry defaults (en/hi deepgram/nova-2, bn deepgram/nova-3), VAPI_<LANG>_TRANSCRIBER_PROVIDER/_MODEL .env overrides (documented in .env.example, passed through docker-compose), rendered under the same per-language headings in Settings (the UI groups by prefix, so no frontend logic changed), and the payload builder reads the resolved tenant fields with the proven defaults as fallback.
 Regression coverage: the smoke fake mirrors live Vapi's rule (nova-2 + bn → 400 whose body names assistant.transcriber.language); payload assertions pin bn → nova-3 / hi → nova-2; new checks assert the transcriber defaults pre-fill (source "default"), a tenant override sticks (source "tenant"), clearing restores the defaults — and end-to-end: with the tenant's Bengali transcriber deliberately set to nova-2, a West Bengal dispatch is rejected by the fake, finalizes FAILED in-line, and the stored summary contains Vapi's message text ("transcriber.language"). Verified natively (SQLite + fake providers); the live behaviour itself was proven on the owner's machine against real Vapi earlier the same day.
+
+## Epic C, story C1 — Database-per-tenant + Secure Box per tenant (2026-10-29)
+
+One image, N silos (design §10, §13.3, §14). What landed:
+
+- `backend/app/box.py` (new): box identity — BOX_TENANT_SLUG env, or
+  slugified SEED_TENANT_NAME when unset, so the original single box
+  needs no config change. `db_fingerprint()` names the database only
+  (scheme + db name / SQLite basename), never credentials, hosts, or
+  paths. `/api/health` now reports `box: {tenant_slug, database,
+  telephony_mode}` (additive keys; existing health assertions
+  untouched).
+- `docker-compose.tenant.yml` (new): one parameterized stack —
+  frontend + backend + Postgres, own volume/network per project
+  name, NO published database port, backend bound to 127.0.0.1.
+  The original `docker-compose.yml` is untouched.
+- `scripts/provision_tenant_box.py` (new): generates one box env
+  file (mode 0600) with fresh DB password, SECRET_KEY, and seed
+  password (printed once); refuses to overwrite without --force;
+  validates against the template when docker exists. `boxes/` is
+  gitignored so generated secrets can never be pushed.
+- `scripts/generate_proxy_config.py` (new): host reverse-proxy
+  config from a {subdomain: frontend port} map — one subdomain to
+  exactly one box, unknown hosts dropped (444), WebSocket upgrade
+  headers forwarded, `--tls` mode with Let's Encrypt paths +
+  HTTP->HTTPS redirect once a domain exists. Interim (no domain):
+  IP:port access, proxy file generated and validated now.
+- `scripts/test_tenant_isolation.py` (new): two boxes on two SQLite
+  DBs over HTTP — health slug/fingerprint, cross-box invisibility
+  (campaign/leads/agent/tenant all 404 across boxes), exactly one
+  create_engine site in backend/app, proxy routing assertions,
+  restart-A-keeps-A-data-and-B-untouched.
+- `docs/multi-tenancy-runbook.md` (new): add a box, proxy cutover,
+  per-tenant backup/restore, restart/rebuild rules, admin rules,
+  and what C1 deliberately does not cover (C2–C7).
+
+Isolation model, stated plainly: one process builds exactly ONE
+engine bound to its own DATABASE_URL (app.db, the only
+create_engine site). There is no shared app process and no code
+path that opens two tenant databases in one request — isolation is
+structural (separate process + database + credentials + network
+per box), not a filter every query must remember.

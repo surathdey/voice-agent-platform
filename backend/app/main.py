@@ -32,6 +32,7 @@ import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from . import box as box_module
 from . import providers as prov
 from . import seed as seed_module
 from .config import settings
@@ -83,6 +84,10 @@ def health():
     return {
         "status": "ok",
         "service": "voice-agent-platform",
+        # Epic C (C1): which Secure Box this process is. The box dict
+        # carries no secrets and no PII — slug + database fingerprint
+        # only — so operators can verify box-to-database mapping.
+        "box": box_module.box_info(),
         "telephony_mode": settings.TELEPHONY_MODE,
         "providers_configured": {
             "vapi": bool(settings.VAPI_API_KEY),

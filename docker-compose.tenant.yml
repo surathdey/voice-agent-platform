@@ -1,0 +1,101 @@
+# Voice Agent Platform — ONE Secure Box (Epic C, story C1).
+#
+# One file, N boxes: the SAME image, different environment per box.
+# Never two codebases. Each box is one docker-compose stack —
+# frontend (nginx) + backend (FastAPI) + Postgres (dedicated
+# container) — with its own env file, its own volume, and its own
+# Docker network, so boxes on one host cannot reach each other.
+#
+# Provision a box first (generates the env file with secrets):
+#   python3 scripts/provision_tenant_box.py --slug na \
+#       --tenant-name "North America" --market NA \
+#       --frontend-port 5174 --backend-port 8001
+#
+# Then start ONLY that box (project name = the box; it prefixes
+# container names, the volume, and the network — never set
+# container_name here, or two boxes would collide):
+#   docker compose -f docker-compose.tenant.yml -p vap-na \
+#       --env-file boxes/na.env up -d --build
+#
+# Rules (design §13.3, §14.1):
+# - NO ports published for the database, ever. Postgres is reachable
+#   only from this box's own backend over the box network.
+# - The backend port is published on localhost only for the interim
+#   IP:port access (127.0.0.1:8001); once the reverse proxy serves
+#   the subdomain, bind it to 127.0.0.1 too and let the proxy be
+#   the only public front door. The frontend port is what the proxy
+#   (or interim direct access) talks to.
+# - NEVER `docker compose down -v` on a box: it deletes that box's
+#   database volume. `down` without -v keeps the data; `restart`
+#   keeps the data and the containers.
+# - The original single-stack file (docker-compose.yml) is untouched:
+#   existing deployments keep working; new tenants use this file.
+#
+# Required env (see boxes/*.env.example values in the provision
+# script output): POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB,
+# SECRET_KEY, BOX_TENANT_SLUG, SEED_TENANT_NAME, SEED_USER_EMAIL,
+# SEED_USER_PASSWORD, BACKEND_PORT, FRONTEND_PORT, TELEPHONY_MODE,
+# PUBLIC_BASE_URL. Provider keys stay empty until the tenant's own
+# keys are supplied (stub mode boots and tests without them).
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - ${COMPOSE_PROJECT_NAME}_db:/var/lib/postgresql/data
+    # No ports: section deliberately absent. The database is never
+    # exposed to the host, let alone the internet (§14.1).
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      SECRET_KEY: ${SECRET_KEY}
+      TELEPHONY_MODE: ${TELEPHONY_MODE:-stub}
+      BOX_TENANT_SLUG: ${BOX_TENANT_SLUG}
+      SEED_TENANT_NAME: ${SEED_TENANT_NAME}
+      SEED_USER_EMAIL: ${SEED_USER_EMAIL}
+      SEED_USER_PASSWORD: ${SEED_USER_PASSWORD}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:${BACKEND_PORT}}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
+      VAPI_API_KEY: ${VAPI_API_KEY:-}
+      VAPI_PHONE_NUMBER_ID: ${VAPI_PHONE_NUMBER_ID:-}
+      VAPI_SERVER_CREDENTIAL_ID: ${VAPI_SERVER_CREDENTIAL_ID:-}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
+      PLIVO_AUTH_ID: ${PLIVO_AUTH_ID:-}
+      PLIVO_AUTH_TOKEN: ${PLIVO_AUTH_TOKEN:-}
+      EXOTEL_SID: ${EXOTEL_SID:-}
+      EXOTEL_API_KEY: ${EXOTEL_API_KEY:-}
+      EXOTEL_API_TOKEN: ${EXOTEL_API_TOKEN:-}
+      EXOTEL_SUBDOMAIN: ${EXOTEL_SUBDOMAIN:-}
+      SARVAM_API_KEY: ${SARVAM_API_KEY:-}
+      S3_RECORDINGS_BUCKET: ${S3_RECORDINGS_BUCKET:-}
+    ports:
+      - "127.0.0.1:${BACKEND_PORT}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "${FRONTEND_PORT}:80"
+    depends_on:
+      - backend
+
+volumes:
+  ${COMPOSE_PROJECT_NAME}_db:
+
+networks:
+  default:
+    name: ${COMPOSE_PROJECT_NAME}_net

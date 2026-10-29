@@ -1,4 +1,8 @@
 .env
+# Epic C (C1): per-box env files hold generated secrets (DB passwords,
+# SECRET_KEY, seed passwords). NEVER commit them; the provision script
+# writes them mode 0600 and this rule keeps them out of every push.
+boxes/
 __pycache__/
 *.pyc
 .venv/

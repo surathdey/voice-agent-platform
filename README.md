@@ -32,6 +32,14 @@ provider reports itself are kept verbatim).**
 See `BUILD-LOG.md` for what is verified. **Phase A is complete** —
 Phase B (the five agents, RPI first) comes next.
 
+## Multi-tenancy (Epic C, story C1)
+
+One image, N silos: each tenant is one Secure Box (frontend +
+backend + Postgres, own env file, own volume, own Docker network).
+See `docs/multi-tenancy-runbook.md` for adding a box, the
+subdomain reverse proxy, and per-tenant backup/restore. The
+original single-stack `docker-compose.yml` still works unchanged.
+
 ## Run it (Docker — the owner's route)
 
 ```bash
