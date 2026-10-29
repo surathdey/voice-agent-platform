@@ -1864,3 +1864,19 @@ not yet a settings-UI control. Frontend role-gating
 (hiding editor/catalog UI per role, handling 403s) is
 NOT in C5 backend scope. Super Admin provider management
 is a C4 follow-up (explicit tenant scoping needed).
+
+C5 follow-up fix, found by the test-box deploy (not by the
+local suite): migration 014's DDL used `DATETIME`, which
+SQLite accepts but PostgreSQL rejects (`type "datetime"
+does not exist`) — the box backend crashed on boot with
+`ALTER TABLE leads ADD COLUMN allocated_at DATETIME`
+failing. Fixed to the existing dialect helper
+(`_ts(dialect)`: TIMESTAMP WITHOUT TIME ZONE on
+PostgreSQL, TIMESTAMP on SQLite) in `_apply_014`, and the
+014 SQL file of record now carries the PostgreSQL form.
+Re-running is safe: `_ensure_column` skips columns the
+crashed run already added, and the 014 marker was never
+recorded (the step raised before it). Lesson carried
+forward: every new migration's DDL must be proven on the
+Postgres test box, not only on SQLite — the local suite
+cannot catch dialect-only type errors.
