@@ -218,9 +218,10 @@ class CatalogAgent(Base):
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     stage: Mapped[str] = mapped_column(String(120), default="")
     purpose: Mapped[str] = mapped_column(String(300), default="")
-    # Structured defaults a version adoption copies (same shape as
-    # AgentConfig's structured config; the version row carries the
-    # prompt text, this row carries the rest).
+    # Creation defaults (same shape as AgentConfig's structured
+    # config). A version row carries its OWN full copy of these, so
+    # adoption reads the version, never this row — these defaults only
+    # fill in fields a version creation omits.
     llm_model: Mapped[str] = mapped_column(String(120), default="sarvam-105b")
     stt_provider: Mapped[str] = mapped_column(String(60), default="saaras")
     stt_language: Mapped[str] = mapped_column(String(20), default="hi-IN")
@@ -248,6 +249,17 @@ class CatalogVersion(Base):
     mismatch guard: suitable_for / model / validated_on tell a tenant
     which stack the version was live-call proven on, so a tenant never
     adopts a version unproven on its own stack.
+
+    FULL-CONTENT RULE (stack-conditional form): the version row carries
+    the ENTIRE agent content — prompt + stack (model / STT / TTS /
+    voice) + language_rule + captured_fields + duration/turn/silence
+    settings. The agent row is only the JOB identity (slug / name /
+    stage / purpose) plus creation defaults. Adoption therefore
+    reproduces EXACTLY what the Super Admin edited on that version:
+    no stale agent defaults ever leak into an adopted agent. A
+    version flipped to another stack keeps its own stack fields; the
+    agent row is never rewritten by a version save, so older versions
+    keep their own content for life.
     """
 
     __tablename__ = "catalog_versions"
@@ -267,6 +279,24 @@ class CatalogVersion(Base):
     validated_on: Mapped[str] = mapped_column(String(200), default="")
     published_by: Mapped[str] = mapped_column(String(200), default="")
     published_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    # Full content carried on the version (see class docstring): the
+    # stack + runtime config the adopted agent runs with. Same shapes
+    # as CatalogAgent's fields; filled at version creation (explicit
+    # values win, omitted fields default from the parent agent row,
+    # stack providers default by suitable_for — see
+    # routers/catalog.py::_resolve_version_fields). validated_on is
+    # HISTORY and is never auto-modified by a suitable_for flip.
+    stt_provider: Mapped[str] = mapped_column(String(60), default="")
+    stt_language: Mapped[str] = mapped_column(String(20), default="hi-IN")
+    tts_provider: Mapped[str] = mapped_column(String(60), default="")
+    tts_voice_id: Mapped[str] = mapped_column(String(120), default="")
+    voice_gender: Mapped[str] = mapped_column(String(10), default="female")
+    language_rule: Mapped[dict] = mapped_column(JSON, default=dict)
+    captured_fields: Mapped[list] = mapped_column(JSON, default=list)
+    max_duration_s: Mapped[int] = mapped_column(Integer, default=300)
+    max_turns: Mapped[int] = mapped_column(Integer, default=50)
+    silence_prompt_after_s: Mapped[int] = mapped_column(Integer, default=8)
+    silence_max_prompts: Mapped[int] = mapped_column(Integer, default=1)
     # Draft/publish split: 'draft' (work in progress, invisible to
     # tenants) or 'published'. published_at is NOT NULL in the schema
     # (Mapped[datetime] infers it), so it cannot mark a draft — status

@@ -9,11 +9,17 @@ Authorship is shared, adoption is per tenant:
   is the mismatch guard: a tenant must never adopt a version unproven
   on its own stack.
 - A tenant ADOPTS a version from a dropdown (agent + version).
-  Adoption COPIES the prompt text + structured config into the
-  tenant's own database (its AgentConfig + a PromptVersion row) and
-  records the adoption (TenantAdoption = current pointer, AdoptionLog
-  = append-only history, the only cross-tenant view, no customer data).
-  After adoption the tenant runtime reads only its own database.
+  Adoption COPIES the version's FULL content — prompt + stack (model
+  / STT / TTS / voice) + language_rule + captured_fields +
+  duration/turn/silence settings — into the tenant's own database
+  (its AgentConfig + a PromptVersion row) and records the adoption
+  (TenantAdoption = current pointer, AdoptionLog = append-only
+  history, the only cross-tenant view, no customer data). The agent
+  row is only the job identity (slug / name / stage / purpose);
+  adoption NEVER reads the agent row's config, so an adopted agent
+  reproduces exactly what the Super Admin edited on that version and
+  no stale agent default ever leaks in. After adoption the tenant
+  runtime reads only its own database.
 - A new catalog version NEVER auto-applies: tenants see a "new
   version available" flag and adopt when ready. Running campaigns keep
   their pinned version for life (see Campaign.pinned_prompt); new
@@ -98,6 +104,98 @@ def _fit(version: CatalogVersion, stack: str) -> tuple[bool, str]:
     return False, f"intended for {stack}"
 
 
+# Settled stacks (do not invent others):
+#   self_hosted = Sarvam: LLM sarvam-*, STT saaras, TTS bulbul.
+#   managed     = Vapi:   LLM anything except sarvam-*, STT deepgram,
+#                          TTS elevenlabs.
+# A version for "both" carries ONE consistent set (Sarvam set OR Vapi
+# set) — the set the prompt was proven with; the adopting tenant runs
+# that set. A MIXED set (e.g. gpt-4o + saaras + bulbul) is never a
+# valid version on any stack.
+def _validate_stack(suitable_for: str, model: str, stt_provider: str, tts_provider: str) -> None:
+    """422 unless the final stored stack is internally consistent."""
+    m = (model or "").strip().lower()
+    stt = (stt_provider or "").strip().lower()
+    tts = (tts_provider or "").strip().lower()
+    if suitable_for == "self_hosted":
+        ok = m.startswith("sarvam") and stt == "saaras" and tts == "bulbul"
+    elif suitable_for == "managed":
+        ok = (not m.startswith("sarvam")) and stt == "deepgram" and tts == "elevenlabs"
+    else:  # "both": one consistent set, Sarvam set or Vapi set.
+        ok = ((m.startswith("sarvam") and stt == "saaras" and tts == "bulbul")
+              or ((not m.startswith("sarvam")) and stt == "deepgram" and tts == "elevenlabs"))
+    if not ok:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"stack mismatch: suitable_for={suitable_for} with model={model!r}, "
+            f"stt={stt_provider!r}, tts={tts_provider!r} is not a consistent stack")
+
+
+def _resolve_version_fields(ca: CatalogAgent, body: CatalogVersionIn) -> dict:
+    """Final stored fields for a NEW version row.
+
+    Explicit values win. Omitted fields default: stack providers and
+    model default BY suitable_for — never from the agent row, whose
+    Sarvam defaults would otherwise poison a managed version (this is
+    exactly how the seed's managed v1 used to adopt a Sarvam stack);
+    non-stack config defaults from the agent row. validated_on is
+    HISTORY: it passes through untouched, never derived from
+    suitable_for, so a version flipped to another stack keeps its
+    validation history and reads "intended for X" until a live call
+    on the new stack proves it. The result is stack-validated (422
+    on mismatch) before any row is written.
+    """
+    suitable = body.suitable_for
+    if suitable not in SUITABLE_FOR:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            "suitable_for must be 'managed', 'self_hosted' or 'both'")
+
+    def _str(v):
+        return v if isinstance(v, str) and v.strip() else None
+
+    model = _str(body.model)
+    if model is None:
+        model = {"managed": "gpt-4o", "self_hosted": "sarvam-105b"}.get(
+            suitable, ca.llm_model or "sarvam-105b")
+    stt = _str(body.stt_provider)
+    if stt is None:
+        stt = {"self_hosted": "saaras", "managed": "deepgram"}.get(
+            suitable, ca.stt_provider or "saaras")
+    tts = _str(body.tts_provider)
+    if tts is None:
+        tts = {"self_hosted": "bulbul", "managed": "elevenlabs"}.get(
+            suitable, ca.tts_provider or "bulbul")
+    voice = _str(body.tts_voice_id)
+    if voice is None:
+        if suitable == "managed":
+            voice = ""  # voice comes from the tenant's Vapi profile
+        elif suitable == "self_hosted":
+            voice = ca.tts_voice_id if (ca.tts_provider or "").lower() == "bulbul" else ""
+        else:
+            voice = ca.tts_voice_id or ""
+    gender = _str(body.voice_gender)
+    if gender not in ("female", "male"):
+        gender = ca.voice_gender if ca.voice_gender in ("female", "male") else "female"
+    fields = {
+        "prompt": body.prompt, "note": body.note, "suitable_for": suitable,
+        "model": model, "validated_on": body.validated_on,
+        "stt_provider": stt,
+        "stt_language": _str(body.stt_language) or ca.stt_language or "hi-IN",
+        "tts_provider": tts, "tts_voice_id": voice, "voice_gender": gender,
+        "language_rule": body.language_rule if body.language_rule is not None else (ca.language_rule or {}),
+        "captured_fields": ([f.model_dump() for f in body.captured_fields]
+                            if body.captured_fields is not None else (ca.captured_fields or [])),
+        "max_duration_s": body.max_duration_s if body.max_duration_s is not None else ca.max_duration_s,
+        "max_turns": body.max_turns if body.max_turns is not None else ca.max_turns,
+        "silence_prompt_after_s": (body.silence_prompt_after_s
+                                  if body.silence_prompt_after_s is not None else ca.silence_prompt_after_s),
+        "silence_max_prompts": (body.silence_max_prompts
+                               if body.silence_max_prompts is not None else ca.silence_max_prompts),
+    }
+    _validate_stack(suitable, model, stt, tts)
+    return fields
+
+
 def _version_out(v: CatalogVersion, stack: str) -> CatalogVersionOut:
     unproven, label = _fit(v, stack)
     # status is authoritative; a draft's published_at is only the
@@ -111,6 +209,14 @@ def _version_out(v: CatalogVersion, stack: str) -> CatalogVersionOut:
         published_at=None if status == "draft" else (v.published_at.isoformat() if v.published_at else None),
         status=status,
         unproven_on_stack=unproven, fit_label=label,
+        stt_provider=v.stt_provider or "", stt_language=v.stt_language or "hi-IN",
+        tts_provider=v.tts_provider or "", tts_voice_id=v.tts_voice_id or "",
+        voice_gender=v.voice_gender or "female",
+        language_rule=v.language_rule or {},
+        captured_fields=v.captured_fields or [],
+        max_duration_s=v.max_duration_s, max_turns=v.max_turns,
+        silence_prompt_after_s=v.silence_prompt_after_s,
+        silence_max_prompts=v.silence_max_prompts,
     )
 
 
@@ -188,6 +294,13 @@ def list_catalog_agents(user: User = Depends(require_catalog_reader), db: Sessio
 @router.post("/agents", response_model=CatalogAgentOut, status_code=status.HTTP_201_CREATED)
 def create_catalog_agent(body: CatalogAgentIn, user: User = Depends(require_catalog_admin),
                          db: Session = Depends(get_db)):
+    """Create a catalog agent. When body.initial_version carries a
+    non-blank prompt (the create-agent form), v1 is written in the
+    SAME transaction as a DRAFT, so an agent created from the form is
+    never version-less. When initial_version is absent (the seed
+    flow: agent first, then a separate immediate-publish call), the
+    agent is created alone. A stack-mismatched initial version is a
+    422 and nothing is written."""
     slug = (body.slug or "").strip().lower()
     if not SLUG_RE.match(slug):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -212,7 +325,14 @@ def create_catalog_agent(body: CatalogAgentIn, user: User = Depends(require_cata
     ca.max_turns = body.max_turns
     ca.silence_prompt_after_s = body.silence_prompt_after_s
     ca.silence_max_prompts = body.silence_max_prompts
+    # Resolve BEFORE any write so a 422 leaves nothing behind.
+    iv = body.initial_version
+    v1_fields = _resolve_version_fields(ca, iv) if (iv is not None and (iv.prompt or "").strip()) else None
     db.add(ca)
+    if v1_fields is not None:
+        db.add(CatalogVersion(
+            catalog_agent_id=ca.catalog_agent_id, version=1,
+            status="draft", published_by="", **v1_fields))
     db.commit()
     db.refresh(ca)
     return _agent_out(db, user, ca)
@@ -229,11 +349,15 @@ def get_catalog_agent(slug_or_id: str, user: User = Depends(require_catalog_read
 def publish_version(slug_or_id: str, body: CatalogVersionIn,
                     user: User = Depends(require_catalog_admin), db: Session = Depends(get_db)):
     """Publish a NEW immutable version. There is no update/delete for
-    versions: a published version never changes, a fix is a new row."""
+    versions: a published version never changes, a fix is a new row.
+    The version stores the FULL content (prompt + stack + config);
+    omitted fields resolve from the agent row / by suitable_for and
+    the final stack is validated (422 on mismatch) before the row is
+    written. The seed flow (prompt/note/suitable_for/model/
+    validated_on only) keeps working: a managed seed version resolves
+    to the Vapi stack, not the agent row's Sarvam defaults."""
     ca = _resolve_agent(db, slug_or_id)
-    if body.suitable_for not in SUITABLE_FOR:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
-                            "suitable_for must be 'managed', 'self_hosted' or 'both'")
+    fields = _resolve_version_fields(ca, body)
     nxt = (
         db.query(CatalogVersion)
         .filter(CatalogVersion.catalog_agent_id == ca.catalog_agent_id)
@@ -243,8 +367,7 @@ def publish_version(slug_or_id: str, body: CatalogVersionIn,
     version = (nxt.version + 1) if nxt else 1
     v = CatalogVersion(
         catalog_agent_id=ca.catalog_agent_id, version=version,
-        prompt=body.prompt, note=body.note, suitable_for=body.suitable_for,
-        model=body.model, validated_on=body.validated_on, published_by=user.email,
+        published_by=user.email, **fields,
     )
     db.add(v)
     db.commit()
@@ -257,14 +380,16 @@ def publish_version(slug_or_id: str, body: CatalogVersionIn,
 def save_draft_version(slug_or_id: str, body: CatalogVersionIn,
                        user: User = Depends(require_catalog_admin), db: Session = Depends(get_db)):
     """Save a NEW version as DRAFT. It NEVER modifies any existing version
-    (published versions stay immutable) and it does NOT publish: the row
-    carries status 'draft' until the publish endpoint flips it. Version
-    numbering stays sequential, assigned at save; publishing does not
-    renumber. The existing immediate-publish endpoint is unchanged."""
+    (published versions stay immutable, and a draft being viewed stays
+    as-is — editing it also creates a new row) and it does NOT publish:
+    the row carries status 'draft' until the publish endpoint flips it.
+    Version numbering stays sequential, assigned at save; publishing
+    does not renumber. The draft carries the FULL edited content
+    (prompt + stack + config), so adopting it later reproduces exactly
+    what was edited; the final stack is validated (422 on mismatch).
+    The existing immediate-publish endpoint is unchanged."""
     ca = _resolve_agent(db, slug_or_id)
-    if body.suitable_for not in SUITABLE_FOR:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
-                            "suitable_for must be 'managed', 'self_hosted' or 'both'")
+    fields = _resolve_version_fields(ca, body)
     nxt = (
         db.query(CatalogVersion)
         .filter(CatalogVersion.catalog_agent_id == ca.catalog_agent_id)
@@ -274,9 +399,7 @@ def save_draft_version(slug_or_id: str, body: CatalogVersionIn,
     version = (nxt.version + 1) if nxt else 1
     v = CatalogVersion(
         catalog_agent_id=ca.catalog_agent_id, version=version,
-        prompt=body.prompt, note=body.note, suitable_for=body.suitable_for,
-        model=body.model, validated_on=body.validated_on,
-        status="draft", published_by="",
+        status="draft", published_by="", **fields,
     )
     db.add(v)
     db.commit()
@@ -329,19 +452,23 @@ def export_version(slug_or_id: str, version: int, user: User = Depends(require_c
     if v.status != "published" and user.role != ROLE_SUPER_ADMIN:
         # A tenant must never see a draft: hide it as not found.
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Catalog version not found")
+    # The version is authoritative for ALL config: the agent row is
+    # only identity + creation defaults, and reading it here would
+    # reintroduce the stale-stack bug (a managed version adopting
+    # the agent row's Sarvam defaults).
     return {
         "catalog_agent_id": ca.slug, "name": ca.name, "stage": ca.stage,
         "purpose": ca.purpose, "version": v.version, "prompt": v.prompt,
         "note": v.note or "", "suitable_for": v.suitable_for,
         "model": v.model or "", "validated_on": v.validated_on or "",
-        "llm_model": ca.llm_model, "stt_provider": ca.stt_provider,
-        "stt_language": ca.stt_language, "tts_provider": ca.tts_provider,
-        "tts_voice_id": ca.tts_voice_id or "", "voice_gender": ca.voice_gender or "female",
-        "language_rule": ca.language_rule or {},
-        "captured_fields": ca.captured_fields or [],
-        "max_duration_s": ca.max_duration_s, "max_turns": ca.max_turns,
-        "silence_prompt_after_s": ca.silence_prompt_after_s,
-        "silence_max_prompts": ca.silence_max_prompts,
+        "llm_model": v.model or "", "stt_provider": v.stt_provider or "",
+        "stt_language": v.stt_language or "hi-IN", "tts_provider": v.tts_provider or "",
+        "tts_voice_id": v.tts_voice_id or "", "voice_gender": v.voice_gender or "female",
+        "language_rule": v.language_rule or {},
+        "captured_fields": v.captured_fields or [],
+        "max_duration_s": v.max_duration_s, "max_turns": v.max_turns,
+        "silence_prompt_after_s": v.silence_prompt_after_s,
+        "silence_max_prompts": v.silence_max_prompts,
     }
 
 
@@ -414,16 +541,22 @@ def adopt_version(body: AdoptionIn, user: User = Depends(require_tenant_admin),
                                     "Catalog agent has no published versions")
         prompt = v.prompt
         version = v.version
+        # Full-content adoption: EVERYTHING except identity comes
+        # from the version row, so the adopted agent reproduces
+        # exactly what the Super Admin edited on that version. The
+        # agent row's config is never read here (it is only creation
+        # defaults); reading it would carry a stale stack whenever a
+        # version's stack changed after the agent was created.
         cfg = {
             "name": ca.name, "stage": ca.stage, "purpose": ca.purpose,
-            "llm_model": ca.llm_model, "stt_provider": ca.stt_provider,
-            "stt_language": ca.stt_language, "tts_provider": ca.tts_provider,
-            "tts_voice_id": ca.tts_voice_id or "", "voice_gender": ca.voice_gender or "female",
-            "language_rule": ca.language_rule or {},
-            "captured_fields": ca.captured_fields or [],
-            "max_duration_s": ca.max_duration_s, "max_turns": ca.max_turns,
-            "silence_prompt_after_s": ca.silence_prompt_after_s,
-            "silence_max_prompts": ca.silence_max_prompts,
+            "llm_model": v.model or "", "stt_provider": v.stt_provider or "",
+            "stt_language": v.stt_language or "hi-IN", "tts_provider": v.tts_provider or "",
+            "tts_voice_id": v.tts_voice_id or "", "voice_gender": v.voice_gender or "female",
+            "language_rule": v.language_rule or {},
+            "captured_fields": v.captured_fields or [],
+            "max_duration_s": v.max_duration_s, "max_turns": v.max_turns,
+            "silence_prompt_after_s": v.silence_prompt_after_s,
+            "silence_max_prompts": v.silence_max_prompts,
         }
 
     # Reuse the tenant's current adoption target; else the single

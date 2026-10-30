@@ -379,6 +379,84 @@ def _apply_015(conn, insp, dialect):
     conn.execute(text("UPDATE catalog_versions SET status = 'published' WHERE status IS NULL"))
 
 
+_COLS_016 = ("stt_provider", "stt_language", "tts_provider", "tts_voice_id",
+             "voice_gender", "language_rule", "captured_fields",
+             "max_duration_s", "max_turns", "silence_prompt_after_s",
+             "silence_max_prompts")
+
+
+def _marker_016(insp, dialect):
+    # Same fresh-database rule as 015: a missing table is already
+    # satisfied (create_all builds the columns from the model).
+    return "catalog_versions" not in _tables(insp) or \
+        _has_columns(insp, "catalog_versions", *_COLS_016)
+
+
+def _apply_016(conn, insp, dialect):
+    """Epic C, C2 stack-conditional form: the version row carries its
+    FULL content (stack + runtime config), not just prompt + metadata.
+
+    Previously a version stored only prompt/note/suitable_for/model/
+    validated_on/status, and adoption copied the agent row's config —
+    so a version whose stack changed adopted a STALE stack (the seed's
+    managed v1 adopted the agent row's Sarvam defaults). After this
+    step every version row is self-contained and adoption reads the
+    version, never the agent row. Backfill: stack providers by
+    suitable_for (managed -> Vapi deepgram/elevenlabs/"", self_hosted
+    -> Sarvam saaras/bulbul/agent voice when the agent is Bulbul,
+    both -> the agent's set); non-stack config from the parent agent
+    row. validated_on is HISTORY and is never rewritten here. Runs
+    inside the runner's single boot transaction, so a partial apply
+    rolls back and resumes cleanly.
+    """
+    if "catalog_versions" not in _tables(insp):
+        return
+    json_type = "JSON" if dialect == "postgresql" else "TEXT"
+    _ensure_column(conn, "catalog_versions", "stt_provider VARCHAR(60) NOT NULL DEFAULT ''")
+    _ensure_column(conn, "catalog_versions", "stt_language VARCHAR(20) NOT NULL DEFAULT 'hi-IN'")
+    _ensure_column(conn, "catalog_versions", "tts_provider VARCHAR(60) NOT NULL DEFAULT ''")
+    _ensure_column(conn, "catalog_versions", "tts_voice_id VARCHAR(120) NOT NULL DEFAULT ''")
+    _ensure_column(conn, "catalog_versions", "voice_gender VARCHAR(10) NOT NULL DEFAULT 'female'")
+    _ensure_column(conn, "catalog_versions", f"language_rule {json_type}")
+    _ensure_column(conn, "catalog_versions", f"captured_fields {json_type}")
+    _ensure_column(conn, "catalog_versions", "max_duration_s INTEGER NOT NULL DEFAULT 300")
+    _ensure_column(conn, "catalog_versions", "max_turns INTEGER NOT NULL DEFAULT 50")
+    _ensure_column(conn, "catalog_versions", "silence_prompt_after_s INTEGER NOT NULL DEFAULT 8")
+    _ensure_column(conn, "catalog_versions", "silence_max_prompts INTEGER NOT NULL DEFAULT 1")
+    conn.execute(text(
+        "UPDATE catalog_versions SET "
+        "stt_provider = CASE suitable_for "
+        "WHEN 'self_hosted' THEN 'saaras' WHEN 'managed' THEN 'deepgram' "
+        "ELSE (SELECT stt_provider FROM catalog_agents "
+        "WHERE catalog_agents.catalog_agent_id = catalog_versions.catalog_agent_id) END, "
+        "tts_provider = CASE suitable_for "
+        "WHEN 'self_hosted' THEN 'bulbul' WHEN 'managed' THEN 'elevenlabs' "
+        "ELSE (SELECT tts_provider FROM catalog_agents "
+        "WHERE catalog_agents.catalog_agent_id = catalog_versions.catalog_agent_id) END, "
+        "tts_voice_id = CASE suitable_for "
+        "WHEN 'managed' THEN '' "
+        "WHEN 'self_hosted' THEN (SELECT CASE WHEN tts_provider = 'bulbul' THEN tts_voice_id ELSE '' END "
+        "FROM catalog_agents WHERE catalog_agents.catalog_agent_id = catalog_versions.catalog_agent_id) "
+        "ELSE (SELECT tts_voice_id FROM catalog_agents "
+        "WHERE catalog_agents.catalog_agent_id = catalog_versions.catalog_agent_id) END, "
+        "stt_language = (SELECT stt_language FROM catalog_agents "
+        "WHERE catalog_agents.catalog_agent_id = catalog_versions.catalog_agent_id), "
+        "voice_gender = (SELECT voice_gender FROM catalog_agents "
+        "WHERE catalog_agents.catalog_agent_id = catalog_versions.catalog_agent_id), "
+        "language_rule = (SELECT language_rule FROM catalog_agents "
+        "WHERE catalog_agents.catalog_agent_id = catalog_versions.catalog_agent_id), "
+        "captured_fields = (SELECT captured_fields FROM catalog_agents "
+        "WHERE catalog_agents.catalog_agent_id = catalog_versions.catalog_agent_id), "
+        "max_duration_s = (SELECT max_duration_s FROM catalog_agents "
+        "WHERE catalog_agents.catalog_agent_id = catalog_versions.catalog_agent_id), "
+        "max_turns = (SELECT max_turns FROM catalog_agents "
+        "WHERE catalog_agents.catalog_agent_id = catalog_versions.catalog_agent_id), "
+        "silence_prompt_after_s = (SELECT silence_prompt_after_s FROM catalog_agents "
+        "WHERE catalog_agents.catalog_agent_id = catalog_versions.catalog_agent_id), "
+        "silence_max_prompts = (SELECT silence_max_prompts FROM catalog_agents "
+        "WHERE catalog_agents.catalog_agent_id = catalog_versions.catalog_agent_id)"))
+
+
 MIGRATIONS = [
     (1, "001_initial", _marker_001, _apply_001),
     (2, "002_a3_campaign_fields", _marker_002, _apply_002),
@@ -395,6 +473,7 @@ MIGRATIONS = [
     (13, "013_c2_catalog_pinning", _marker_013, _apply_013),
     (14, "014_c5_roles", _marker_014, _apply_014),
     (15, "015_c2_draft_status", _marker_015, _apply_015),
+    (16, "016_c2_version_full_content", _marker_016, _apply_016),
 ]
 
 

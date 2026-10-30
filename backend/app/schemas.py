@@ -186,8 +186,27 @@ class CatalogVersionIn(BaseModel):
     suitable_for: str = "both"
     model: str = ""
     # Stack(s) live-call proven on, e.g. "Vapi managed". "Best for X"
-    # is claimed ONLY for stacks named here.
+    # is claimed ONLY for stacks named here. HISTORY: flipping
+    # suitable_for never rewrites this field.
     validated_on: str = ""
+    # Full content carried on the version (see models.CatalogVersion).
+    # Every field is OPTIONAL here: None means "omitted" and the
+    # version-creation resolver fills it from the parent agent row
+    # (non-stack config) or by suitable_for (stack providers/model),
+    # then validates the final stack. The detail form always sends
+    # every field explicitly; the seed immediate-publish path sends
+    # only prompt/note/suitable_for/model/validated_on.
+    stt_provider: Optional[str] = None
+    stt_language: Optional[str] = None
+    tts_provider: Optional[str] = None
+    tts_voice_id: Optional[str] = None
+    voice_gender: Optional[str] = None
+    language_rule: Optional[dict] = None
+    captured_fields: Optional[List[CapturedField]] = None
+    max_duration_s: Optional[int] = None
+    max_turns: Optional[int] = None
+    silence_prompt_after_s: Optional[int] = None
+    silence_max_prompts: Optional[int] = None
 
 
 class CatalogVersionOut(CatalogVersionIn):
@@ -208,7 +227,9 @@ class CatalogAgentIn(BaseModel):
     name: str
     stage: str = ""
     purpose: str = ""
-    # Structured defaults an adoption copies (same shape as AgentIn).
+    # Creation defaults (same shape as AgentIn). A version row carries
+    # its own full copy, so adoption reads the version, never this
+    # row — these only fill in fields a version creation omits.
     llm_model: str = "sarvam-105b"
     stt_provider: str = "saaras"
     stt_language: str = "hi-IN"
@@ -221,6 +242,12 @@ class CatalogAgentIn(BaseModel):
     max_turns: int = 50
     silence_prompt_after_s: int = 8
     silence_max_prompts: int = 1
+    # First version, created WITH the agent as v1 DRAFT (create-agent
+    # form). When present and carrying a non-blank prompt, the agent
+    # is never created version-less: v1 is written in the same
+    # transaction. When absent (seed flow: agent first, then a
+    # separate immediate-publish call), the agent is created alone.
+    initial_version: Optional[CatalogVersionIn] = None
 
 
 class CatalogAgentOut(CatalogAgentIn):
