@@ -11,6 +11,7 @@ import BrowserTest from './pages/BrowserTest'
 import PlatformDashboard from './pages/PlatformDashboard'
 import Tenants from './pages/Tenants'
 import CatalogAuthoring from './pages/CatalogAuthoring'
+import Setup from './pages/Setup'
 import { api, clearSession, getUser, setSession } from './api'
 
 const NAV = ['Dashboard', 'Campaigns', 'Agents', 'Calls', 'Browser Test', 'Journey', 'Human Queue', 'Settings']
@@ -35,6 +36,24 @@ export default function App() {
       api('/api/users/me').then((me) => setUser({ ...user, ...me })).catch(() => {})
     }
   }, [user])
+
+  // Public invite setup takes precedence over the login gate (and
+  // over any existing session): a setup link must complete even for
+  // a logged-in operator, and success replaces the session with the
+  // new account. nginx falls back to index.html for /setup, so a
+  // hard-loaded invite link lands here with its query params.
+  const setupParams = new URLSearchParams(window.location.search)
+  const setupInvite = setupParams.get('invite')
+  const setupToken = setupParams.get('token')
+  const clearSetupParams = () => { window.history.replaceState({}, '', '/') }
+  if (setupInvite && setupToken) {
+    return <Setup
+      inviteId={setupInvite}
+      token={setupToken}
+      onDone={(u) => { clearSetupParams(); setUser(u) }}
+      onBack={() => { clearSetupParams(); window.location.reload() }}
+    />
+  }
 
   if (!user) return <Login onDone={(u) => setUser(u)} />
 

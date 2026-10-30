@@ -9,6 +9,7 @@ from-numbers) are Tenant Admin work via PUT /me. Super Admin tenant
 edits (name, market, timezone, mode, concurrency) go through PATCH
 /{tenant_id} below — never the tenant's own settings endpoint.
 """
+import re
 import secrets
 from datetime import datetime, timedelta
 
@@ -22,6 +23,7 @@ from ..market_time import tenant_timezone_name, timezone_name_for_market
 from ..models import Tenant, User, UserInvite
 from ..schemas import TenantIn, TenantOut, TenantPatchIn, TenantUpdateIn
 from ..security import hash_password
+from .users import SETUP_LINK_TTL_HOURS, record_invite_dispatch
 
 router = APIRouter(prefix="/api/tenants", tags=["tenants"])
 
@@ -142,7 +144,10 @@ def create_tenant(body: TenantIn, creator: User = Depends(require_super_admin),
     generated or returned. The response carries the setup link the
     Super Admin forwards to the new Tenant Admin (email delivery is
     log-mode until a provider is wired) and the OTP under the
-    INVITE_DEV_OTP test gate only.
+    INVITE_DEV_OTP test gate only. When body carries admin_name +
+    admin_email, the pending admin uses exactly those; otherwise the
+    legacy placeholder (admin@{tenant_id}.example) keeps seed scripts
+    and API callers working unchanged.
     """
     tenant = Tenant(
         name=body.name, market=body.market,
@@ -152,9 +157,24 @@ def create_tenant(body: TenantIn, creator: User = Depends(require_super_admin),
     )
     db.add(tenant)
     db.flush()
-    admin_email = f"admin@{tenant.tenant_id}.example"
+    # First Tenant Admin, invite-based. An explicit admin_email wins;
+    # without it the legacy placeholder keeps seed scripts and API
+    # callers working unchanged. Duplicate emails 409 — login lookup
+    # is by email, so two accounts must never share one.
+    if body.admin_email is not None:
+        admin_email = body.admin_email.strip()
+        if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", admin_email):
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                                "admin_email must be a valid email address")
+        if db.query(User).filter(User.email == admin_email).first() is not None:
+            raise HTTPException(status.HTTP_409_CONFLICT,
+                                "An account with this email already exists")
+        admin_name = (body.admin_name or "").strip() or "Tenant Admin"
+    else:
+        admin_email = f"admin@{tenant.tenant_id}.example"
+        admin_name = "Tenant Admin"
     admin = User(
-        tenant_id=tenant.tenant_id, email=admin_email, name="Tenant Admin",
+        tenant_id=tenant.tenant_id, email=admin_email, name=admin_name,
         role="tenant_admin", password_hash="", is_active=False,
     )
     db.add(admin)
@@ -162,14 +182,16 @@ def create_tenant(body: TenantIn, creator: User = Depends(require_super_admin),
     otp = f"{secrets.randbelow(900000) + 100000:06d}"
     setup_token = secrets.token_urlsafe(32)
     invite = UserInvite(
-        tenant_id=tenant.tenant_id, email=admin_email, name="Tenant Admin",
+        tenant_id=tenant.tenant_id, email=admin_email, name=admin_name,
         role="tenant_admin", channel="email", invited_by=creator.user_id,
         otp_hash=hash_password(otp), setup_token_hash=hash_password(setup_token),
-        expires_at=datetime.utcnow() + timedelta(hours=24),
+        expires_at=datetime.utcnow() + timedelta(hours=SETUP_LINK_TTL_HOURS),
     )
     db.add(invite)
     db.commit()
+    record_invite_dispatch(invite.invite_id, admin_email, "email", creator.email)
     return {"tenant": _out(tenant).model_dump(), "admin_email": admin_email,
+            "admin_name": admin_name,
             "invite_id": invite.invite_id,
             "setup_url": f"/setup?invite={invite.invite_id}&token={setup_token}",
             "dev_otp": otp if settings.INVITE_DEV_OTP else None}

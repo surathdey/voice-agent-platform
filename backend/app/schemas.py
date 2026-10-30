@@ -60,6 +60,9 @@ class InviteOut(BaseModel):
     channel: str
     setup_url: str
     expires_at: Optional[str] = None
+    # Computed, never stored: pending (unused, unexpired), active
+    # (setup completed), expired (unused, past expires_at).
+    status: Optional[str] = None
     # Returned ONLY when INVITE_DEV_OTP=true (tests). In production
     # the OTP travels only over its channel (log-mode until wired).
     dev_otp: Optional[str] = None
@@ -128,6 +131,12 @@ class TenantIn(BaseModel):
     provider_mode_default: str = "managed"
     from_numbers: List[str] = []
     concurrency_limit: int = 20
+    # First Tenant Admin, invite-based (Epic C invite flow). Both
+    # optional: when admin_email is absent the legacy placeholder
+    # (admin@{tenant_id}.example) is used, so seed scripts and API
+    # callers without these fields keep working unchanged.
+    admin_name: Optional[str] = None
+    admin_email: Optional[str] = None
 
 
 class TenantOut(BaseModel):

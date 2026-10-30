@@ -24,6 +24,7 @@ from ..config import settings
 from ..db import get_db
 from ..deps import (
     get_current_user,
+    require_super_admin,
     require_tenant_admin_or_super,
     team_caller_ids,
     ROLE_CALLER,
@@ -49,6 +50,31 @@ teams_router = APIRouter(prefix="/api/teams", tags=["teams"])
 
 INVITABLE_ROLES = (ROLE_TENANT_ADMIN, ROLE_TEAM_LEADER, ROLE_CALLER)
 SETUP_LINK_TTL_HOURS = 24
+
+
+def _invite_status(invite: UserInvite) -> str:
+    """User-facing invite state, computed never stored: active once
+    setup completed (used_at set), expired once past expires_at
+    without setup, pending otherwise."""
+    from datetime import datetime
+    if invite.used_at is not None:
+        return "active"
+    if invite.expires_at is not None and datetime.utcnow() > invite.expires_at:
+        return "expired"
+    return "pending"
+
+
+def record_invite_dispatch(invite_id: str, email: str, channel: str,
+                           invited_by_email: str) -> None:
+    """The ONE send-invite seam (log-mode until a provider is wired):
+    the dispatch is recorded, the OTP value is NEVER logged. When a
+    real email/SMS provider lands, it plugs in here — invite handlers
+    must not dispatch (or log) invites anywhere else. The inviter
+    forwards the setup link (returned by the create call) when the
+    channel is unavailable — the OTP itself travels only over its
+    channel (or the INVITE_DEV_OTP test gate)."""
+    logger.info("invite %s created for %s via %s (invited by %s)",
+                invite_id, email, channel, invited_by_email)
 
 
 def _user_out(u: User) -> UserOut:
@@ -149,18 +175,14 @@ def create_invite(body: InviteIn, creator: User = Depends(require_tenant_admin_o
     )
     db.add(invite)
     db.commit()
-    # Log-mode delivery until an email/SMS provider is wired: the
-    # dispatch is recorded, the OTP value is NOT logged. The inviter
-    # forwards the setup link (returned below) when the channel is
-    # unavailable — the OTP itself travels only over its channel.
-    logger.info("invite %s created for %s via %s (invited by %s)",
-                invite.invite_id, body.email, body.channel, creator.email)
+    record_invite_dispatch(invite.invite_id, body.email, body.channel, creator.email)
     return InviteOut(
         invite_id=invite.invite_id, tenant_id=tenant_id, email=body.email,
         name=body.name, role=body.role, team_id=body.team_id,
         channel=body.channel,
         setup_url=f"/setup?invite={invite.invite_id}&token={setup_token}",
         expires_at=invite.expires_at.isoformat(),
+        status="pending",
         dev_otp=otp if settings.INVITE_DEV_OTP else None,
     )
 
@@ -179,7 +201,42 @@ def list_invites(user: User = Depends(require_tenant_admin_or_super),
         invite_id=r.invite_id, tenant_id=r.tenant_id, email=r.email,
         name=r.name, role=r.role, team_id=r.team_id, channel=r.channel,
         setup_url="", expires_at=r.expires_at.isoformat() if r.expires_at else None,
+        status=_invite_status(r),
     ) for r in rows]
+
+
+@router.post("/invites/{invite_id}/resend", response_model=InviteOut)
+def resend_invite(invite_id: str, actor: User = Depends(require_super_admin),
+                  db: Session = Depends(get_db)):
+    """Regenerate an invite's OTP + setup link (Super Admin only).
+    Pending invites only: a consumed invite (setup completed) 422s.
+    An unused invite — including an expired one, which this revives
+    with a fresh 24h expiry — gets new hashed OTP + token values, so
+    the old OTP and old link stop working immediately. The pending
+    user row is untouched (still inactive, still no password)."""
+    from datetime import datetime, timedelta
+    invite = db.get(UserInvite, invite_id)
+    if invite is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Invite not found")
+    if invite.used_at is not None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            "Invite already used — resend is for pending invites only")
+    otp = f"{secrets.randbelow(900000) + 100000:06d}"
+    setup_token = secrets.token_urlsafe(32)
+    invite.otp_hash = hash_password(otp)
+    invite.setup_token_hash = hash_password(setup_token)
+    invite.expires_at = datetime.utcnow() + timedelta(hours=SETUP_LINK_TTL_HOURS)
+    db.commit()
+    record_invite_dispatch(invite.invite_id, invite.email, invite.channel, actor.email)
+    return InviteOut(
+        invite_id=invite.invite_id, tenant_id=invite.tenant_id, email=invite.email,
+        name=invite.name, role=invite.role, team_id=invite.team_id,
+        channel=invite.channel,
+        setup_url=f"/setup?invite={invite.invite_id}&token={setup_token}",
+        expires_at=invite.expires_at.isoformat(),
+        status="pending",
+        dev_otp=otp if settings.INVITE_DEV_OTP else None,
+    )
 
 
 @router.patch("/{user_id}", response_model=UserOut)
