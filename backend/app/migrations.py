@@ -353,6 +353,32 @@ def _apply_014(conn, insp, dialect):
     conn.execute(text("UPDATE users SET role = 'caller' WHERE role = 'operator'"))
 
 
+def _marker_015(insp, dialect):
+    # A missing table is already satisfied: the runner runs BEFORE
+    # create_all, and create_all builds catalog_versions WITH the status
+    # column from the model on fresh databases. Only an existing table
+    # lacking the column needs the step.
+    return "catalog_versions" not in _tables(insp) or \
+        _has_columns(insp, "catalog_versions", "status")
+
+
+def _apply_015(conn, insp, dialect):
+    """Epic C, C2 draft/publish split: explicit status on catalog versions.
+
+    published_at is NOT NULL in the schema (Mapped[datetime] infers it),
+    so it cannot mark a draft. The new status column does: 'draft' rows
+    are work in progress invisible to tenants, 'published' rows are live.
+    ADD COLUMN with NOT NULL DEFAULT backfills existing rows as
+    'published' on both dialects; the UPDATE covers any NULL straggler.
+    Only runs for an existing table: on a fresh database the marker
+    above is already true and create_all creates the column.
+    """
+    if "catalog_versions" not in _tables(insp):
+        return
+    _ensure_column(conn, "catalog_versions", "status VARCHAR(20) NOT NULL DEFAULT 'published'")
+    conn.execute(text("UPDATE catalog_versions SET status = 'published' WHERE status IS NULL"))
+
+
 MIGRATIONS = [
     (1, "001_initial", _marker_001, _apply_001),
     (2, "002_a3_campaign_fields", _marker_002, _apply_002),
@@ -368,6 +394,7 @@ MIGRATIONS = [
     (12, "012_s3_recording_archive", _marker_012, _apply_012),
     (13, "013_c2_catalog_pinning", _marker_013, _apply_013),
     (14, "014_c5_roles", _marker_014, _apply_014),
+    (15, "015_c2_draft_status", _marker_015, _apply_015),
 ]
 
 

@@ -238,11 +238,13 @@ class CatalogAgent(Base):
 
 
 class CatalogVersion(Base):
-    """One IMMUTABLE published version of a catalog agent (C2).
+    """One version of a catalog agent (C2).
 
-    A published version NEVER changes: there is deliberately NO update
+    A PUBLISHED version NEVER changes: there is deliberately NO update
     or delete endpoint for versions. A fix or improvement becomes a
-    NEW version row (version = max + 1). The version metadata is the
+    NEW version row (version = max + 1). A DRAFT version (status
+    'draft') is work in progress: tenants never see it, and it becomes
+    published only via the publish endpoint. The version metadata is the
     mismatch guard: suitable_for / model / validated_on tell a tenant
     which stack the version was live-call proven on, so a tenant never
     adopts a version unproven on its own stack.
@@ -265,6 +267,12 @@ class CatalogVersion(Base):
     validated_on: Mapped[str] = mapped_column(String(200), default="")
     published_by: Mapped[str] = mapped_column(String(200), default="")
     published_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    # Draft/publish split: 'draft' (work in progress, invisible to
+    # tenants) or 'published'. published_at is NOT NULL in the schema
+    # (Mapped[datetime] infers it), so it cannot mark a draft — status
+    # does. New rows default to 'published' for the immediate-publish
+    # path; the draft endpoint sets 'draft' explicitly.
+    status: Mapped[str] = mapped_column(String(20), default="published")
 
     __table_args__ = (UniqueConstraint("catalog_agent_id", "version", name="uq_catalog_version"),)
 

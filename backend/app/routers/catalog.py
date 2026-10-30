@@ -37,6 +37,7 @@ The adoption log is the platform view: Super Admin sees all
 tenants, Tenant Admin sees only their own tenant.
 """
 import re
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
@@ -45,6 +46,7 @@ from ..box import box_tenant_slug
 from ..config import settings
 from ..db import get_db
 from ..deps import (
+    ROLE_SUPER_ADMIN,
     get_current_user,
     require_catalog_admin,
     require_catalog_reader,
@@ -98,12 +100,16 @@ def _fit(version: CatalogVersion, stack: str) -> tuple[bool, str]:
 
 def _version_out(v: CatalogVersion, stack: str) -> CatalogVersionOut:
     unproven, label = _fit(v, stack)
+    # status is authoritative; a draft's published_at is only the
+    # creation timestamp left by the column default, so it is masked.
+    status = v.status or "published"
     return CatalogVersionOut(
         version_id=v.version_id, catalog_agent_id=v.catalog_agent_id,
         version=v.version, prompt=v.prompt, note=v.note or "",
         suitable_for=v.suitable_for, model=v.model or "",
         validated_on=v.validated_on or "", published_by=v.published_by or "",
-        published_at=v.published_at.isoformat() if v.published_at else None,
+        published_at=None if status == "draft" else (v.published_at.isoformat() if v.published_at else None),
+        status=status,
         unproven_on_stack=unproven, fit_label=label,
     )
 
@@ -121,12 +127,18 @@ def _resolve_agent(db: Session, slug_or_id: str) -> CatalogAgent:
 
 def _agent_out(db: Session, user: User, ca: CatalogAgent) -> CatalogAgentOut:
     stack = _tenant_stack()
-    versions = (
+    all_versions = (
         db.query(CatalogVersion)
         .filter(CatalogVersion.catalog_agent_id == ca.catalog_agent_id)
         .order_by(CatalogVersion.version)
         .all()
     )
+    # Tenant-facing reads see ONLY published versions: a tenant must never
+    # see or adopt a draft. Super Admin sees all versions with status.
+    if user.role == ROLE_SUPER_ADMIN:
+        versions = all_versions
+    else:
+        versions = [v for v in all_versions if v.status == "published"]
     adopted = (
         db.query(TenantAdoption)
         .filter(TenantAdoption.tenant_id == user.tenant_id,
@@ -240,6 +252,65 @@ def publish_version(slug_or_id: str, body: CatalogVersionIn,
     return _version_out(v, _tenant_stack())
 
 
+@router.post("/agents/{slug_or_id}/versions/draft", response_model=CatalogVersionOut,
+             status_code=status.HTTP_201_CREATED)
+def save_draft_version(slug_or_id: str, body: CatalogVersionIn,
+                       user: User = Depends(require_catalog_admin), db: Session = Depends(get_db)):
+    """Save a NEW version as DRAFT. It NEVER modifies any existing version
+    (published versions stay immutable) and it does NOT publish: the row
+    carries status 'draft' until the publish endpoint flips it. Version
+    numbering stays sequential, assigned at save; publishing does not
+    renumber. The existing immediate-publish endpoint is unchanged."""
+    ca = _resolve_agent(db, slug_or_id)
+    if body.suitable_for not in SUITABLE_FOR:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            "suitable_for must be 'managed', 'self_hosted' or 'both'")
+    nxt = (
+        db.query(CatalogVersion)
+        .filter(CatalogVersion.catalog_agent_id == ca.catalog_agent_id)
+        .order_by(CatalogVersion.version.desc())
+        .first()
+    )
+    version = (nxt.version + 1) if nxt else 1
+    v = CatalogVersion(
+        catalog_agent_id=ca.catalog_agent_id, version=version,
+        prompt=body.prompt, note=body.note, suitable_for=body.suitable_for,
+        model=body.model, validated_on=body.validated_on,
+        status="draft", published_by="",
+    )
+    db.add(v)
+    db.commit()
+    db.refresh(v)
+    return _version_out(v, _tenant_stack())
+
+
+@router.post("/agents/{slug_or_id}/versions/{version}/publish", response_model=CatalogVersionOut)
+def publish_draft_version(slug_or_id: str, version: int,
+                          user: User = Depends(require_catalog_admin), db: Session = Depends(get_db)):
+    """Publish a draft version: sets status 'published' + published_at +
+    published_by. Only drafts can be published; an already-published
+    version is rejected (it never changes). Publishing does not
+    renumber."""
+    ca = _resolve_agent(db, slug_or_id)
+    v = (
+        db.query(CatalogVersion)
+        .filter(CatalogVersion.catalog_agent_id == ca.catalog_agent_id,
+                CatalogVersion.version == version)
+        .first()
+    )
+    if v is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Catalog version not found")
+    if v.status == "published":
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            "Version is already published")
+    v.status = "published"
+    v.published_at = datetime.utcnow()
+    v.published_by = user.email
+    db.commit()
+    db.refresh(v)
+    return _version_out(v, _tenant_stack())
+
+
 @router.get("/agents/{slug_or_id}/versions/{version}/export")
 def export_version(slug_or_id: str, version: int, user: User = Depends(require_catalog_reader),
                    db: Session = Depends(get_db)):
@@ -254,6 +325,9 @@ def export_version(slug_or_id: str, version: int, user: User = Depends(require_c
         .first()
     )
     if v is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Catalog version not found")
+    if v.status != "published" and user.role != ROLE_SUPER_ADMIN:
+        # A tenant must never see a draft: hide it as not found.
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Catalog version not found")
     return {
         "catalog_agent_id": ca.slug, "name": ca.name, "stage": ca.stage,
@@ -275,6 +349,9 @@ def export_version(slug_or_id: str, version: int, user: User = Depends(require_c
 def adopt_version(body: AdoptionIn, user: User = Depends(require_tenant_admin),
                   db: Session = Depends(get_db)):
     """Adopt a catalog version into this tenant's own database.
+
+    Only PUBLISHED versions can be adopted: an explicit draft version is
+    rejected, and latest-resolution considers published versions only.
 
     Same-DB mode: catalog_agent_id + version resolve against local
     catalog tables. Import mode: body.payload (from the export
@@ -321,10 +398,14 @@ def adopt_version(body: AdoptionIn, user: User = Depends(require_tenant_admin),
             )
             if v is None:
                 raise HTTPException(status.HTTP_404_NOT_FOUND, "Catalog version not found")
+            if v.status != "published":
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                                    "Cannot adopt a draft version")
         else:
             v = (
                 db.query(CatalogVersion)
-                .filter(CatalogVersion.catalog_agent_id == ca.catalog_agent_id)
+                .filter(CatalogVersion.catalog_agent_id == ca.catalog_agent_id,
+                        CatalogVersion.status == "published")
                 .order_by(CatalogVersion.version.desc())
                 .first()
             )

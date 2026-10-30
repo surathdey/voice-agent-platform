@@ -196,6 +196,8 @@ class CatalogVersionOut(CatalogVersionIn):
     version: int
     published_by: str = ""
     published_at: Optional[str] = None
+    # Draft/publish split: "draft" iff published_at is NULL, else "published".
+    status: str = "published"
     # Computed for the requesting tenant's stack (not stored):
     unproven_on_stack: bool = False      # suitable_for fits neither "both" nor this stack
     fit_label: str = ""                  # "best for managed" | "intended for managed" | ""
