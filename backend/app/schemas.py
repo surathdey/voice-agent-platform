@@ -98,6 +98,22 @@ class TenantPatchIn(BaseModel):
     from_numbers: Optional[List[str]] = None
 
 
+class TenantUpdateIn(BaseModel):
+    """Super Admin tenant edit (Epic C): everything EXCEPT identity.
+    tenant_id / slug are accepted only as an immutability guard — if
+    either is present and differs from the tenant's own id, the
+    endpoint 422s. from_numbers is deliberately absent: tenant phone
+    numbers are tenant-side (tenant Settings), never Super Admin work.
+    """
+    name: Optional[str] = None
+    market: Optional[str] = None
+    timezone: Optional[str] = None
+    provider_mode_default: Optional[str] = None
+    concurrency_limit: Optional[int] = None
+    tenant_id: Optional[str] = None
+    slug: Optional[str] = None
+
+
 class LoginOut(BaseModel):
     access_token: str
     token_type: str = "bearer"

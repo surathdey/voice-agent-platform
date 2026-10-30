@@ -5,7 +5,9 @@ provisioning endpoint is now locked down, as its own docstring
 promised). The first Tenant Admin is created INVITE-based — pending
 until they complete setup with the OTP + their own password — so
 tenant creation never returns a password. Tenant settings (timezone,
-from-numbers) are Tenant Admin work via PUT /me.
+from-numbers) are Tenant Admin work via PUT /me. Super Admin tenant
+edits (name, market, timezone, mode, concurrency) go through PATCH
+/{tenant_id} below — never the tenant's own settings endpoint.
 """
 import secrets
 from datetime import datetime, timedelta
@@ -18,7 +20,7 @@ from ..db import get_db
 from ..deps import get_current_user, require_super_admin, require_tenant_admin
 from ..market_time import tenant_timezone_name, timezone_name_for_market
 from ..models import Tenant, User, UserInvite
-from ..schemas import TenantIn, TenantOut, TenantPatchIn
+from ..schemas import TenantIn, TenantOut, TenantPatchIn, TenantUpdateIn
 from ..security import hash_password
 
 router = APIRouter(prefix="/api/tenants", tags=["tenants"])
@@ -60,6 +62,56 @@ def get_tenant(tenant_id: str, user: User = Depends(get_current_user), db: Sessi
     tenant = db.get(Tenant, tenant_id)
     if tenant is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Tenant not found")
+    return _out(tenant)
+
+
+@router.patch("/{tenant_id}", response_model=TenantOut)
+def update_tenant(tenant_id: str, body: TenantUpdateIn,
+                  user: User = Depends(require_super_admin), db: Session = Depends(get_db)):
+    """Super Admin tenant edit (Epic C): name, market, timezone, mode,
+    concurrency. The tenant's slug/tenant_id is IDENTITY (box name,
+    database name, subdomain routing) and can never change — a
+    differing tenant_id or slug in the body 422s. The "Platform" scope
+    row is not a customer tenant and is not editable. from_numbers
+    stays tenant-side (tenant Settings) and is deliberately not
+    editable here. Changing mode does NOT re-adopt or change any
+    adopted version — adopted versions stay pinned; the tenant must
+    adopt catalog versions matching the new mode."""
+    tenant = db.get(Tenant, tenant_id)
+    if tenant is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Tenant not found")
+    if tenant.name == "Platform":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Platform scope row is not editable")
+    if body.tenant_id is not None and body.tenant_id != tenant.tenant_id:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "tenant_id is immutable")
+    if body.slug is not None and body.slug != tenant.tenant_id:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "slug is immutable")
+    if body.name is not None:
+        name = body.name.strip()
+        if not name:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "name must not be empty")
+        tenant.name = name
+    if body.market is not None:
+        market = body.market.strip().upper()
+        if market not in ("IN", "NA"):
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "market must be 'IN' or 'NA'")
+        tenant.market = market
+    if body.provider_mode_default is not None:
+        mode = body.provider_mode_default.strip()
+        if mode not in ("managed", "self_hosted"):
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "provider_mode_default must be 'managed' or 'self_hosted'")
+        tenant.provider_mode_default = mode
+    if body.concurrency_limit is not None:
+        if body.concurrency_limit < 0:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "concurrency_limit must be >= 0")
+        tenant.concurrency_limit = body.concurrency_limit
+    if body.timezone is not None:
+        # Blank timezone = derive from the (possibly new) market.
+        tenant.timezone = body.timezone.strip() or timezone_name_for_market(tenant.market)
+    db.commit()
+    db.refresh(tenant)
     return _out(tenant)
 
 
