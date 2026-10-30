@@ -8,7 +8,11 @@ import { api } from '../api'
    forwarding — email delivery is log-mode until a provider is wired)
    is shown here, super_admin only. Tenant cards show the first
    Tenant Admin's invite status with a Resend action for pending
-   invites. The "Platform" scope row is not a customer tenant and is
+   invites. The edit view shows the same invite read-only (link + OTP)
+   while the create-time or a fresh resend result is still in page state
+   for that tenant; afterwards it shows email + status + a Resend offer —
+   the original link is never recoverable (only salted hashes are stored)
+   and is never persisted to browser storage. The "Platform" scope row is not a customer tenant and is
    not editable. A tenant's slug/tenant_id is identity (box name,
    database name, subdomain routing) and is never edited here; phone
    numbers stay tenant-side (tenant Settings). Invite tokens, links
@@ -126,6 +130,17 @@ export default function Tenants() {
   const isPlatform = (t) => t.name === 'Platform'
   const modeChanged = editing && editForm.provider_mode_default !== editing.provider_mode_default
 
+  // Read-only invite display in the edit view. The backend stores only
+  // salted hashes, so a setup link/OTP is unrecoverable once page state is
+  // gone: the edit view shows the link + OTP only when the create-time or
+  // a fresh resend result is still in page state for THIS tenant's invite
+  // (matched by invite_id). Otherwise it shows email + status + a note,
+  // and offers Resend — never a stale or fabricated link. Nothing here is
+  // persisted to localStorage/sessionStorage or any backend column.
+  const editInvite = editing && !isPlatform(editing) ? adminInviteFor(editing.tenant_id) : null
+  const editInviteResult = editInvite && inviteResult && inviteResult.invite_id === editInvite.invite_id
+    ? inviteResult : null
+
   return (
     <div>
       <div className="page-head">
@@ -209,6 +224,42 @@ export default function Tenants() {
               <div className="card" style={{ marginTop: 14 }}>
                 Note: changing mode does NOT re-adopt or change any adopted version automatically —
                 adopted versions stay pinned. The tenant must adopt catalog versions matching the new mode.
+              </div>
+            )}
+            {editInvite && (
+              <div className="card" style={{ marginTop: 14 }}>
+                <h4 style={{ marginTop: 0 }}>Admin invite (read-only)</h4>
+                <p style={{ color: 'var(--slate)' }}>
+                  {editInvite.email} — {editInvite.status}
+                </p>
+                {editInviteResult ? (
+                  <>
+                    <div className="field"><label>Setup link (forward this)</label>
+                      <input readOnly value={`${window.location.origin}${editInviteResult.setup_url}`} onFocus={(e) => e.target.select()} /></div>
+                    {editInviteResult.dev_otp
+                      ? <p style={{ marginTop: 10 }}>OTP for manual forwarding: <b>{editInviteResult.dev_otp}</b></p>
+                      : <p style={{ color: 'var(--slate)', marginTop: 10 }}>
+                          The OTP travels over the invite channel (currently log-mode). On this test box it
+                          is shown here when the INVITE_DEV_OTP test gate is enabled.</p>}
+                  </>
+                ) : editInvite.status === 'active' ? (
+                  <p style={{ color: 'var(--slate)' }}>
+                    Setup is complete for this admin — there is no link to show.
+                  </p>
+                ) : (
+                  <>
+                    <p style={{ color: 'var(--slate)' }}>
+                      The original setup link is shown only at creation or on resend — it cannot be
+                      recovered afterwards, because only salted hashes are stored. If the admin never
+                      got it or lost it, resend below to mint a fresh link (the old link stops working).
+                    </p>
+                    {(editInvite.status === 'pending' || editInvite.status === 'expired') && (
+                      <button type="button" className="btn small secondary" disabled={busy}
+                        onClick={() => resendInvite(editInvite.invite_id)}>
+                        {editInvite.status === 'expired' ? 'Resend invite (expired — renew)' : 'Resend invite'}</button>
+                    )}
+                  </>
+                )}
               </div>
             )}
             <div style={{ marginTop: 14, display: 'flex', gap: 10 }}>
